@@ -1,0 +1,15 @@
+# 环境与密钥
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地运行数据（聊天记录与日志）
+data/
+
+# IDE
+.idea/
+.vscode/
