@@ -10,6 +10,12 @@ __pycache__/
 # 本地运行数据（聊天记录与日志）
 data/
 
+# 公网隧道二进制（从 GitHub 下载，不入库）
+cloudflared.exe
+
+# Gradio 运行缓存
+.gradio/
+
 # IDE
 .idea/
 .vscode/

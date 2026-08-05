@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from core.math_format import normalize_math_text
@@ -39,7 +40,7 @@ def load_history() -> list[dict]:
 
 
 def save_history(history: list[dict]) -> None:
-    """保存历史；只保留纯文本消息，绘图/图片消息不持久化。"""
+    """保存历史；只保留纯文本消息。"""
     _ensure_dir()
     clean: list[dict] = []
     for item in history:
@@ -49,9 +50,9 @@ def save_history(history: list[dict]) -> None:
         content = item.get("content")
         if role not in ("user", "assistant") or not isinstance(content, str):
             continue
-        if role == "assistant" and content.startswith("📈"):
-            continue  # 绘图占位消息不持久化
         clean.append({"role": role, "content": content})
-    HISTORY_FILE.write_text(
+    tmp = HISTORY_FILE.with_name(HISTORY_FILE.name + ".tmp")
+    tmp.write_text(
         json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    os.replace(tmp, HISTORY_FILE)

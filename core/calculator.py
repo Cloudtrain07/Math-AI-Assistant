@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+import threading
 import types
 import io as _io
 
@@ -33,6 +34,10 @@ _BOXED = re.compile(r"\\boxed\s*\{([^}]*)\}")
 _IMPLICIT_MUL = re.compile(r"(?<!\\)(\d)([a-zA-Z])")
 _TRAILING = re.compile(r"[。．,，;；\s]+$")
 
+MAX_FORMULA_LEN = 500
+MAX_FORMULAS_PER_CALL = 20
+VERIFY_TIMEOUT_SECONDS = 10.0
+
 
 def extract_math_blocks(text: str) -> list[str]:
     """从回答文本中提取所有 $...$ / $$...$$ 公式块。"""
@@ -45,10 +50,33 @@ def extract_math_blocks(text: str) -> list[str]:
 
 
 def _clean(latex: str) -> str:
+    # math_format 会把 < > 转义为 \lt / \gt / \textless / \textgreater，解析前转回
+    latex = latex.replace(r"\textless", "<").replace(r"\textgreater", ">")
+    latex = latex.replace(r"\lt", "<").replace(r"\gt", ">")
     latex = _BOXED.sub(r"\1", latex)
     latex = _IMPLICIT_MUL.sub(r"\1\\cdot\2", latex)
     latex = latex.replace("\\left(", "(").replace("\\right)", ")")
     return _TRAILING.sub("", latex).strip()
+
+
+def _parse_with_timeout(latex: str, timeout: float = VERIFY_TIMEOUT_SECONDS):
+    """在守护线程中解析公式；超时返回 None，避免阻塞事件线程。"""
+    result: dict = {}
+
+    def worker() -> None:
+        try:
+            result["expr"] = latex2sympy(latex)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return None
+    if "error" in result:
+        raise result["error"]
+    return result.get("expr")
 
 
 def verify_math(text: str) -> list[dict]:
@@ -62,13 +90,27 @@ def verify_math(text: str) -> list[dict]:
             }
         ]
     results: list[dict] = []
-    for raw in extract_math_blocks(text):
+    for raw in extract_math_blocks(text)[:MAX_FORMULAS_PER_CALL]:
+        if len(raw) > MAX_FORMULA_LEN:
+            results.append(
+                {
+                    "source": raw[:60],
+                    "status": "解析失败",
+                    "detail": "公式过长（>500 字符），已跳过验算",
+                }
+            )
+            continue
         latex = _clean(raw)
         try:
-            expr = latex2sympy(latex)
+            expr = _parse_with_timeout(latex)
         except Exception as exc:
             results.append(
                 {"source": raw, "status": "解析失败", "detail": str(exc)[:80]}
+            )
+            continue
+        if expr is None:
+            results.append(
+                {"source": raw, "status": "解析失败", "detail": "验算超时"}
             )
             continue
         if expr is None or isinstance(expr, bool):
