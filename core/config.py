@@ -19,6 +19,7 @@ class Settings:
     reasoning_effort: str
     max_history_messages: int
     max_output_tokens: int
+    max_wait_seconds: int
     max_message_len: int
     daily_token_limit: int
     global_daily_token_limit: int
@@ -64,6 +65,7 @@ def get_settings() -> Settings:
         reasoning_effort=reasoning_effort,
         max_history_messages=_env_int("MAX_HISTORY_MESSAGES", 20),
         max_output_tokens=_env_int("MAX_OUTPUT_TOKENS", 30000),
+        max_wait_seconds=_env_int("MAX_WAIT_SECONDS", 600),
         max_message_len=_env_int("MAX_MESSAGE_LEN", 2000),
         daily_token_limit=_env_int("DAILY_TOKEN_LIMIT", 1_000_000),
         global_daily_token_limit=_env_int("GLOBAL_DAILY_TOKEN_LIMIT", 3_000_000),

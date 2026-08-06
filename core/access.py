@@ -15,7 +15,7 @@ ACCESS_LOG = DATA_DIR / "access.log"
 # 排除易混淆字符（0/O、1/I/l）
 _PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 DEFAULT_PASSWORD_LENGTH = 8
-DEFAULT_LOG_MAX_LINES = 5
+DEFAULT_LOG_MAX_LINES = 1000
 
 _log_lock = threading.Lock()
 
@@ -81,7 +81,7 @@ def trim_log_file(path: Path | str, max_lines: int = DEFAULT_LOG_MAX_LINES) -> N
 
 
 def log_access_event(*parts: str, target: Path | None = None) -> None:
-    """把一条访问事件追加写入 access.log，并只保留最近 5 条（写失败静默）。"""
+    """把一条访问事件追加写入 access.log，并只保留最近 1000 条（写失败静默）。"""
     try:
         path = Path(target) if target is not None else ACCESS_LOG
         path.parent.mkdir(parents=True, exist_ok=True)

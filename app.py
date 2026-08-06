@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import threading
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -18,9 +20,14 @@ from core.access import (
 )
 from core.calculator import CALCULATOR_AVAILABLE, verify_math
 from core.config import get_settings
-from core.deepseek_client import DeepSeekClient
+from core.deepseek_client import DeepSeekClient, MaxWaitTimeout
 from core.math_format import normalize_math_text
-from core.prompts import VISION_COMPLETE_PROMPT, build_system_prompt
+from core.prompts import (
+    MODE_ANSWER,
+    MODE_INTERACTIVE,
+    VISION_COMPLETE_PROMPT,
+    build_system_prompt,
+)
 from core.storage import save_history
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.usage import (
@@ -68,6 +75,55 @@ MAX_MESSAGE_LEN = settings.max_message_len if settings else 2000
 
 _log_lock = threading.Lock()
 
+# 互动模式阶段关键词（启发式，用户可用「给答案」等口令纠正）
+ESCAPE_KEYWORDS = (
+    "给答案",
+    "直接讲",
+    "没时间",
+    "别问了",
+    "直接解",
+    "说答案",
+    "给我答案",
+    "直接给答案",
+    "讲一下",
+    "讲讲",
+)
+PRACTICE_KEYWORDS = (
+    "出题",
+    "练练",
+    "再来一道",
+    "巩固",
+    "出道题",
+    "练习题",
+    "再来一题",
+    "换个题",
+)
+GRADING_KEYWORDS = (
+    "我的做法",
+    "我的过程",
+    "我的解答",
+    "我的思路",
+    "我这样写",
+    "我这样算",
+    "我算得",
+    "我解出来",
+    "我算出来",
+    "帮我看看",
+    "帮我看",
+    "检查一下",
+    "请批改",
+    "帮我批改",
+    "改一下",
+    "对吗",
+    "对不对",
+)
+
+
+def _new_stage_state() -> dict:
+    """互动模式的初始阶段状态。"""
+    return {"stage": "initial_hint", "hints": 0, "last_mode": MODE_INTERACTIVE}
+
+
 # 视觉客户端（可选）：未配置 DASHSCOPE_API_KEY 时，上传图片会给出提示
 if settings is not None and settings.vision_api_key:
     vision_client = VisionClient(settings)
@@ -76,12 +132,27 @@ else:
 
 
 def to_api_messages(
-    history: list[dict], level: str, mode: str, answer_style: str | None = None
+    history: list[dict],
+    level: str,
+    mode: str,
+    answer_style: str | None = None,
+    stage: str | None = None,
+    mode_changed: bool = False,
 ) -> list[dict[str, str]]:
     """把界面历史转换为 DeepSeek 需要的消息列表，并控制上下文长度。"""
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": build_system_prompt(level, mode, answer_style)}
+        {
+            "role": "system",
+            "content": build_system_prompt(level, mode, answer_style, stage),
+        }
     ]
+    if mode_changed:
+        messages.append(
+            {
+                "role": "system",
+                "content": "【模式切换】现在起按新模式作答，忽略此前对话中的旧模式行为。",
+            }
+        )
     if settings is not None:
         history = history[-settings.max_history_messages :]
     for item in history:
@@ -111,7 +182,9 @@ def _friendly_error(exc: Exception) -> str:
     """把 API 异常映射为简洁的中文提示，避免把堆栈抛给用户。"""
     name = exc.__class__.__name__
     text = str(exc)[:150]
-    if "Authentication" in name or "401" in text:
+    if isinstance(exc, MaxWaitTimeout):
+        hint = "已达到最长等待时间，已自动停止（可重新发送）"
+    elif "Authentication" in name or "401" in text:
         hint = "API Key 无效或未配置，请检查 .env 中的 DEEPSEEK_API_KEY"
     elif "RateLimit" in name or "429" in text:
         hint = "请求过于频繁或额度不足（触发限流）"
@@ -148,6 +221,62 @@ def _log_event(kind: str, text: str) -> None:
         pass
 
 
+def _write_error_log(record: dict) -> None:
+    """把一条诊断记录追加写入 data/error.log（JSON 一行一条）。"""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with _log_lock:
+            with open(DATA_DIR / "error.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _base_error_record(ip: str, turn_total: int | None) -> dict:
+    """公共字段：当前配置与访客信息。"""
+    return {
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ip": ip,
+        "tokens": turn_total,
+        "model": settings.model if settings is not None else None,
+        "thinking": settings.thinking if settings is not None else None,
+        "reasoning_effort": (
+            settings.reasoning_effort if settings is not None else None
+        ),
+    }
+
+
+def _log_error(
+    exc: Exception, *, ip: str, turn_total: int | None, partial: bool
+) -> None:
+    """把一次 API 异常的完整信息写入 data/error.log，便于定位根因。"""
+    record = _base_error_record(ip, turn_total)
+    record.update(
+        {
+            "type": exc.__class__.__name__,
+            "message": str(exc)[:2000],
+            "partial_answer": partial,
+        }
+    )
+    _write_error_log(record)
+
+
+def _log_empty_reply(*, ip: str, turn_total: int | None, truncated: bool) -> None:
+    """记录"请求完成但没收到正式回答"的情况（常见于思考链耗尽输出额度）。"""
+    record = _base_error_record(ip, turn_total)
+    record.update(
+        {
+            "type": "empty_reply",
+            "truncated": truncated,
+            "message": (
+                "请求完成但未收到正式回答（无异常抛出）；"
+                f"truncated={truncated}，可能为思考链已用尽 max_tokens 额度"
+            ),
+        }
+    )
+    _write_error_log(record)
+
+
 def _recognition_incomplete(text: str) -> bool:
     """粗略判断识别文本是否在公式中途被截断（奇数个 $ 或结尾是公式残片）。"""
     if not text:
@@ -156,6 +285,147 @@ def _recognition_incomplete(text: str) -> bool:
     if stripped.endswith(("\\", "{", "}")):
         return True
     return stripped.count("$") % 2 == 1
+
+
+def _looks_like_new_problem(text: str) -> bool:
+    """粗略判断用户消息是否是一道新题（含数学定界符/运算符，或较长的问句）。"""
+    t = (text or "").strip()
+    if len(t) >= 15 and (
+        t.endswith(("？", "?"))
+        or any(k in t for k in ("求", "解", "证明", "已知", "设", "怎么", "如何", "为什么", "计算"))
+    ):
+        return True
+    return any(ch in t for ch in "=<>≤≥×÷√∫∑±∞²³") or "$" in t or "\\" in t
+
+
+def advance_stage(
+    mode: str, message: str, current: dict | None, has_history: bool = False
+) -> dict:
+    """根据用户新消息计算本轮回复应遵循的阶段（纯函数，供测试）。
+
+    优先级：解答模式 → 逃生词 → 练习词 → 批改词 → 新题判定 → 常规推进。
+    """
+    current = dict(current or {})
+    stage = current.get("stage")
+    hints = int(current.get("hints") or 0)
+    last_mode = current.get("last_mode") or MODE_INTERACTIVE
+    mode_changed = mode != last_mode
+    if mode != MODE_INTERACTIVE:
+        return {
+            "stage": None,
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": mode_changed,
+        }
+
+    text = (message or "").strip()
+    if mode_changed:
+        new_stage = "targeted_hint" if has_history else "initial_hint"
+        return {
+            "stage": new_stage,
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": True,
+        }
+    if any(k in text for k in ESCAPE_KEYWORDS):
+        return {
+            "stage": "full_solution",
+            "hints": hints,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if any(k in text for k in PRACTICE_KEYWORDS):
+        return {
+            "stage": "practice_wait",
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if any(k in text for k in GRADING_KEYWORDS):
+        return {
+            "stage": "grading",
+            "hints": hints,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage in ("summary", "full_solution", "grading") and _looks_like_new_problem(
+        text
+    ):
+        return {
+            "stage": "initial_hint",
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if not has_history:
+        return {
+            "stage": "initial_hint",
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage in (None, "initial_hint"):
+        return {
+            "stage": "targeted_hint",
+            "hints": hints + 1,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage == "targeted_hint":
+        if hints + 1 >= 3:
+            return {
+                "stage": "full_solution",
+                "hints": 0,
+                "last_mode": mode,
+                "mode_changed": False,
+            }
+        return {
+            "stage": "targeted_hint",
+            "hints": hints + 1,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage == "full_solution":
+        return {
+            "stage": "targeted_hint",
+            "hints": 1,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage == "practice_wait":
+        return {
+            "stage": "practice_grade",
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage == "practice_grade":
+        return {
+            "stage": "practice_grade",
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage == "grading":
+        return {
+            "stage": "summary",
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    if stage == "summary":
+        return {
+            "stage": "summary",
+            "hints": 0,
+            "last_mode": mode,
+            "mode_changed": False,
+        }
+    return {
+        "stage": "initial_hint",
+        "hints": 0,
+        "last_mode": mode,
+        "mode_changed": False,
+    }
 
 
 def recognize_image(image: str | None):
@@ -213,14 +483,41 @@ def respond(
     level: str,
     mode: str,
     thinking: bool,
+    model: str,
+    reasoning_effort: str,
     answer_style: str | None,
     usage_state: dict,
+    stage_state: dict,
     request: gr.Request,
 ):
-    """纯文本聊天：流式回复，并累计会话用量与每日每访客限额。"""
+    """纯文本聊天：流式回复，累计会话用量，并按互动模式阶段引导。
+
+    思考链仅当轮展示（reasoning_md 输出），不写入历史、不回传 API。
+    """
     history = list(history or [])
+    stage_state = dict(stage_state or _new_stage_state())
+    stage_state.setdefault("stage", None)
+    stage_state.setdefault("hints", 0)
+    stage_state.setdefault("last_mode", MODE_INTERACTIVE)
+    if mode == MODE_INTERACTIVE and stage_state.get("stage") not in (
+        "initial_hint",
+        "targeted_hint",
+        "full_solution",
+        "summary",
+        "grading",
+        "practice_wait",
+        "practice_grade",
+    ):
+        stage_state["stage"] = "initial_hint"
     if not message.strip():
-        yield history, "", "💡 请先输入问题，或上传题目图片等待自动识别。", usage_state
+        yield (
+            history,
+            "",
+            "💡 请先输入问题，或上传题目图片等待自动识别。",
+            usage_state,
+            stage_state,
+            "",
+        )
         return
 
     ip = (request.client.host if request and request.client else None) or "unknown"
@@ -231,6 +528,8 @@ def respond(
             "",
             f"⚠️ 消息过长（最多 {MAX_MESSAGE_LEN:,} 字符），请精简后重试。",
             usage_state,
+            stage_state,
+            "",
         )
         return
 
@@ -244,8 +543,11 @@ def respond(
         log_access_event(
             "超额拒绝", f"IP={ip}", f"本访客={daily_used}", f"全局={global_used}"
         )
-        yield history, "", quota_msg, usage_state
+        yield history, "", quota_msg, usage_state, stage_state, ""
         return
+
+    # 根据用户新消息推进互动模式阶段（解答模式无阶段）
+    new_stage = advance_stage(mode, message, stage_state, has_history=bool(history))
 
     user_content = normalize_math_text(message, auto_close=True)
     _log_event("发送", user_content)
@@ -260,35 +562,77 @@ def respond(
             "",
             "",
             usage_state,
+            new_stage,
+            "",
         )
         return
 
     answer = ""
+    reasoning_text = ""
     usage = None
     truncated = False
+    thinking_started = time.monotonic()
     try:
-        for piece, chunk_usage, finish_reason in client.chat_stream_with_usage(
-            to_api_messages(history, level, mode, answer_style), thinking=thinking
+        for piece, reasoning_piece, chunk_usage, finish_reason in (
+            client.chat_stream_with_usage(
+                to_api_messages(
+                    history,
+                    level,
+                    mode,
+                    answer_style,
+                    stage=new_stage["stage"],
+                    mode_changed=new_stage["mode_changed"],
+                ),
+                thinking=thinking,
+                reasoning_effort=reasoning_effort,
+                model=model,
+            )
         ):
+            if reasoning_piece:
+                reasoning_text += reasoning_piece
             if piece:
                 answer += piece
             if chunk_usage is not None:
                 usage = chunk_usage
             if finish_reason == "length":
                 truncated = True
-            display = normalize_math_text(answer)
-            yield (
-                history + [{"role": "assistant", "content": display}],
-                "",
-                "",
-                usage_state,
-            )
+            if not answer:
+                # 思考阶段：状态栏显示已用时与估算思考 token，避免界面一片空白
+                tokens_part = (
+                    f"，思考约 {estimate_tokens(reasoning_text)} tokens"
+                    if reasoning_text
+                    else ""
+                )
+                status_text = (
+                    "⏳ 正在思考… "
+                    f"已用时 {int(time.monotonic() - thinking_started)} 秒"
+                    f"{tokens_part}"
+                )
+                yield (
+                    history,
+                    "",
+                    status_text,
+                    usage_state,
+                    new_stage,
+                    normalize_math_text(reasoning_text, auto_close=True),
+                )
+            else:
+                display = normalize_math_text(answer)
+                yield (
+                    history + [{"role": "assistant", "content": display}],
+                    "",
+                    "",
+                    usage_state,
+                    new_stage,
+                    normalize_math_text(reasoning_text, auto_close=True),
+                )
     except Exception as exc:
         turn_total = None
         if usage is not None:
             turn_total = int(getattr(usage, "total_tokens", 0) or 0)
         elif answer:
             turn_total = estimate_tokens(answer)
+        _log_error(exc, ip=ip, turn_total=turn_total, partial=bool(answer))
         usage_state = record_usage(usage_state, turn_total)
         if turn_total is not None:
             daily_used = add_daily_usage(today, ip, turn_total)
@@ -311,22 +655,40 @@ def respond(
         else:
             partial_history = history
             status_text = _friendly_error(exc)
-        yield partial_history, "", status_text, usage_state
+        yield (
+            partial_history,
+            "",
+            status_text,
+            usage_state,
+            new_stage,
+            normalize_math_text(reasoning_text, auto_close=True),
+        )
         return
 
     if not answer:
         usage_state = record_usage(usage_state, None)
+        turn_total = (
+            int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None
+        )
+        _log_empty_reply(ip=ip, turn_total=turn_total, truncated=truncated)
+        if truncated:
+            hint = "模型的思考过程已用完本次输出额度，没能生成正式回答"
+        else:
+            hint = "请求已完成，但模型没有生成正式回答"
+        if turn_total is not None:
+            hint += f"（本次约消耗 {turn_total} tokens）"
+        status_text = (
+            f"⚠️ {hint}。\n\n"
+            "建议：关闭「深度思考模式」、把 .env 中 DEEPSEEK_REASONING_EFFORT 调低，"
+            "或调大 MAX_OUTPUT_TOKENS 后重启。"
+        )
         yield (
-            history
-            + [
-                {
-                    "role": "assistant",
-                    "content": "（没有收到回复，请检查 API Key、余额或网络）",
-                }
-            ],
+            history + [{"role": "assistant", "content": "（未收到正式回答）"}],
             "",
-            "",
+            status_text,
             usage_state,
+            new_stage,
+            normalize_math_text(reasoning_text, auto_close=True),
         )
         return
 
@@ -357,13 +719,73 @@ def respond(
     )
     if truncated:
         status_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
-    yield final_history, "", status_text, usage_state
+    yield (
+        final_history,
+        "",
+        status_text,
+        usage_state,
+        new_stage,
+        normalize_math_text(reasoning_text, auto_close=True),
+    )
+
+
+def continue_last_answer(
+    history: list[dict],
+    level: str,
+    mode: str,
+    thinking: bool,
+    model: str,
+    reasoning_effort: str,
+    answer_style: str | None,
+    usage_state: dict,
+    stage_state: dict,
+    request: gr.Request,
+):
+    """「继续生成」按钮：取最近一条题目原文，拼上继续指令后复用完整回复流程。"""
+    history = list(history or [])
+    last_user = ""
+    for item in reversed(history):
+        content = item.get("content")
+        if item.get("role") == "user" and isinstance(content, str) and content.strip():
+            last_user = content
+            break
+    if not last_user:
+        yield (
+            history,
+            "",
+            "💡 还没有可继续的题目，请先提问。",
+            usage_state,
+            stage_state,
+            gr.skip(),
+        )
+        return
+    message = f"{last_user}\n（请继续完成上一条回答）"
+    yield from respond(
+        message,
+        history,
+        level,
+        mode,
+        thinking,
+        model,
+        reasoning_effort,
+        answer_style,
+        usage_state,
+        stage_state,
+        request,
+    )
 
 
 def clear_conversation():
-    """开启新对话：清空聊天记录、重置用量统计并持久化。"""
+    """开启新对话：清空聊天记录、重置用量与阶段状态并持久化。"""
     save_history([])
-    return gr.update(value=[]), "", "🗑️ 已开启新对话。", new_usage_state()
+    return (
+        gr.update(value=[]),
+        "",
+        "🗑️ 已开启新对话。",
+        new_usage_state(),
+        _new_stage_state(),
+        "（本轮无思考过程）",
+    )
 
 
 def render_usage_panel(request: gr.Request) -> str:
@@ -425,8 +847,8 @@ def verify_last_answer(history: list[dict]) -> str:
 
 
 def toggle_answer_style(mode: str):
-    """解答风格选项只在直接解答模式下显示。"""
-    return gr.update(visible=(mode == "直接解答模式"))
+    """解答风格选项只在解答模式下显示。"""
+    return gr.update(visible=(mode == MODE_ANSWER))
 
 
 with gr.Blocks(title="数学学习 AI 助手") as demo:
@@ -451,19 +873,29 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             ["小学", "初中", "高中", "大学"], value="高中", label="学段"
         )
         mode_radio = gr.Radio(
-            ["讲解模式", "重点互动模式", "直接解答模式", "练习模式"],
-            value="讲解模式",
+            [MODE_INTERACTIVE, MODE_ANSWER],
+            value=MODE_INTERACTIVE,
             label="模式",
         )
         thinking_checkbox = gr.Checkbox(
             value=settings.thinking if settings else False,
             label="深度思考模式（更严谨，稍慢）",
         )
+        model_radio = gr.Radio(
+            ["deepseek-v4-flash", "deepseek-v4-pro"],
+            value=settings.model if settings else "deepseek-v4-flash",
+            label="模型",
+        )
+        effort_radio = gr.Radio(
+            ["low", "high", "max"],
+            value=settings.reasoning_effort if settings else "high",
+            label="思考强度",
+        )
     with gr.Row():
         answer_style_radio = gr.Radio(
             ["完整步骤+答案", "简略过程+答案", "只给答案和结论"],
             value="完整步骤+答案",
-            label="解答风格（仅直接解答模式）",
+            label="解答风格（仅解答模式）",
             visible=False,
         )
     with gr.Row():
@@ -480,10 +912,20 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             )
             status = gr.Markdown("")
             usage_state = gr.State(value=new_usage_state())
+            stage_state = gr.State(value=_new_stage_state())
             send_btn = gr.Button("发送", variant="primary")
+    with gr.Accordion("思考过程（仅当轮，不会写入历史）", open=False):
+        reasoning_md = gr.Markdown(
+            "（本轮暂无思考过程）",
+            latex_delimiters=[
+                {"left": "$$", "right": "$$", "display": True},
+                {"left": "$", "right": "$", "display": False},
+            ],
+        )
     with gr.Row():
         clear_btn = gr.Button("🗑️ 新对话")
         stop_btn = gr.Button("⏹️ 停止生成")
+        continue_btn = gr.Button("▶️ 继续生成")
         verify_btn = gr.Button("🧮 验算上一条回答")
     with gr.Row():
         refresh_btn = gr.Button("🔄 刷新用量（仅本机）")
@@ -511,10 +953,13 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             level_radio,
             mode_radio,
             thinking_checkbox,
+            model_radio,
+            effort_radio,
             answer_style_radio,
             usage_state,
+            stage_state,
         ],
-        outputs=[chatbot, textbox, status, usage_state],
+        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
     )
     submit_event = textbox.submit(
         respond,
@@ -524,14 +969,35 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             level_radio,
             mode_radio,
             thinking_checkbox,
+            model_radio,
+            effort_radio,
             answer_style_radio,
             usage_state,
+            stage_state,
         ],
-        outputs=[chatbot, textbox, status, usage_state],
+        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
     )
-    stop_btn.click(None, None, None, cancels=[send_event, submit_event])
+    continue_event = continue_btn.click(
+        continue_last_answer,
+        inputs=[
+            chatbot,
+            level_radio,
+            mode_radio,
+            thinking_checkbox,
+            model_radio,
+            effort_radio,
+            answer_style_radio,
+            usage_state,
+            stage_state,
+        ],
+        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
+    )
+    stop_btn.click(
+        None, None, None, cancels=[send_event, submit_event, continue_event]
+    )
     clear_btn.click(
-        clear_conversation, outputs=[chatbot, textbox, status, usage_state]
+        clear_conversation,
+        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
     )
     verify_btn.click(verify_last_answer, inputs=[chatbot], outputs=[status])
     refresh_btn.click(render_usage_panel, inputs=[], outputs=[usage_panel])

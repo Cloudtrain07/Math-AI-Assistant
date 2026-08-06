@@ -57,13 +57,13 @@ def test_trim_log_file_keeps_last_n(tmp_path):
     assert lines == ["line4", "line5", "line6", "line7", "line8"]
 
 
-def test_log_access_event_trims_to_5(tmp_path):
+def test_log_access_event_trims_to_1000(tmp_path):
     target = tmp_path / "access.log"
-    for i in range(6):
+    for i in range(1001):
         log_access_event("事件", f"n={i}", target=target)
     lines = target.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 5
-    assert "n=5" in lines[-1]
+    assert len(lines) == 1000
+    assert "n=1000" in lines[-1]
     assert "n=0" not in "".join(lines)
 
 
