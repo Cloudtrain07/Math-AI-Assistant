@@ -41,12 +41,11 @@ def get_lan_ip() -> str:
 
 def save_access_info(
     url: str | None,
-    username: str,
-    password: str,
+    accounts: list[dict],
     lan_url: str | None = None,
     target: Path | None = None,
 ) -> Path:
-    """把公网/局域网地址与访问账号写入访问信息文件，返回文件路径。"""
+    """把公网/局域网地址与全部访问账号写入访问信息文件，返回文件路径。"""
     target = Path(target) if target is not None else ACCESS_FILE
     target.parent.mkdir(parents=True, exist_ok=True)
     lan_url = lan_url or f"http://{get_lan_ip()}:7860"
@@ -56,9 +55,14 @@ def save_access_info(
         f"生成时间：{now}",
         f"公网地址：{url if url else '（暂不可用，请检查网络后重启程序）'}",
         f"局域网地址：{lan_url}",
-        f"用户名：{username}",
-        f"密码：{password}",
-        "提示：密码每次启动都会重新生成，请只分享给信任的人。",
+        "访问账号（用户名 / 密码）：",
+    ]
+    for account in accounts:
+        display = account.get("display_name") or account.get("username")
+        suffix = f"（{display}）" if display and display != account.get("username") else ""
+        lines.append(f"  {account.get('username')} / {account.get('password')}{suffix}")
+    lines += [
+        "提示：密码固定，请妥善保管，只分享给信任的人。",
         "",
     ]
     target.write_text("\n".join(lines), encoding="utf-8")

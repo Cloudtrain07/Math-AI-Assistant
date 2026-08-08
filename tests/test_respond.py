@@ -44,7 +44,7 @@ class _ReasoningClient:
 
 def _fake_request():
     client = type("Client", (), {"host": "127.0.0.1"})()
-    return type("Request", (), {"client": client})()
+    return type("Request", (), {"client": client, "username": "user1"})()
 
 
 def _stage0():
@@ -110,7 +110,7 @@ def test_respond_success_path(monkeypatch, tmp_path):
     assert stage_state["stage"] == "initial_hint"
     assert fake_client.calls == 1
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(today, "127.0.0.1", path=p) == 123
+    assert usage_module.get_daily_used(today, "user1", path=p) == 123
     assert usage_module.get_daily_total(today, path=p) == 123
 
 

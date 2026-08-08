@@ -34,15 +34,21 @@ def test_save_access_info_writes_file(tmp_path):
     target = tmp_path / "当前访问密码.txt"
     result = save_access_info(
         "https://abc.gradio.live",
-        "math",
-        "Ab3dEf9k",
+        [
+            {
+                "username": "user1",
+                "password": "Ab3dEf9k",
+                "display_name": "小明",
+            }
+        ],
         lan_url="http://192.168.1.5:7860",
         target=target,
     )
     assert result == target
     text = target.read_text(encoding="utf-8")
-    assert "math" in text
+    assert "user1" in text
     assert "Ab3dEf9k" in text
+    assert "小明" in text
     assert "https://abc.gradio.live" in text
     assert "http://192.168.1.5:7860" in text
 
