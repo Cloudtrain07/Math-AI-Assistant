@@ -214,6 +214,7 @@ def test_generate_similar_no_selection(monkeypatch, tmp_path):
     results = list(
         app_module.generate_similar(
             "",
+            "进阶",
             [],
             "高中",
             "解答模式",
@@ -236,6 +237,7 @@ def test_generate_similar_with_entry(monkeypatch, tmp_path):
     results = list(
         app_module.generate_similar(
             entry["id"],
+            "挑战",
             [],
             "高中",
             "解答模式",
@@ -252,3 +254,38 @@ def test_generate_similar_with_entry(monkeypatch, tmp_path):
     assert "收藏" in last[2]
     user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
     assert any("变式" in u for u in user_msgs)
+    assert any("挑战" in u for u in user_msgs)
+
+
+def test_confirm_clear_two_step(monkeypatch, tmp_path):
+    _patch_env(monkeypatch, tmp_path)
+    r1 = app_module.confirm_clear(_fake_request(), [], "")
+    assert r1[8] == "armed"
+    assert "再点一次确认" in r1[2]
+    r2 = app_module.confirm_clear(_fake_request(), [], "armed")
+    assert r2[8] == ""
+    assert "已开启新对话" in r2[2]
+
+
+def test_confirm_delete_two_step(monkeypatch, tmp_path):
+    _patch_env(monkeypatch, tmp_path)
+    entry = bank.add_entry(
+        {"title": "索引", "question": "题"}, username="user1"
+    )
+    r1 = app_module.confirm_delete(_fake_request(), entry["id"], "")
+    assert r1[0] == "armed"
+    assert "再点一次确认删除" in r1[2]
+    r2 = app_module.confirm_delete(_fake_request(), entry["id"], "armed")
+    assert r2[0] == ""
+    assert "已删除" in r2[2]
+    assert bank.load_entries("user1") == []
+
+
+def test_reset_confirm_buttons():
+    clear_state, delete_state, clear_btn, delete_btn = (
+        app_module.reset_confirm_buttons("armed", "")
+    )
+    assert clear_state["value"] == ""
+    assert clear_btn["value"] == "🗑️ 新对话"
+    assert delete_state.get("value") is None
+    assert delete_btn.get("value") is None

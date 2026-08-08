@@ -101,12 +101,13 @@ def test_respond_success_path(monkeypatch, tmp_path):
             _fake_request(),
         )
     )
-    final_history, _, status_text, usage_state, stage_state, _ = results[-1]
+    final_history, _, status_text, usage_text, usage_state, stage_state, _ = results[-1]
 
     assert final_history[-1]["content"] == "你好世界"
     assert usage_state == {"total_tokens": 123, "turns": 1}
-    assert "累计" in status_text and "123" in status_text
-    assert "本访客" in status_text
+    assert "123" in status_text
+    assert "累计" in usage_text and "123" in usage_text
+    assert "本访客" in usage_text
     assert stage_state["stage"] == "initial_hint"
     assert fake_client.calls == 1
     today = __import__("datetime").date.today().isoformat()
@@ -143,7 +144,7 @@ def test_respond_quota_rejected(monkeypatch, tmp_path):
             _fake_request(),
         )
     )
-    final_history, _, status_text, usage_state, stage_state, _ = results[-1]
+    final_history, _, status_text, _, usage_state, stage_state, _ = results[-1]
 
     assert "额度已用尽" in status_text
     assert final_history == []
@@ -176,7 +177,7 @@ def test_respond_overlong_message_rejected(monkeypatch):
             _fake_request(),
         )
     )
-    final_history, _, status_text, usage_state, stage_state, _ = results[-1]
+    final_history, _, status_text, _, usage_state, stage_state, _ = results[-1]
 
     assert "过长" in status_text
     assert final_history == []
@@ -210,7 +211,7 @@ def test_respond_escape_keyword_full_solution(monkeypatch, tmp_path):
             _fake_request(),
         )
     )
-    final_history, _, _, _, stage_state, _ = results[-1]
+    final_history, _, _, _, _, stage_state, _ = results[-1]
     assert stage_state["stage"] == "full_solution"
     assert final_history[-1]["content"] == "你好世界"
 
@@ -240,7 +241,7 @@ def test_respond_practice_keyword_practice_wait(monkeypatch, tmp_path):
             _fake_request(),
         )
     )
-    _, _, _, _, stage_state, _ = results[-1]
+    _, _, _, _, _, stage_state, _ = results[-1]
     assert stage_state["stage"] == "practice_wait"
 
 
@@ -269,7 +270,7 @@ def test_respond_answer_mode_stage_none(monkeypatch, tmp_path):
             _fake_request(),
         )
     )
-    _, _, _, _, stage_state, _ = results[-1]
+    _, _, _, _, _, stage_state, _ = results[-1]
     assert stage_state["stage"] is None
     assert stage_state["last_mode"] == "解答模式"
 
@@ -304,7 +305,7 @@ def test_respond_new_problem_resets_stage(monkeypatch, tmp_path):
             _fake_request(),
         )
     )
-    _, _, _, _, new_stage, _ = results[-1]
+    _, _, _, _, _, new_stage, _ = results[-1]
     assert new_stage["stage"] == "initial_hint"
     assert new_stage["hints"] == 0
 
@@ -339,7 +340,7 @@ def test_respond_reasoning_panel_and_status(monkeypatch, tmp_path):
     assert thinking_yields
     assert "tokens" in thinking_yields[0][2]
     # 思考片段累积显示在 reasoning_md 输出中
-    reasoning_texts = [r[5] for r in results if r[5]]
+    reasoning_texts = [r[6] for r in results if r[6]]
     assert any(
         "先看定义域" in t and "再讨论单调性" in t for t in reasoning_texts
     )
@@ -377,7 +378,7 @@ def test_continue_last_answer(monkeypatch, tmp_path):
             _fake_request(),
         )
     )
-    final_history, _, _, _, _, _ = results[-1]
+    final_history, _, _, _, _, _, _ = results[-1]
     last_user = next(
         m["content"] for m in reversed(final_history) if m["role"] == "user"
     )

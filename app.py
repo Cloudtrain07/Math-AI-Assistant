@@ -73,6 +73,17 @@ LATEX_DELIMITERS = [
     {"left": "$$", "right": "$$", "display": True},
     {"left": "$", "right": "$", "display": False},
 ]
+
+# 移动端适配与整体排版（蓝白黑冷色调主题之外的少量微调）
+PAGE_CSS = """
+.gradio-container { max-width: 1280px !important; margin: 0 auto !important; }
+@media (max-width: 768px) {
+  .gradio-container { max-width: 100% !important; padding: 8px !important; }
+  .chatbot { height: 55vh !important; }
+  .katex-display, .katex { overflow-x: auto; overflow-y: hidden; }
+}
+"""
+
 # app.py 位于项目根目录，data 目录就在同级
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -538,6 +549,7 @@ def respond(
             history,
             "",
             "💡 请先输入问题，或上传题目图片等待自动识别。",
+            "",
             usage_state,
             stage_state,
             "",
@@ -554,6 +566,7 @@ def respond(
             history,
             "",
             f"⚠️ 消息过长（最多 {MAX_MESSAGE_LEN:,} 字符），请精简后重试。",
+            "",
             usage_state,
             stage_state,
             "",
@@ -573,7 +586,7 @@ def respond(
             f"本访客={daily_used}",
             f"全局={global_used}",
         )
-        yield history, "", quota_msg, usage_state, stage_state, ""
+        yield history, "", quota_msg, "", usage_state, stage_state, ""
         return
 
     # 根据用户新消息推进互动模式阶段（解答模式无阶段）
@@ -591,6 +604,7 @@ def respond(
     if client is None:
         yield (
             history + [{"role": "assistant", "content": f"⚠️ {startup_hint}"}],
+            "",
             "",
             "",
             usage_state,
@@ -644,6 +658,7 @@ def respond(
                     history,
                     "",
                     status_text,
+                    "",
                     usage_state,
                     new_stage,
                     normalize_math_text(reasoning_text, auto_close=True),
@@ -652,6 +667,7 @@ def respond(
                 display = normalize_math_text(answer)
                 yield (
                     history + [{"role": "assistant", "content": display}],
+                    "",
                     "",
                     "",
                     usage_state,
@@ -693,6 +709,7 @@ def respond(
             partial_history,
             "",
             status_text,
+            format_cumulative(usage_state),
             usage_state,
             new_stage,
             normalize_math_text(reasoning_text, auto_close=True),
@@ -722,6 +739,7 @@ def respond(
             history + [{"role": "assistant", "content": "（未收到正式回答）"}],
             "",
             status_text,
+            format_cumulative(usage_state),
             usage_state,
             new_stage,
             normalize_math_text(reasoning_text, auto_close=True),
@@ -746,22 +764,22 @@ def respond(
             f"本访客={daily_used}",
             f"全局={global_used}",
         )
-    status_text = format_usage(usage)
-    cum_text = format_cumulative(usage_state)
-    status_text = f"{status_text}\n\n{cum_text}" if status_text else cum_text
-    status_text += (
+    result_text = format_usage(usage)
+    if truncated:
+        result_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
+    verify_note = _auto_verify_loop(answer, final_history, username)
+    if verify_note:
+        result_text += "\n\n" + verify_note
+    usage_text = format_cumulative(usage_state)
+    usage_text += (
         f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本访客），"
         f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
     )
-    if truncated:
-        status_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
-    verify_note = _auto_verify_loop(answer, final_history, username)
-    if verify_note:
-        status_text += "\n\n" + verify_note
     yield (
         final_history,
         "",
-        status_text,
+        result_text,
+        usage_text,
         usage_state,
         new_stage,
         normalize_math_text(reasoning_text, auto_close=True),
@@ -793,6 +811,7 @@ def continue_last_answer(
             history,
             "",
             "💡 还没有可继续的题目，请先提问。",
+            "",
             usage_state,
             stage_state,
             gr.skip(),
@@ -822,6 +841,7 @@ def clear_conversation(request: gr.Request):
         gr.update(value=[]),
         "",
         "🗑️ 已开启新对话。",
+        "",
         new_usage_state(),
         _new_stage_state(),
         "（本轮无思考过程）",
@@ -1356,6 +1376,7 @@ def save_entry(
 
 def generate_similar(
     entry_id: str,
+    difficulty: str,
     history: list[dict],
     level: str,
     mode: str,
@@ -1370,18 +1391,21 @@ def generate_similar(
     """选中题目生成同类型变式，发进聊天区走正常问答流程。"""
     username = _username_of(request)
     entry = get_entry(entry_id, username) if entry_id else None
+    if difficulty not in ("基础", "进阶", "挑战"):
+        difficulty = "进阶"
     if entry is None:
         yield (
             gr.update(),
             "",
             "⚠️ 请先在习题库选择一道题。",
+            "",
             usage_state,
             stage_state,
             gr.update(),
         )
         return
     message = (
-        "【习题库变式】请根据下面这道题，出一道同知识点的变式题"
+        f"【习题库变式】请根据下面这道题，出一道同知识点的「{difficulty}」难度变式题"
         "（改数字或条件，题型方法保持一致），只出题、不要解答：\n\n"
         f"{entry['question']}"
     )
@@ -1402,18 +1426,127 @@ def generate_similar(
         last = item
         yield item
     if last is not None:
-        h, t, s, u, st, r = last
+        h, t, s, usage_text, u, st, r = last
         yield (
             h,
             t,
             s + "\n\n📌 如需收藏这道变式，点击「收藏当前题目」。",
+            usage_text,
             u,
             st,
             r,
         )
 
 
-with gr.Blocks(title="数学学习 AI 助手") as demo:
+def confirm_clear(
+    request: gr.Request,
+    history: list[dict],
+    confirm_state: str,
+):
+    """新对话二次确认：第一次点击进入待确认，第二次才真正清空。"""
+    if not confirm_state:
+        return (
+            gr.update(),
+            gr.update(),
+            "⚠️ 再点一次确认清空当前账号的对话（5 秒后自动取消）。",
+            "",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value="⚠️ 再点一次确认清空"),
+            "armed",
+        )
+    (
+        new_history,
+        _text,
+        result_msg,
+        usage_msg,
+        new_usage,
+        new_stage,
+        _reasoning,
+    ) = clear_conversation(request)
+    return (
+        new_history,
+        _text,
+        result_msg,
+        usage_msg,
+        new_usage,
+        new_stage,
+        _reasoning,
+        gr.update(value="🗑️ 新对话"),
+        "",
+    )
+
+
+def confirm_delete(
+    request: gr.Request,
+    selected_id: str,
+    confirm_state: str,
+):
+    """删除习题二次确认：第一次点击进入待确认，第二次才真正删除。"""
+    if not selected_id:
+        return (
+            "",
+            gr.update(value="🗑️ 删除"),
+            "⚠️ 请先选择一道题。",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            "（先在上方选择一道题）",
+            "",
+            gr.update(value=False),
+        )
+    if not confirm_state:
+        return (
+            "armed",
+            gr.update(value="⚠️ 再点一次确认删除"),
+            "⚠️ 再点一次确认删除这道题（5 秒后自动取消）。",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
+    (
+        bank_msg,
+        stats,
+        tag_update,
+        selector_update,
+        detail,
+        selected,
+        solution_update,
+    ) = delete_selected_entry(selected_id, request)
+    return (
+        "",
+        gr.update(value="🗑️ 删除"),
+        bank_msg,
+        stats,
+        tag_update,
+        selector_update,
+        detail,
+        selected,
+        solution_update,
+    )
+
+
+def reset_confirm_buttons(clear_state: str, delete_state: str):
+    """Timer 到点后复位二次确认状态与按钮文案。"""
+    return (
+        gr.update(value="") if clear_state else gr.update(),
+        gr.update(value="") if delete_state else gr.update(),
+        gr.update(value="🗑️ 新对话") if clear_state else gr.update(),
+        gr.update(value="🗑️ 删除") if delete_state else gr.update(),
+    )
+
+
+with gr.Blocks(
+    title="数学学习 AI 助手",
+    theme=gr.themes.Base(
+        primary_hue="blue", secondary_hue="blue", neutral_hue="slate"
+    ),
+    css=PAGE_CSS,
+) as demo:
     gr.Markdown(
         "# 🧮 数学学习 AI 助手\n\n"
         "基于 DeepSeek 大模型，采用苏格拉底式引导，一步步带你学会数学。"
@@ -1445,6 +1578,7 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
                     value=settings.thinking if settings else False,
                     label="深度思考模式（更严谨，稍慢）",
                 )
+            with gr.Accordion("⚙️ 高级设置", open=False):
                 model_radio = gr.Radio(
                     ["deepseek-v4-flash", "deepseek-v4-pro"],
                     value=settings.model if settings else "deepseek-v4-flash",
@@ -1455,7 +1589,6 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
                     value=settings.reasoning_effort if settings else "high",
                     label="思考强度",
                 )
-            with gr.Row():
                 answer_style_radio = gr.Radio(
                     ["完整步骤+答案", "简略过程+答案", "只给答案和结论"],
                     value="完整步骤+答案",
@@ -1474,7 +1607,8 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
                         show_label=False,
                         container=False,
                     )
-                    status = gr.Markdown("")
+                    result_status = gr.Markdown("")
+                    usage_status = gr.Markdown("")
                     usage_state = gr.State(value=new_usage_state())
                     stage_state = gr.State(value=_new_stage_state())
                     send_btn = gr.Button("发送", variant="primary")
@@ -1492,20 +1626,21 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
                 continue_btn = gr.Button("▶️ 继续生成")
                 collect_btn = gr.Button("📌 收藏当前题目")
                 verify_btn = gr.Button("🧮 验算上一条回答")
-            with gr.Row():
-                refresh_btn = gr.Button("🔄 刷新用量（仅本机）")
-                usage_panel = gr.Markdown("（点击“刷新用量”查看今日用量）")
-            with gr.Row():
-                reset_account_dropdown = gr.Dropdown(
-                    choices=[a["username"] for a in accounts],
-                    label="重置密码账号（仅本机）",
-                )
-                reset_pwd_textbox = gr.Textbox(
-                    label="新密码",
-                    placeholder="输入新密码后点击重置",
-                )
-                reset_pwd_btn = gr.Button("重置密码")
-                reset_pwd_status = gr.Markdown("")
+            with gr.Accordion("🔐 主人设置（仅本机可见）", open=False):
+                with gr.Row():
+                    refresh_btn = gr.Button("🔄 刷新用量")
+                    usage_panel = gr.Markdown("（点击“刷新用量”查看今日用量）")
+                with gr.Row():
+                    reset_account_dropdown = gr.Dropdown(
+                        choices=[a["username"] for a in accounts],
+                        label="重置密码账号",
+                    )
+                    reset_pwd_textbox = gr.Textbox(
+                        label="新密码",
+                        placeholder="输入新密码后点击重置",
+                    )
+                    reset_pwd_btn = gr.Button("重置密码")
+                    reset_pwd_status = gr.Markdown("")
             gr.Examples(
                 examples=[
                     "解方程 x² - 5x + 6 = 0，请引导我自己算出来",
@@ -1516,71 +1651,90 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             )
 
         with gr.Tab("习题库"):
-            bank_stats = gr.Markdown("（习题库为空）")
             with gr.Row():
-                bank_tag_filter = gr.Dropdown(
-                    choices=[], label="按标签筛选", value=None
-                )
-                bank_search = gr.Textbox(
-                    label="关键词搜索",
-                    placeholder="搜索题目或标签",
-                    scale=2,
-                )
-                bank_refresh_btn = gr.Button("🔄 刷新")
-                new_btn = gr.Button("📝 手动新建")
-            entry_selector = gr.Dropdown(
-                choices=[], label="选择题目", value=None
-            )
-            with gr.Row():
-                solution_checkbox = gr.Checkbox(
-                    label="显示正确解", value=False
-                )
-                edit_btn = gr.Button("✏️ 编辑")
-                delete_btn = gr.Button("🗑️ 删除")
-                similar_btn = gr.Button("🎯 生成同类型题")
-            detail_md = gr.Markdown(
-                "（先在上方选择一道题）",
-                latex_delimiters=LATEX_DELIMITERS,
-            )
-            bank_status = gr.Markdown("", latex_delimiters=LATEX_DELIMITERS)
-            with gr.Accordion(
-                "题目表单（收藏 / 手动新建 / 编辑）", open=False
-            ) as entry_form:
-                edit_id_state = gr.State(value="")
-                form_title = gr.Textbox(
-                    label="索引描述（必填，纯中文，用于查找）",
-                    lines=1,
-                    placeholder="如：讨论反常积分的绝对收敛条件",
-                )
-                form_question = gr.Textbox(
-                    label="题目内容",
-                    lines=4,
-                    placeholder="输入完整题目，用中文描述即可；公式建议用 $...$ 包裹以便排版",
-                )
-                form_mistake = gr.Textbox(
-                    label="我的卡点 / 错误做法（可选）", lines=2
-                )
-                form_solution = gr.Textbox(
-                    label="正确解（可选，建议自己写一遍）", lines=4
-                )
-                form_error_type = gr.Dropdown(
-                    choices=ERROR_TYPES, label="错误类型（可选）"
-                )
-                form_tags = gr.Textbox(
-                    label="标签（多个用顿号或逗号分隔）", lines=1
-                )
-                with gr.Row():
-                    form_save_btn = gr.Button("💾 保存", variant="primary")
-                    form_cancel_btn = gr.Button("取消")
-                form_status = gr.Markdown("", latex_delimiters=LATEX_DELIMITERS)
-            force_save_state = gr.State(value="")
-            selected_id_state = gr.State(value="")
+                with gr.Column(scale=1):
+                    bank_stats = gr.Markdown("（习题库为空）")
+                    with gr.Row():
+                        bank_tag_filter = gr.Dropdown(
+                            choices=[], label="按标签筛选", value=None
+                        )
+                        bank_search = gr.Textbox(
+                            label="关键词搜索",
+                            placeholder="搜索题目或标签",
+                            scale=2,
+                        )
+                    with gr.Row():
+                        bank_refresh_btn = gr.Button("🔄 刷新")
+                        new_btn = gr.Button("📝 手动新建")
+                    entry_selector = gr.Dropdown(
+                        choices=[], label="选择题目", value=None
+                    )
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        solution_checkbox = gr.Checkbox(
+                            label="显示正确解", value=False
+                        )
+                        edit_btn = gr.Button("✏️ 编辑")
+                        delete_btn = gr.Button("🗑️ 删除")
+                        similar_btn = gr.Button("🎯 生成同类型题")
+                    difficulty_radio = gr.Radio(
+                        ["基础", "进阶", "挑战"],
+                        value="进阶",
+                        label="变式难度（生成同类型题时使用）",
+                    )
+                    detail_md = gr.Markdown(
+                        "（先在上方选择一道题）",
+                        latex_delimiters=LATEX_DELIMITERS,
+                    )
+                    bank_status = gr.Markdown(
+                        "", latex_delimiters=LATEX_DELIMITERS
+                    )
+                    with gr.Accordion(
+                        "题目表单（收藏 / 手动新建 / 编辑）", open=False
+                    ) as entry_form:
+                        edit_id_state = gr.State(value="")
+                        form_title = gr.Textbox(
+                            label="索引描述（必填，纯中文，用于查找）",
+                            lines=1,
+                            placeholder="如：讨论反常积分的绝对收敛条件",
+                        )
+                        form_question = gr.Textbox(
+                            label="题目内容",
+                            lines=4,
+                            placeholder="输入完整题目，用中文描述即可；公式建议用 $...$ 包裹以便排版",
+                        )
+                        form_mistake = gr.Textbox(
+                            label="我的卡点 / 错误做法（可选）", lines=2
+                        )
+                        form_solution = gr.Textbox(
+                            label="正确解（可选，建议自己写一遍）", lines=4
+                        )
+                        form_error_type = gr.Dropdown(
+                            choices=ERROR_TYPES, label="错误类型（可选）"
+                        )
+                        form_tags = gr.Textbox(
+                            label="标签（多个用顿号或逗号分隔）", lines=1
+                        )
+                        with gr.Row():
+                            form_save_btn = gr.Button(
+                                "💾 保存", variant="primary"
+                            )
+                            form_cancel_btn = gr.Button("取消")
+                        form_status = gr.Markdown(
+                            "", latex_delimiters=LATEX_DELIMITERS
+                        )
+                    force_save_state = gr.State(value="")
+                    selected_id_state = gr.State(value="")
+
+    clear_confirm_state = gr.State(value="")
+    delete_confirm_state = gr.State(value="")
+    confirm_timer = gr.Timer(value=5, active=True)
 
     # ===== 学习 Tab 事件 =====
     image_input.upload(
         recognize_image,
         inputs=[image_input],
-        outputs=[textbox, status, image_input],
+        outputs=[textbox, result_status, image_input],
     )
 
     send_event = send_btn.click(
@@ -1597,7 +1751,15 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             usage_state,
             stage_state,
         ],
-        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+        ],
     )
     submit_event = textbox.submit(
         respond,
@@ -1613,7 +1775,15 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             usage_state,
             stage_state,
         ],
-        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+        ],
     )
     continue_event = continue_btn.click(
         continue_last_answer,
@@ -1628,7 +1798,15 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             usage_state,
             stage_state,
         ],
-        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+        ],
     )
     collect_event = collect_btn.click(
         collect_current_problem,
@@ -1651,10 +1829,21 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
         None, None, None, cancels=[send_event, submit_event, continue_event]
     )
     clear_btn.click(
-        clear_conversation,
-        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
+        confirm_clear,
+        inputs=[chatbot, clear_confirm_state],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+            clear_btn,
+            clear_confirm_state,
+        ],
     )
-    verify_btn.click(verify_last_answer, inputs=[chatbot], outputs=[status])
+    verify_btn.click(verify_last_answer, inputs=[chatbot], outputs=[result_status])
     refresh_btn.click(render_usage_panel, inputs=[], outputs=[usage_panel])
     reset_pwd_btn.click(
         reset_account_password,
@@ -1665,6 +1854,11 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
         toggle_answer_style,
         inputs=[mode_radio],
         outputs=[answer_style_radio],
+    )
+    confirm_timer.tick(
+        reset_confirm_buttons,
+        inputs=[clear_confirm_state, delete_confirm_state],
+        outputs=[clear_confirm_state, delete_confirm_state, clear_btn, delete_btn],
     )
 
     # ===== 习题库 Tab 事件 =====
@@ -1724,9 +1918,11 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
         ],
     )
     delete_btn.click(
-        delete_selected_entry,
-        inputs=[selected_id_state],
+        confirm_delete,
+        inputs=[selected_id_state, delete_confirm_state],
         outputs=[
+            delete_confirm_state,
+            delete_btn,
             bank_status,
             bank_stats,
             bank_tag_filter,
@@ -1740,6 +1936,7 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
         generate_similar,
         inputs=[
             selected_id_state,
+            difficulty_radio,
             chatbot,
             level_radio,
             mode_radio,
@@ -1750,7 +1947,15 @@ with gr.Blocks(title="数学学习 AI 助手") as demo:
             usage_state,
             stage_state,
         ],
-        outputs=[chatbot, textbox, status, usage_state, stage_state, reasoning_md],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+        ],
     )
     form_save_btn.click(
         save_entry,
