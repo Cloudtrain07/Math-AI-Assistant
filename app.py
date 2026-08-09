@@ -17,13 +17,16 @@ from core.access import (
     is_owner_host,
     log_access_event,
     save_access_info,
+    trim_log_file,
 )
 from core.accounts import (
     check_login,
     ensure_accounts,
+    get_account,
     load_accounts,
     reset_password,
 )
+from core.backup import daily_backup_loop, ensure_today_backup
 from core.calculator import CALCULATOR_AVAILABLE, verify_math
 from core.config import get_settings
 from core.deepseek_client import DeepSeekClient, MaxWaitTimeout
@@ -64,7 +67,7 @@ from core.usage import (
 )
 from core.vision_client import VisionClient
 
-APP_VERSION = "2026-08-05"
+APP_VERSION = "1.0.0"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
@@ -73,6 +76,9 @@ LATEX_DELIMITERS = [
     {"left": "$$", "right": "$$", "display": True},
     {"left": "$", "right": "$", "display": False},
 ]
+
+# 日志文件保留的最大行数（超过后自动裁剪）
+LOG_MAX_LINES = 2000
 
 # 移动端适配与整体排版（蓝白黑冷色调主题之外的少量微调）
 PAGE_CSS = """
@@ -250,6 +256,7 @@ def _log_event(kind: str, text: str) -> None:
         with _log_lock:
             with open(DATA_DIR / "chat.log", "a", encoding="utf-8") as f:
                 f.write(line)
+        trim_log_file(DATA_DIR / "chat.log", max_lines=LOG_MAX_LINES)
     except Exception:
         pass
 
@@ -261,6 +268,7 @@ def _write_error_log(record: dict) -> None:
         with _log_lock:
             with open(DATA_DIR / "error.log", "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        trim_log_file(DATA_DIR / "error.log", max_lines=LOG_MAX_LINES)
     except Exception:
         pass
 
@@ -767,14 +775,13 @@ def respond(
     result_text = format_usage(usage)
     if truncated:
         result_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
-    verify_note = _auto_verify_loop(answer, final_history, username)
-    if verify_note:
-        result_text += "\n\n" + verify_note
     usage_text = format_cumulative(usage_state)
     usage_text += (
         f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本访客），"
         f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
     )
+    reasoning_display = normalize_math_text(reasoning_text, auto_close=True)
+    # 第一段：先立即输出答案，验算随后刷新，避免界面等待
     yield (
         final_history,
         "",
@@ -782,7 +789,20 @@ def respond(
         usage_text,
         usage_state,
         new_stage,
-        normalize_math_text(reasoning_text, auto_close=True),
+        reasoning_display,
+    )
+    # 第二段：本地验算（发现错误时模型复核），结果追加到「本次结果」
+    verify_note = _auto_verify_loop(answer, final_history, username)
+    if verify_note:
+        result_text += "\n\n" + verify_note
+    yield (
+        final_history,
+        "",
+        result_text,
+        usage_text,
+        usage_state,
+        new_stage,
+        reasoning_display,
     )
 
 
@@ -902,6 +922,16 @@ def restore_history(request: gr.Request) -> list[dict]:
     return load_history(username)
 
 
+def restore_level(request: gr.Request) -> str:
+    """登录后把学段默认值设为账号配置的学段（页面加载时触发）。"""
+    username = request.username if request and request.username else "unknown"
+    account = get_account(username)
+    level = account["level"] if account else "高中"
+    if level not in ("小学", "初中", "高中", "大学"):
+        level = "高中"
+    return level
+
+
 def _recheck_wrong_answer(answer: str) -> str:
     """验算发现不成立时，请模型快速复核并给出修正；失败返回空串。"""
     complete_fn = getattr(client, "complete", None)
@@ -952,38 +982,6 @@ def _auto_verify_loop(answer: str, history: list[dict], username: str) -> str:
         else:
             note += "\n\n⚠️ 验算发现疑点，复核未成功，可回复「重新检查」。"
     return note
-
-
-def verify_last_answer(history: list[dict]) -> str:
-    """用 sympy 验算上一条 AI 回答里的公式。"""
-    last = None
-    for item in reversed(list(history or [])):
-        if item.get("role") == "assistant" and isinstance(item.get("content"), str):
-            last = item["content"]
-            break
-    if last is None:
-        return "ℹ️ 还没有可验算的 AI 回答。"
-    if not CALCULATOR_AVAILABLE:
-        return "⚠️ 本地验算组件未安装（sympy / latex2sympy2），请先运行 pip install -r requirements.txt。"
-    results = verify_math(last)
-    if not results:
-        return "ℹ️ 上一条回答里没有找到可验算的公式。"
-    lines = ["**本地验算结果：**"]
-    for item in results:
-        source = item["source"][:60]
-        if item["status"] == "成立":
-            lines.append(f"✅ `{source}` → 等式成立")
-        elif item["status"] == "不成立":
-            lines.append(f"❌ `{source}` → **等式不成立！**")
-        elif item["status"] == "表达式":
-            lines.append(f"ℹ️ `{source}` → 已解析为表达式：`{item['detail']}`")
-        elif item["status"] == "方程":
-            lines.append(f"ℹ️ `{source}` → 已解析为方程 `{item['detail']}`（含未知数，无法自动判定，可代入具体值验证）")
-        elif item["status"] == "解为":
-            lines.append(f"ℹ️ `{source}` → 方程的解为 `{item['detail']}`（可对照 AI 给出的答案）")
-        else:
-            lines.append(f"⚠️ `{source}` → 解析失败：{item['detail']}")
-    return "\n\n".join(lines)
 
 
 def toggle_answer_style(mode: str):
@@ -1625,7 +1623,6 @@ with gr.Blocks(
                 stop_btn = gr.Button("⏹️ 停止生成")
                 continue_btn = gr.Button("▶️ 继续生成")
                 collect_btn = gr.Button("📌 收藏当前题目")
-                verify_btn = gr.Button("🧮 验算上一条回答")
             with gr.Accordion("🔐 主人设置（仅本机可见）", open=False):
                 with gr.Row():
                     refresh_btn = gr.Button("🔄 刷新用量")
@@ -1843,7 +1840,6 @@ with gr.Blocks(
             clear_confirm_state,
         ],
     )
-    verify_btn.click(verify_last_answer, inputs=[chatbot], outputs=[result_status])
     refresh_btn.click(render_usage_panel, inputs=[], outputs=[usage_panel])
     reset_pwd_btn.click(
         reset_account_password,
@@ -1985,6 +1981,7 @@ with gr.Blocks(
         outputs=[entry_form, form_status, bank_status],
     )
     demo.load(restore_history, outputs=[chatbot], show_progress="hidden")
+    demo.load(restore_level, outputs=[level_radio], show_progress="hidden")
 
 
 if __name__ == "__main__":
@@ -1994,6 +1991,10 @@ if __name__ == "__main__":
     print("访问账号（固定密码，完整清单见 data/accounts.json）：")
     for account in accounts:
         print(f"  {account['username']} / {account['password']}")
+    backup_path = ensure_today_backup()
+    if backup_path:
+        print(f"数据备份：已生成 {backup_path}")
+    threading.Thread(target=daily_backup_loop, daemon=True).start()
     demo.queue(default_concurrency_limit=4).launch(
         server_name=server_name,
         server_port=7860,

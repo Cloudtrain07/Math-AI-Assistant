@@ -87,6 +87,9 @@ def test_auto_verify_detects_wrong_and_rechecks(monkeypatch, tmp_path):
     assert "不成立" in last[2]
     assert "已自动复核" in last[2]
     assert fake.complete_calls == 1
+    # 两段式输出：先出答案（不含验算），随后刷新验算结果
+    assert "自动验算" not in results[-2][2]
+    assert "自动验算" in results[-1][2]
     assistant_msgs = [m["content"] for m in last[0] if m["role"] == "assistant"]
     assert any("自动复核" in m and "2+2=4" in m for m in assistant_msgs)
 
@@ -136,3 +139,27 @@ def test_restore_history_unknown_account(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     request = type("R", (), {"client": None, "username": None})()
     assert app_module.restore_history(request) == []
+
+
+def test_restore_level_from_account(monkeypatch, tmp_path):
+    import core.accounts as accounts_mod
+
+    path = tmp_path / "accounts.json"
+    monkeypatch.setattr(accounts_mod, "ACCOUNTS_FILE", path)
+    accounts_mod._write_accounts(
+        [
+            {
+                "username": "user1",
+                "password": "x",
+                "level": "大学",
+                "enabled": True,
+            }
+        ],
+        path,
+    )
+    assert app_module.restore_level(_fake_request()) == "大学"
+
+
+def test_restore_level_fallback():
+    request = type("R", (), {"client": None, "username": None})()
+    assert app_module.restore_level(request) == "高中"

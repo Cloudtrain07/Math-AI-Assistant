@@ -93,20 +93,6 @@ class DeepSeekClient:
             except Exception:
                 pass
 
-    def chat_stream(
-        self,
-        messages: list[dict[str, str]],
-        thinking: bool | None = None,
-        reasoning_effort: str | None = None,
-        model: str | None = None,
-    ) -> Iterator[str]:
-        """流式回答文本（兼容旧接口）。"""
-        for piece, _, _, _ in self._chat_stream_with_usage(
-            messages, thinking, reasoning_effort, model
-        ):
-            if piece:
-                yield piece
-
     def chat_stream_with_usage(
         self,
         messages: list[dict[str, str]],
