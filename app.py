@@ -41,7 +41,6 @@ from core.exercise_bank import (
     load_entries,
     update_entry,
 )
-from core import image_edit
 from core.math_format import normalize_math_text
 from core.prompts import (
     MODE_ANSWER,
@@ -68,7 +67,7 @@ from core.usage import (
 )
 from core.vision_client import VisionClient
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
@@ -1539,79 +1538,6 @@ def reset_confirm_buttons(clear_state: str, delete_state: str):
     )
 
 
-def _edit_current_image(
-    image: str | None,
-    original_state: str,
-    operation,
-    success_text: str,
-):
-    """通用图片编辑：加载当前图 → 处理 → 更新图片组件与状态提示。"""
-    if not image:
-        return gr.update(), "⚠️ 请先上传图片。"
-    try:
-        edited = operation(image_edit.load(image))
-        return (
-            gr.update(value=edited),
-            f"{success_text}，可继续编辑或点击「识别题目」。",
-        )
-    except Exception as exc:
-        return gr.update(), f"❌ 图片处理失败：{exc}"
-
-
-def on_image_upload(image: str | None, original_state: str):
-    """上传/拍照后保存原图，不再自动识别，由用户编辑后手动识别。"""
-    if not image:
-        return gr.update(), "💡 请先上传或拍摄题目图片。", ""
-    return (
-        gr.update(),
-        "📷 已上传图片：可编辑（旋转/裁剪/缩放）后点击「识别题目」。",
-        image,
-    )
-
-
-def edit_rotate(image: str | None, original_state: str):
-    return _edit_current_image(image, original_state, image_edit.rotate90, "↻ 已旋转 90°")
-
-
-def edit_crop_preset(image: str | None, original_state: str, percent: float):
-    return _edit_current_image(
-        image,
-        original_state,
-        lambda img: image_edit.crop_preset(img, percent),
-        f"✂️ 已裁剪 {percent:.0f}%",
-    )
-
-
-def edit_zoom(image: str | None, original_state: str, percent: float):
-    label = "＋ 已放大 10%" if percent > 0 else "－ 已缩小 10%"
-    return _edit_current_image(
-        image, original_state, lambda img: image_edit.zoom(img, percent), label
-    )
-
-
-def edit_crop_custom(image: str | None, crop_text: str, original_state: str):
-    """按输入百分比（左,上,右,下）裁剪。"""
-    if not image:
-        return gr.update(), "⚠️ 请先上传图片。"
-    try:
-        parts = [float(x) for x in (crop_text or "").replace("，", ",").split(",")]
-    except Exception:
-        return gr.update(), "⚠️ 裁剪格式应为：左,上,右,下（百分比，如 10,5,90,95）。"
-    if len(parts) != 4:
-        return gr.update(), "⚠️ 裁剪需要 4 个数字：左,上,右,下（百分比）。"
-    try:
-        edited = image_edit.crop_percent(image_edit.load(image), *parts)
-        return gr.update(value=edited), "✅ 已按自定义比例裁剪，可点击「识别题目」。"
-    except Exception as exc:
-        return gr.update(), f"❌ 图片处理失败：{exc}"
-
-
-def edit_reset(original_state: str):
-    if not original_state:
-        return gr.update(), "⚠️ 还没有可恢复的原图。"
-    return gr.update(value=original_state), "🔄 已恢复原图。"
-
-
 with gr.Blocks(
     title="数学学习 AI 助手",
     theme=gr.themes.Base(
@@ -1679,29 +1605,12 @@ with gr.Blocks(
             usage_status = gr.Markdown("")
             usage_state = gr.State(value=new_usage_state())
             stage_state = gr.State(value=_new_stage_state())
-            original_image_state = gr.State(value="")
-            with gr.Accordion("📷 题目图片（拍照 / 上传 / 编辑）", open=True):
+            with gr.Accordion("📷 题目图片（上传 / 粘贴后自动识别）", open=True):
                 image_input = gr.Image(
-                    label="题目图片（拍照/上传）",
+                    label="题目图片（上传/粘贴后自动识别）",
                     sources=["upload", "clipboard"],
                     type="filepath",
                 )
-                with gr.Row():
-                    rotate_btn = gr.Button("↻ 旋转90°")
-                    crop10_btn = gr.Button("✂️ 裁剪10%")
-                    crop25_btn = gr.Button("✂️ 裁剪25%")
-                with gr.Row():
-                    zoom_in_btn = gr.Button("＋ 放大")
-                    zoom_out_btn = gr.Button("－ 缩小")
-                    reset_img_btn = gr.Button("🔄 重置")
-                with gr.Row():
-                    crop_textbox = gr.Textbox(
-                        label="自定义裁剪（左,上,右,下 百分比）",
-                        placeholder="如：10,5,90,95",
-                        scale=2,
-                    )
-                    crop_btn = gr.Button("✂️ 应用裁剪")
-                    recognize_btn = gr.Button("🔍 识别题目", variant="primary")
             with gr.Accordion("思考过程（仅当轮，不会写入历史）", open=False):
                 reasoning_md = gr.Markdown(
                     "（本轮暂无思考过程）",
@@ -1821,46 +1730,6 @@ with gr.Blocks(
 
     # ===== 学习 Tab 事件 =====
     image_input.upload(
-        on_image_upload,
-        inputs=[image_input, original_image_state],
-        outputs=[image_input, result_status, original_image_state],
-    )
-    rotate_btn.click(
-        edit_rotate,
-        inputs=[image_input, original_image_state],
-        outputs=[image_input, result_status],
-    )
-    crop10_btn.click(
-        lambda image, state: edit_crop_preset(image, state, 10),
-        inputs=[image_input, original_image_state],
-        outputs=[image_input, result_status],
-    )
-    crop25_btn.click(
-        lambda image, state: edit_crop_preset(image, state, 25),
-        inputs=[image_input, original_image_state],
-        outputs=[image_input, result_status],
-    )
-    zoom_in_btn.click(
-        lambda image, state: edit_zoom(image, state, 10),
-        inputs=[image_input, original_image_state],
-        outputs=[image_input, result_status],
-    )
-    zoom_out_btn.click(
-        lambda image, state: edit_zoom(image, state, -10),
-        inputs=[image_input, original_image_state],
-        outputs=[image_input, result_status],
-    )
-    reset_img_btn.click(
-        edit_reset,
-        inputs=[original_image_state],
-        outputs=[image_input, result_status],
-    )
-    crop_btn.click(
-        edit_crop_custom,
-        inputs=[image_input, crop_textbox, original_image_state],
-        outputs=[image_input, result_status],
-    )
-    recognize_btn.click(
         recognize_image,
         inputs=[image_input],
         outputs=[textbox, result_status, image_input],
