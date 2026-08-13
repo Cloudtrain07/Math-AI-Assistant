@@ -18,6 +18,15 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "exercise_bank"
 # 错误类型选项（首个为空表示不选）
 ERROR_TYPES = ["", "概念不清", "计算失误", "方法不会", "审题不清"]
 
+# 大类默认预设（首次使用时初始化，之后由用户自行增删改）
+DEFAULT_CATEGORIES = ["代数", "几何", "函数", "数列", "概率", "其他"]
+MAX_CATEGORIES = 50
+
+# 掌握度等级与升级/降级规则
+MASTERY_LEVELS = ["未掌握", "学习中", "已掌握"]
+MASTERY_UPGRADE = {"未掌握": "学习中", "学习中": "已掌握", "已掌握": "已掌握"}
+MASTERY_DOWNGRADE = {"已掌握": "学习中", "学习中": "未掌握", "未掌握": "未掌握"}
+
 _SAFE_NAME = re.compile(r"[^\w\u4e00-\u9fff-]")
 
 
@@ -34,6 +43,7 @@ def _sanitize_entry(item: dict) -> dict:
         "mistake": str(item.get("mistake") or "").strip(),
         "solution": str(item.get("solution") or "").strip(),
         "error_type": str(item.get("error_type") or "").strip(),
+        "category": str(item.get("category") or "").strip(),
         "tags": [
             str(tag).strip()
             for tag in (item.get("tags") or [])
@@ -41,6 +51,15 @@ def _sanitize_entry(item: dict) -> dict:
         ],
         "created_at": str(item.get("created_at") or ""),
         "last_reviewed": str(item.get("last_reviewed") or ""),
+        "mastery": (
+            str(item.get("mastery") or "")
+            if str(item.get("mastery") or "") in MASTERY_LEVELS
+            else ""
+        ),
+        "practice_right": int(item.get("practice_right") or 0),
+        "practice_wrong": int(item.get("practice_wrong") or 0),
+        "consecutive_right": int(item.get("consecutive_right") or 0),
+        "last_practiced": str(item.get("last_practiced") or ""),
     }
 
 
@@ -143,9 +162,13 @@ def find_duplicate(
 
 
 def filter_entries(
-    entries: list[dict], tag: str | None = None, keyword: str | None = None
+    entries: list[dict],
+    tag: str | None = None,
+    keyword: str | None = None,
+    category: str | None = None,
+    mastery: str | None = None,
 ) -> list[dict]:
-    """按标签与关键词（匹配简短描述/题目/标签）过滤；无过滤条件时原样返回。"""
+    """按标签/关键词/大类/掌握度过滤；未分类与未掌握均匹配空串；无条件时原样返回。"""
     result = list(entries)
     if tag:
         result = [e for e in result if tag in (e.get("tags") or [])]
@@ -158,6 +181,10 @@ def filter_entries(
             or keyword in e.get("question", "")
             or any(keyword in t for t in (e.get("tags") or []))
         ]
+    if category is not None:
+        result = [e for e in result if (e.get("category") or "") == category]
+    if mastery is not None:
+        result = [e for e in result if (e.get("mastery") or "未掌握") == mastery]
     return result
 
 
@@ -166,3 +193,129 @@ def entry_label(entry: dict) -> str:
     title = (entry.get("title") or "").strip()
     label = title[:20] if title else "（无索引）"
     return f"{label}（{entry.get('created_at', '')[5:10]}）"
+
+
+def _categories_path(username: str) -> Path:
+    safe = _SAFE_NAME.sub("_", username or "default") or "default"
+    return DATA_DIR / f"categories_{safe}.json"
+
+
+def _clean_categories(categories) -> list[str]:
+    """清洗大类列表：去空白、去重、限制数量。"""
+    seen: list[str] = []
+    for name in categories or []:
+        name = str(name).strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen[:MAX_CATEGORIES]
+
+
+def load_categories(username: str = "default") -> list[str]:
+    """读取账号的大类列表；文件缺失或损坏时返回默认预设。"""
+    path = _categories_path(username)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return _clean_categories(data)
+    except Exception:
+        pass
+    return list(DEFAULT_CATEGORIES)
+
+
+def save_categories(
+    categories: list[str], username: str = "default"
+) -> list[str]:
+    """保存大类列表，返回清洗后的列表。"""
+    clean = _clean_categories(categories)
+    path = _categories_path(username)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(tmp, path)
+    return clean
+
+
+def add_category(name: str, username: str = "default") -> tuple[bool, list[str]]:
+    """新增大类；空名/重名/超上限时返回 (False, 当前列表)。"""
+    name = (name or "").strip()
+    categories = load_categories(username)
+    if not name or name in categories or len(categories) >= MAX_CATEGORIES:
+        return False, categories
+    categories.append(name)
+    return True, save_categories(categories, username)
+
+
+def rename_category(
+    old: str, new: str, username: str = "default"
+) -> list[str]:
+    """重命名大类，并同步更新该类下所有题目的 category；失败时原样返回。"""
+    old = (old or "").strip()
+    new = (new or "").strip()
+    categories = load_categories(username)
+    if old not in categories or not new or (new in categories and new != old):
+        return categories
+    categories = [new if c == old else c for c in categories]
+    save_categories(categories, username)
+    entries = load_entries(username)
+    changed = False
+    for entry in entries:
+        if entry.get("category") == old:
+            entry["category"] = new
+            changed = True
+    if changed:
+        save_entries(entries, username)
+    return categories
+
+
+def delete_category(name: str, username: str = "default") -> list[str]:
+    """删除大类；该类下所有题目变为未分类（不删题）。"""
+    name = (name or "").strip()
+    categories = load_categories(username)
+    if name not in categories:
+        return categories
+    categories = [c for c in categories if c != name]
+    save_categories(categories, username)
+    entries = load_entries(username)
+    changed = False
+    for entry in entries:
+        if entry.get("category") == name:
+            entry["category"] = ""
+            changed = True
+    if changed:
+        save_entries(entries, username)
+    return categories
+
+
+def record_practice(
+    entry_id: str, correct: bool, username: str = "default"
+) -> dict | None:
+    """记录一次练习对/错并自动更新掌握度；返回更新后的条目或 None。
+
+    规则：答对连续 2 次升一级（未掌握→学习中→已掌握）并清零连续计数；
+    答错降一级（已掌握→学习中，学习中→未掌握），同时清零连续计数。
+    """
+    entry = get_entry(entry_id, username)
+    if entry is None:
+        return None
+    mastery = entry.get("mastery") or "未掌握"
+    consecutive = int(entry.get("consecutive_right") or 0)
+    if correct:
+        consecutive += 1
+        if consecutive >= 2:
+            mastery = MASTERY_UPGRADE.get(mastery, mastery)
+            consecutive = 0
+    else:
+        mastery = MASTERY_DOWNGRADE.get(mastery, mastery)
+        consecutive = 0
+    fields = {
+        "mastery": mastery,
+        "practice_right": int(entry.get("practice_right") or 0)
+        + (1 if correct else 0),
+        "practice_wrong": int(entry.get("practice_wrong") or 0)
+        + (0 if correct else 1),
+        "consecutive_right": consecutive,
+        "last_practiced": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return update_entry(entry_id, fields, username)

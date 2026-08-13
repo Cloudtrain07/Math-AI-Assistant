@@ -31,14 +31,21 @@ from core.calculator import CALCULATOR_AVAILABLE, verify_math
 from core.config import get_settings
 from core.deepseek_client import DeepSeekClient, MaxWaitTimeout
 from core.exercise_bank import (
+    DEFAULT_CATEGORIES,
     ERROR_TYPES,
+    MASTERY_LEVELS,
+    add_category,
     add_entry,
+    delete_category,
     delete_entry,
     entry_label,
     filter_entries,
     find_duplicate,
     get_entry,
+    load_categories,
     load_entries,
+    record_practice,
+    rename_category,
     update_entry,
 )
 from core.math_format import normalize_math_text
@@ -67,7 +74,7 @@ from core.usage import (
 )
 from core.vision_client import VisionClient
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
@@ -83,10 +90,52 @@ LOG_MAX_LINES = 2000
 # 移动端适配与整体排版（蓝白黑冷色调主题之外的少量微调）
 PAGE_CSS = """
 .gradio-container { max-width: 1280px !important; margin: 0 auto !important; }
+.bank-toolbar { flex-wrap: wrap !important; row-gap: 6px !important; }
+.bank-toolbar .gr-box, .bank-toolbar .gr-button { min-width: 96px; }
+.bank-actions { flex-wrap: wrap !important; row-gap: 6px !important; }
+.mastery-row { justify-content: flex-end !important; gap: 6px !important; }
+.mastery-row .gr-button { padding: 2px 12px !important; }
+.bank-layout { display: grid !important; gap: 8px !important; align-items: start !important; }
+.bank-filters { grid-area: filters; }
+.bank-stats { grid-area: stats; }
+.bank-selector { grid-area: selector; }
+.bank-detail { grid-area: detail; }
+.bank-status { grid-area: status; }
+.bank-actions-area { grid-area: actions; }
+.bank-mastery { grid-area: mastery; }
+.bank-practice { grid-area: practice; }
+.bank-manage { grid-area: manage; }
+.bank-form { grid-area: form; }
+@media (min-width: 769px) {
+  .bank-layout { grid-template-columns: 1fr 2fr; grid-template-areas:
+    "filters filters"
+    "stats actions"
+    "selector practice"
+    "manage mastery"
+    ". detail"
+    ". status"
+    ". form"; }
+}
 @media (max-width: 768px) {
   .gradio-container { max-width: 100% !important; padding: 8px !important; }
   .chatbot { height: 55vh !important; }
   .katex-display, .katex { overflow-x: auto; overflow-y: hidden; }
+  .bank-toolbar > * { flex: 1 1 30% !important; }
+  .bank-actions > * { flex: 1 1 30% !important; }
+  .bank-actions .gr-checkbox { flex: 1 1 30% !important; }
+  .mastery-row { justify-content: flex-start !important; }
+  .mastery-row > * { flex: 0 1 auto !important; }
+  .bank-layout { grid-template-columns: 1fr; grid-template-areas:
+    "filters"
+    "stats"
+    "selector"
+    "detail"
+    "status"
+    "actions"
+    "mastery"
+    "practice"
+    "manage"
+    "form"; }
 }
 """
 
@@ -532,6 +581,7 @@ def respond(
     usage_state: dict,
     stage_state: dict,
     request: gr.Request,
+    verify: bool = True,
 ):
     """纯文本聊天：流式回复，累计会话用量，并按互动模式阶段引导。
 
@@ -792,7 +842,9 @@ def respond(
         reasoning_display,
     )
     # 第二段：本地验算（发现错误时模型复核），结果追加到「本次结果」
-    verify_note = _auto_verify_loop(answer, final_history, username)
+    verify_note = ""
+    if verify:
+        verify_note = _auto_verify_loop(answer, final_history, username)
     if verify_note:
         result_text += "\n\n" + verify_note
     yield (
@@ -1014,6 +1066,22 @@ def _render_detail(entry: dict, show_solution: bool = False) -> str:
     tags = entry.get("tags") or []
     if tags:
         lines.append(f"\n**标签**：{'、'.join(tags)}")
+    category = (entry.get("category") or "").strip()
+    lines.append(f"\n**大类**：{category if category else '未分类'}")
+    mastery = entry.get("mastery") or "未掌握"
+    right = int(entry.get("practice_right") or 0)
+    wrong = int(entry.get("practice_wrong") or 0)
+    consecutive = int(entry.get("consecutive_right") or 0)
+    practiced = entry.get("last_practiced") or ""
+    mastery_part = f"**掌握度**：{mastery}"
+    if right or wrong:
+        mastery_part += f"（答对 {right} · 答错 {wrong}"
+        if consecutive:
+            mastery_part += f" · 连续答对 {consecutive}"
+        if practiced:
+            mastery_part += f" · 最近 {practiced}"
+        mastery_part += "）"
+    lines.append(f"\n{mastery_part}")
     review = (
         f"，上次复习：{entry['last_reviewed']}" if entry.get("last_reviewed") else ""
     )
@@ -1032,10 +1100,50 @@ def _all_tag_choices(entries: list[dict]) -> list[str]:
     return sorted({tag for e in entries for tag in (e.get("tags") or [])})
 
 
-def _bank_view(entries: list[dict], selected_id: str | None = None):
-    """习题库统一视图：统计、标签筛选项、题目下拉与详情。"""
+def _resolve_category_filter(category: str | None) -> str | None:
+    """大类筛选值映射：全部/空不过滤，未分类映射为空串。"""
+    category = (category or "").strip()
+    if category in ("", "全部"):
+        return None
+    if category == "未分类":
+        return ""
+    return category
+
+
+def _category_choices(categories: list[str]) -> list[str]:
+    return ["全部", "未分类"] + list(categories)
+
+
+def _bank_view(
+    entries: list[dict], selected_id: str | None = None, username: str = "default"
+):
+    """习题库统一视图：统计（按大类计数）、标签与大类筛选项、题目下拉与详情。"""
+    categories = load_categories(username)
+    counts = {
+        c: sum(1 for e in entries if (e.get("category") or "") == c)
+        for c in categories
+    }
+    uncat = sum(1 for e in entries if not (e.get("category") or ""))
+    parts = [f"{c} {n}" for c, n in counts.items() if n]
+    if uncat:
+        parts.append(f"未分类 {uncat}")
     stats = f"📚 当前共 **{len(entries)}** 道题"
+    if parts:
+        stats += "（" + " · ".join(parts) + "）"
+    mastery_counts = {
+        level: sum(
+            1 for e in entries if (e.get("mastery") or "未掌握") == level
+        )
+        for level in MASTERY_LEVELS
+    }
+    if entries:
+        stats += "\n\n掌握度：" + " · ".join(
+            f"{level} {mastery_counts[level]}"
+            for level in MASTERY_LEVELS
+            if mastery_counts[level]
+        )
     tag_update = gr.update(choices=_all_tag_choices(entries))
+    category_update = gr.update(choices=_category_choices(categories))
     choices = [(entry_label(e), e["id"]) for e in reversed(entries)]
     selector_update = gr.update(choices=choices, value=None)
     detail = "（先在上方选择一道题）"
@@ -1044,7 +1152,7 @@ def _bank_view(entries: list[dict], selected_id: str | None = None):
         if entry is not None:
             selector_update = gr.update(choices=choices, value=selected_id)
             detail = _render_detail(entry, show_solution=False)
-    return stats, tag_update, selector_update, detail
+    return stats, tag_update, category_update, selector_update, detail
 
 
 def _suggest_meta(question: str, answer: str) -> dict:
@@ -1088,10 +1196,13 @@ def _open_form_outputs(
     mistake: str,
     solution: str,
     error_type: str,
+    category: str,
+    mastery: str,
     tags_text: str,
     edit_id: str,
     bank_msg: str,
     form_msg: str,
+    username: str = "default",
 ):
     """习题库表单与页面统一输出元组（收藏 / 手动新建共用）。"""
     return (
@@ -1102,6 +1213,14 @@ def _open_form_outputs(
         mistake,
         solution,
         gr.update(choices=ERROR_TYPES, value=error_type),
+        gr.update(
+            choices=["未分类"] + load_categories(username),
+            value=category or "未分类",
+        ),
+        gr.update(
+            choices=MASTERY_LEVELS,
+            value=mastery if mastery in MASTERY_LEVELS else "未掌握",
+        ),
         tags_text,
         edit_id,
         bank_msg,
@@ -1134,7 +1253,8 @@ def collect_current_problem(history: list[dict], request: gr.Request):
             break
     if not question:
         yield _open_form_outputs(
-            "", "", "", "", "", "", "", "💡 聊天里还没有题目，请先提问，或使用「手动新建」。", ""
+            "", "", "", "", "", "", "", "", "", "💡 聊天里还没有题目，请先提问，或使用「手动新建」。", "",
+            _username_of(request),
         )
         return
     # 先立即打开表单给反馈，标签建议稍后生成，避免点击后长时间无反应
@@ -1146,8 +1266,11 @@ def collect_current_problem(history: list[dict], request: gr.Request):
         "",
         "",
         "",
+        "",
+        "",
         "✅ 已带入题目，正在生成标签建议…",
         "⏳ 正在生成建议标签…",
+        _username_of(request),
     )
     meta = _suggest_meta(question, answer)
     tag_text = "、".join(meta["tags"])
@@ -1162,37 +1285,75 @@ def collect_current_problem(history: list[dict], request: gr.Request):
         "",
         "",
         meta["error_type"],
+        "",
+        "",
         tag_text,
         "",
         "✅ 已带入题目，请在表单确认后保存。",
         f"ℹ️ 建议标签：{tag_text or '无'}{hint}",
+        _username_of(request),
     )
 
 
 def new_blank_entry(request: gr.Request):
     """手动新建：打开空白表单并切换到习题库 Tab。"""
     yield _open_form_outputs(
-        "", "", "", "", "", "", "", "📝 手动新建：填写索引描述与题目内容后保存。", ""
+        "", "", "", "", "", "", "", "", "", "📝 手动新建：填写索引描述与题目内容后保存。", "",
+        _username_of(request),
     )
 
 
-def refresh_bank(request: gr.Request, tag: str | None, keyword: str | None):
-    """刷新习题库列表（应用标签筛选与关键词搜索）。"""
+def _resolve_mastery_filter(mastery: str | None) -> str | None:
+    """掌握度筛选值映射：全部/空不过滤，其余精确匹配。"""
+    mastery = (mastery or "").strip()
+    if mastery in ("", "全部"):
+        return None
+    return mastery if mastery in MASTERY_LEVELS else None
+
+
+def refresh_bank(
+    request: gr.Request,
+    tag: str | None,
+    keyword: str | None,
+    category: str | None,
+    mastery: str | None,
+):
+    """刷新习题库列表（应用大类、掌握度、标签筛选与关键词搜索）。"""
     username = _username_of(request)
-    entries = filter_entries(load_entries(username), tag=tag or None, keyword=keyword)
+    resolved_category = _resolve_category_filter(category)
+    resolved_mastery = _resolve_mastery_filter(mastery)
+    entries = filter_entries(
+        load_entries(username),
+        tag=tag or None,
+        keyword=keyword,
+        category=resolved_category,
+        mastery=resolved_mastery,
+    )
     stats = f"📚 当前共 **{len(entries)}** 道题" + (
-        "（筛选后）" if (tag or keyword) else ""
+        "（筛选后）"
+        if (
+            tag
+            or keyword
+            or resolved_category is not None
+            or resolved_mastery is not None
+        )
+        else ""
     )
     tag_update = gr.update(choices=_all_tag_choices(entries))
+    category_update = gr.update(choices=_category_choices(load_categories(username)))
+    mastery_update = gr.update(choices=["全部"] + MASTERY_LEVELS)
     choices = [(entry_label(e), e["id"]) for e in reversed(entries)]
     return (
         stats,
         tag_update,
+        category_update,
+        mastery_update,
         gr.update(choices=choices, value=None),
         "（先在上方选择一道题）",
         "",
         gr.update(value=False),
         "🔄 已刷新。",
+        gr.update(visible=False),
     )
 
 
@@ -1200,11 +1361,29 @@ def select_entry(entry_id: str, show_solution: bool, request: gr.Request):
     """选择题目后展示详情（正确解默认隐藏）。"""
     username = _username_of(request)
     if not entry_id:
-        return "（先在上方选择一道题）", "", gr.update(value=False), ""
+        return (
+            "（先在上方选择一道题）",
+            "",
+            gr.update(value=False),
+            "",
+            gr.update(visible=False),
+        )
     entry = get_entry(entry_id, username)
     if entry is None:
-        return "（未找到该题，请刷新）", "", gr.update(value=False), ""
-    return _render_detail(entry, show_solution=False), entry_id, gr.update(value=False), ""
+        return (
+            "（未找到该题，请刷新）",
+            "",
+            gr.update(value=False),
+            "",
+            gr.update(visible=False),
+        )
+    return (
+        _render_detail(entry, show_solution=False),
+        entry_id,
+        gr.update(value=False),
+        "",
+        gr.update(visible=True),
+    )
 
 
 def toggle_solution(
@@ -1230,6 +1409,7 @@ def edit_entry(selected_id: str, request: gr.Request):
     """把选中题目载入表单进入编辑模式。"""
     username = _username_of(request)
     entry = get_entry(selected_id, username) if selected_id else None
+    category_choices = ["未分类"] + load_categories(username)
     if entry is None:
         return (
             gr.update(),
@@ -1239,6 +1419,8 @@ def edit_entry(selected_id: str, request: gr.Request):
             "",
             "",
             gr.update(choices=ERROR_TYPES, value=""),
+            gr.update(choices=category_choices, value="未分类"),
+            gr.update(choices=MASTERY_LEVELS, value="未掌握"),
             "",
             "",
             "",
@@ -1251,6 +1433,11 @@ def edit_entry(selected_id: str, request: gr.Request):
         entry["mistake"],
         entry["solution"],
         gr.update(choices=ERROR_TYPES, value=entry.get("error_type") or ""),
+        gr.update(choices=category_choices, value=entry.get("category") or "未分类"),
+        gr.update(
+            choices=MASTERY_LEVELS,
+            value=entry.get("mastery") or "未掌握",
+        ),
         "、".join(entry.get("tags") or []),
         entry["id"],
         "",
@@ -1266,21 +1453,29 @@ def delete_selected_entry(selected_id: str, request: gr.Request):
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
             "（先在上方选择一道题）",
             "",
             gr.update(value=False),
+            gr.update(visible=False),
         )
     ok = delete_entry(selected_id, username)
     entries = load_entries(username)
-    stats, tag_update, selector_update, _ = _bank_view(entries)
+    stats, tag_update, category_update, selector_update, _ = _bank_view(
+        entries, username=username
+    )
     return (
         "🗑️ 已删除。" if ok else "⚠️ 未找到该题。",
         stats,
         tag_update,
+        category_update,
+        gr.update(choices=["全部"] + MASTERY_LEVELS),
         selector_update,
         "（先在上方选择一道题）",
         "",
         gr.update(value=False),
+        gr.update(visible=False),
     )
 
 
@@ -1292,6 +1487,8 @@ def save_entry(
     mistake: str,
     solution: str,
     error_type: str,
+    category: str,
+    mastery: str,
     tags_text: str,
     force_state: str,
 ):
@@ -1306,9 +1503,12 @@ def save_entry(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
             "（先在上方选择一道题）",
             "",
             gr.update(value=False),
+            gr.update(visible=False),
         )
         return
     if not question:
@@ -1318,9 +1518,12 @@ def save_entry(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
             "（先在上方选择一道题）",
             "",
             gr.update(value=False),
+            gr.update(visible=False),
         )
         return
     tags = [
@@ -1334,6 +1537,14 @@ def save_entry(
         "mistake": (mistake or "").strip(),
         "solution": (solution or "").strip(),
         "error_type": error_type if error_type in ERROR_TYPES else "",
+        "category": (
+            ""
+            if (category or "") in ("", "未分类")
+            else (category or "").strip()
+        ),
+        "mastery": (
+            mastery if mastery in MASTERY_LEVELS else "未掌握"
+        ),
         "tags": tags,
     }
     entries = load_entries(username)
@@ -1349,6 +1560,9 @@ def save_entry(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(visible=False),
         )
         return
     if edit_id:
@@ -1357,18 +1571,21 @@ def save_entry(
     else:
         saved = add_entry(fields, username)
         message = "✅ 已保存到习题库。"
-    stats, tag_update, selector_update, detail = _bank_view(
-        load_entries(username), selected_id=saved["id"]
+    stats, tag_update, category_update, selector_update, detail = _bank_view(
+        load_entries(username), selected_id=saved["id"], username=username
     )
     yield (
         message,
         "",
         stats,
         tag_update,
+        category_update,
+        gr.update(choices=["全部"] + MASTERY_LEVELS),
         selector_update,
         detail,
         saved["id"],
         gr.update(value=False),
+        gr.update(visible=True),
     )
 
 
@@ -1436,6 +1653,472 @@ def generate_similar(
         )
 
 
+def generate_category_quiz(
+    category_filter: str | None,
+    entry_id: str,
+    difficulty: str,
+    history: list[dict],
+    level: str,
+    mode: str,
+    thinking: bool,
+    model: str,
+    reasoning_effort: str,
+    answer_style: str | None,
+    usage_state: dict,
+    stage_state: dict,
+    request: gr.Request,
+):
+    """按大类出题：选中单题优先，否则用大类筛选结果作素材池，进入练习闭环。"""
+    username = _username_of(request)
+    if difficulty not in ("基础", "进阶", "挑战"):
+        difficulty = "进阶"
+    entries = load_entries(username)
+    pool: list[dict] = []
+    source_desc = ""
+    if entry_id:
+        entry = get_entry(entry_id, username)
+        if entry is not None:
+            pool = [entry]
+            title = (entry.get("title") or "").strip()[:20]
+            source_desc = f"选中题目「{title or '无索引'}」"
+    if not pool:
+        cat = _resolve_category_filter(category_filter)
+        if cat is None:
+            pool = entries
+            source_desc = "全部题目"
+        elif cat == "":
+            pool = [e for e in entries if not (e.get("category") or "")]
+            source_desc = "未分类题目"
+        else:
+            pool = [e for e in entries if (e.get("category") or "") == cat]
+            source_desc = f"「{cat}」大类题目"
+    mode_switched = mode != MODE_INTERACTIVE
+    mode_update = gr.update(value=MODE_INTERACTIVE) if mode_switched else gr.update()
+    if not pool:
+        yield (
+            gr.update(),
+            "",
+            "",
+            "",
+            usage_state,
+            stage_state,
+            gr.update(),
+            mode_update,
+            f"⚠️ {source_desc or '当前范围'}下还没有题目，先收藏几道题或换个范围。",
+        )
+        return
+    # 素材总量控制在单条消息长度上限内（MAX_MESSAGE_LEN 默认 2000 字符）
+    budget = 1700
+    refs_parts: list[str] = []
+    for e in pool[:5]:
+        q = (e.get("question") or "").strip()
+        if not q:
+            continue
+        item = f"【参考题 {len(refs_parts) + 1}】\n{q[:300]}"
+        if len("\n\n".join(refs_parts + [item])) > budget:
+            break
+        refs_parts.append(item)
+    refs = "\n\n".join(refs_parts)
+    message = (
+        f"【按类出题】请根据下面这些题（同知识点、题型方法保持一致），"
+        f"出一道「{difficulty}」难度变式题（改数字或条件即可，方法不变）："
+        "只出题、不写答案和解析，等用户作答后再批改。\n\n"
+        f"{refs}"
+    )
+    stage_state = dict(stage_state or {})
+    stage_state["stage"] = "practice_wait"
+    stage_state["hints"] = 0
+    stage_state["last_mode"] = MODE_INTERACTIVE
+    last = None
+    for item in respond(
+        message,
+        history,
+        level,
+        MODE_INTERACTIVE,
+        thinking,
+        model,
+        reasoning_effort,
+        answer_style,
+        usage_state,
+        stage_state,
+        request,
+    ):
+        last = item
+        yield (*item, mode_update, "")
+    if last is not None:
+        h, t, s, usage_text, u, st, r = last
+        note = f"📚 已从 {len(refs_parts)} 道{source_desc}中选材出题，作答后我会批改。"
+        if mode_switched:
+            note += "\n（已自动切换到互动模式进行练习）"
+        yield (h, t, s, usage_text, u, st, r, mode_update, note)
+
+
+def _new_paper_state() -> dict:
+    return {"active": False, "questions": "", "size": 0}
+
+
+def _paper_pool(
+    username: str, category_filter: str | None, entry_id: str
+) -> tuple[list[dict], str]:
+    """组卷素材池：选中题优先按其所属大类取素材，否则用大类筛选结果。"""
+    entries = load_entries(username)
+    if entry_id:
+        entry = get_entry(entry_id, username)
+        if entry is not None:
+            cat = (entry.get("category") or "").strip()
+            if cat:
+                pool = [e for e in entries if (e.get("category") or "") == cat]
+                return pool, f"「{cat}」大类题目"
+            pool = [e for e in entries if not (e.get("category") or "")]
+            return pool, "未分类题目"
+    cat = _resolve_category_filter(category_filter)
+    if cat is None:
+        return entries, "全部题目"
+    if cat == "":
+        return [e for e in entries if not (e.get("category") or "")], "未分类题目"
+    return (
+        [e for e in entries if (e.get("category") or "") == cat],
+        f"「{cat}」大类题目",
+    )
+
+
+def _clamp_paper_size(size: str | int | None) -> int:
+    try:
+        n = int(str(size or "").strip())
+    except (TypeError, ValueError):
+        return 5
+    return max(1, min(10, n))
+
+
+def generate_paper(
+    category_filter: str | None,
+    entry_id: str,
+    paper_size: str | int | None,
+    difficulty: str,
+    history: list[dict],
+    level: str,
+    mode: str,
+    thinking: bool,
+    model: str,
+    reasoning_effort: str,
+    answer_style: str | None,
+    usage_state: dict,
+    stage_state: dict,
+    paper_state: dict,
+    request: gr.Request,
+):
+    """组卷自测：按大类素材一次生成 N 道变式题，存入试卷状态等待作答。"""
+    username = _username_of(request)
+    size = _clamp_paper_size(paper_size)
+    if difficulty not in ("基础", "进阶", "挑战"):
+        difficulty = "进阶"
+    pool, source_desc = _paper_pool(username, category_filter, entry_id)
+    mode_switched = mode != MODE_INTERACTIVE
+    mode_update = gr.update(value=MODE_INTERACTIVE) if mode_switched else gr.update()
+    if not pool:
+        yield (
+            gr.update(),
+            "",
+            "",
+            "",
+            usage_state,
+            stage_state,
+            gr.update(),
+            _new_paper_state(),
+            mode_update,
+            f"⚠️ {source_desc}下还没有题目，先收藏几道题或换个范围。",
+        )
+        return
+    # 素材总量控制在单条消息长度上限内（MAX_MESSAGE_LEN 默认 2000 字符）
+    budget = 1700
+    refs_parts: list[str] = []
+    for e in pool[:5]:
+        q = (e.get("question") or "").strip()
+        if not q:
+            continue
+        item = f"【参考题 {len(refs_parts) + 1}】\n{q[:300]}"
+        if len("\n\n".join(refs_parts + [item])) > budget:
+            break
+        refs_parts.append(item)
+    refs = "\n\n".join(refs_parts)
+    message = (
+        f"【组卷自测】请根据下面这些题（同知识点、题型方法保持一致），"
+        f"生成一套共 {size} 道「{difficulty}」难度变式题"
+        "（每道改数字或条件即可，方法不变），按 1 到 "
+        f"{size} 编号输出：只出题、不写答案和解析，等用户作答后统一批改。\n\n"
+        f"{refs}"
+    )
+    stage_state = dict(stage_state or {})
+    stage_state["stage"] = "practice_wait"
+    stage_state["hints"] = 0
+    stage_state["last_mode"] = MODE_INTERACTIVE
+    last = None
+    for item in respond(
+        message,
+        history,
+        level,
+        MODE_INTERACTIVE,
+        thinking,
+        model,
+        reasoning_effort,
+        answer_style,
+        usage_state,
+        stage_state,
+        request,
+        verify=False,
+    ):
+        last = item
+        yield (*item, gr.update(), mode_update, "")
+    if last is not None:
+        h, t, s, usage_text, u, st, r = last
+        questions_text = ""
+        for m in reversed(h or []):
+            if m.get("role") == "assistant" and m.get("content"):
+                questions_text = m["content"]
+                break
+        new_paper = {"active": True, "questions": questions_text, "size": size}
+        note = (
+            f"📄 已根据 {len(refs_parts)} 道{source_desc}生成 {size} 道题，"
+            "请把全部作答写进输入框，然后点「批改本卷」。"
+        )
+        if mode_switched:
+            note += "\n（已自动切换到互动模式）"
+        yield (h, t, s, usage_text, u, st, r, new_paper, mode_update, note)
+
+
+def grade_paper(
+    answers: str,
+    history: list[dict],
+    level: str,
+    mode: str,
+    thinking: bool,
+    model: str,
+    reasoning_effort: str,
+    answer_style: str | None,
+    usage_state: dict,
+    stage_state: dict,
+    paper_state: dict,
+    request: gr.Request,
+):
+    """批改本卷：把输入框里的整套作答交给 AI 统一批改并小结。"""
+    paper_state = dict(paper_state or {})
+    if not paper_state.get("active"):
+        yield (
+            gr.update(),
+            "",
+            "💡 当前没有待批改的试卷，先点「组卷自测」出一套题。",
+            "",
+            usage_state,
+            stage_state,
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            "",
+        )
+        return
+    answers = (answers or "").strip()
+    if not answers:
+        yield (
+            gr.update(),
+            "",
+            "✍️ 请先把全部作答写进输入框，再点「批改本卷」。",
+            "",
+            usage_state,
+            stage_state,
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            "",
+        )
+        return
+    size = int(paper_state.get("size") or 0)
+    message = (
+        f"【批改本卷】请帮我批改这份共 {size} 道题的作答：逐题判定对错"
+        "（哪道对、哪道错、错在哪），最后给一句小结：共对几道。"
+        "只批改、不重出题。\n\n作答：\n"
+        f"{answers[:1500]}"
+    )
+    stage_state = dict(stage_state or {})
+    stage_state["stage"] = "practice_grade"
+    stage_state["hints"] = 0
+    stage_state["last_mode"] = MODE_INTERACTIVE
+    last = None
+    for item in respond(
+        message,
+        history,
+        level,
+        MODE_INTERACTIVE,
+        thinking,
+        model,
+        reasoning_effort,
+        answer_style,
+        usage_state,
+        stage_state,
+        request,
+        verify=False,
+    ):
+        last = item
+        yield (*item, gr.update(), gr.update(), "")
+    if last is not None:
+        h, t, s, usage_text, u, st, r = last
+        yield (
+            h,
+            t,
+            s + "\n\n✅ 本卷已批改完成。",
+            usage_text,
+            u,
+            st,
+            r,
+            _new_paper_state(),
+            gr.update(),
+            "",
+        )
+
+
+def mark_mastery(
+    selected_id: str, correct: bool, request: gr.Request
+):
+    """记录选中题目的练习对/错并自动更新掌握度。"""
+    username = _username_of(request)
+    if not selected_id:
+        return (
+            gr.update(),
+            gr.update(),
+            "⚠️ 请先在习题库选择一道题，再标记对错。",
+        )
+    entry = record_practice(selected_id, bool(correct), username)
+    if entry is None:
+        return (
+            gr.update(),
+            gr.update(),
+            "⚠️ 未找到该题，请刷新后重试。",
+        )
+    detail = _render_detail(entry, show_solution=False)
+    stats = _bank_view(load_entries(username), username=username)[0]
+    if correct:
+        msg = (
+            f"✅ 已记录答对（连续答对 {entry['consecutive_right']} 次，"
+            f"当前掌握度：{entry['mastery']}）。"
+        )
+    else:
+        msg = f"❌ 已记录答错（当前掌握度：{entry['mastery']}）。"
+    return detail, stats, msg
+
+
+def _category_widget_updates(categories: list[str]):
+    """大类相关下拉统一更新（筛选 / 管理 / 表单）。"""
+    return (
+        gr.update(choices=_category_choices(categories)),
+        gr.update(choices=categories),
+        gr.update(choices=["未分类"] + categories),
+    )
+
+
+def manage_add_category(name: str, request: gr.Request):
+    """新增大类。"""
+    username = _username_of(request)
+    ok, categories = add_category(name, username)
+    msg = (
+        "✅ 已添加大类。"
+        if ok
+        else "⚠️ 名称不能为空、已存在或超过 50 个大类上限。"
+    )
+    return (*_category_widget_updates(categories), msg)
+
+
+def manage_rename_category(old: str, new: str, request: gr.Request):
+    """重命名大类（同步更新该类下所有题目的分类）。"""
+    username = _username_of(request)
+    old = (old or "").strip()
+    new = (new or "").strip()
+    categories = rename_category(old, new, username)
+    if old and new and old not in categories and new in categories:
+        msg = "✅ 已重命名，该类下的题目已同步更新。"
+    else:
+        msg = "⚠️ 重命名失败：新名称不能为空或与已有大类重复。"
+    return (*_category_widget_updates(categories), msg)
+
+
+def manage_delete_category(
+    name: str,
+    confirm_state: str,
+    category_filter: str,
+    tag_filter: str,
+    keyword: str,
+    mastery_filter: str,
+    request: gr.Request,
+):
+    """删除大类（二次确认）；该类下的题目全部变为未分类。"""
+    username = _username_of(request)
+    name = (name or "").strip()
+    if not name:
+        return (
+            "⚠️ 请先选择要删除的大类。",
+            "",
+            gr.update(value="🗑️ 删除大类"),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value=False),
+            gr.update(),
+            gr.update(visible=False),
+        )
+    if not confirm_state:
+        return (
+            "⚠️ 再点一次确认删除（该大类下的题会变成未分类，5 秒后自动取消）。",
+            "armed",
+            gr.update(value="⚠️ 再点一次确认删除"),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value=False),
+            gr.update(),
+            gr.update(visible=False),
+        )
+    categories = delete_category(name, username)
+    if (category_filter or "") == name:
+        category_filter = "全部"
+    entries = filter_entries(
+        load_entries(username),
+        tag=tag_filter or None,
+        keyword=keyword,
+        category=_resolve_category_filter(category_filter),
+        mastery=_resolve_mastery_filter(mastery_filter),
+    )
+    stats, tag_update, _, selector_update, detail = _bank_view(
+        entries, username=username
+    )
+    return (
+        f"🗑️ 已删除大类「{name}」，其中题目已变为未分类。",
+        "",
+        gr.update(value="🗑️ 删除大类"),
+        gr.update(choices=_category_choices(categories), value=category_filter),
+        gr.update(choices=["全部"] + MASTERY_LEVELS),
+        gr.update(choices=categories),
+        gr.update(choices=["未分类"] + categories),
+        stats,
+        tag_update,
+        selector_update,
+        detail,
+        "",
+        gr.update(value=False),
+        "🔄 已刷新。",
+        gr.update(visible=False),
+    )
+
+
 def confirm_clear(
     request: gr.Request,
     history: list[dict],
@@ -1453,6 +2136,7 @@ def confirm_clear(
             gr.update(),
             gr.update(value="⚠️ 再点一次确认清空"),
             "armed",
+            _new_paper_state(),
         )
     (
         new_history,
@@ -1473,6 +2157,7 @@ def confirm_clear(
         _reasoning,
         gr.update(value="🗑️ 新对话"),
         "",
+        _new_paper_state(),
     )
 
 
@@ -1490,9 +2175,12 @@ def confirm_delete(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
             "（先在上方选择一道题）",
             "",
             gr.update(value=False),
+            gr.update(visible=False),
         )
     if not confirm_state:
         return (
@@ -1505,15 +2193,21 @@ def confirm_delete(
             gr.update(),
             gr.update(),
             gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(visible=False),
         )
     (
         bank_msg,
         stats,
         tag_update,
+        category_update,
+        mastery_update,
         selector_update,
         detail,
         selected,
         solution_update,
+        mastery_vis,
     ) = delete_selected_entry(selected_id, request)
     return (
         "",
@@ -1521,20 +2215,27 @@ def confirm_delete(
         bank_msg,
         stats,
         tag_update,
+        category_update,
+        gr.update(choices=["全部"] + MASTERY_LEVELS),
         selector_update,
         detail,
         selected,
         solution_update,
+        mastery_vis,
     )
 
 
-def reset_confirm_buttons(clear_state: str, delete_state: str):
+def reset_confirm_buttons(
+    clear_state: str, delete_state: str, category_state: str
+):
     """Timer 到点后复位二次确认状态与按钮文案。"""
     return (
         gr.update(value="") if clear_state else gr.update(),
         gr.update(value="") if delete_state else gr.update(),
+        gr.update(value="") if category_state else gr.update(),
         gr.update(value="🗑️ 新对话") if clear_state else gr.update(),
         gr.update(value="🗑️ 删除") if delete_state else gr.update(),
+        gr.update(value="🗑️ 删除大类") if category_state else gr.update(),
     )
 
 
@@ -1624,6 +2325,7 @@ with gr.Blocks(
                 stop_btn = gr.Button("⏹️ 停止生成")
                 continue_btn = gr.Button("▶️ 继续生成")
                 collect_btn = gr.Button("📌 收藏当前题目")
+                grade_paper_btn = gr.Button("📝 批改本卷")
             with gr.Accordion("🔐 主人设置（仅本机可见）", open=False):
                 with gr.Row():
                     refresh_btn = gr.Button("🔄 刷新用量")
@@ -1649,10 +2351,21 @@ with gr.Blocks(
             )
 
         with gr.Tab("习题库"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    bank_stats = gr.Markdown("（习题库为空）")
-                    with gr.Row():
+            with gr.Row(elem_classes=["bank-layout"]):
+                with gr.Accordion(
+                    "🔍 筛选与搜索", open=False, elem_classes=["bank-filters"]
+                ):
+                    with gr.Row(elem_classes=["bank-toolbar"]):
+                        bank_category_filter = gr.Dropdown(
+                            choices=["全部", "未分类"] + list(DEFAULT_CATEGORIES),
+                            label="大类筛选",
+                            value="全部",
+                        )
+                        bank_mastery_filter = gr.Dropdown(
+                            choices=["全部"] + MASTERY_LEVELS,
+                            label="掌握度筛选",
+                            value="全部",
+                        )
                         bank_tag_filter = gr.Dropdown(
                             choices=[], label="按标签筛选", value=None
                         )
@@ -1661,71 +2374,136 @@ with gr.Blocks(
                             placeholder="搜索题目或标签",
                             scale=2,
                         )
-                    with gr.Row():
                         bank_refresh_btn = gr.Button("🔄 刷新")
                         new_btn = gr.Button("📝 手动新建")
-                    entry_selector = gr.Dropdown(
-                        choices=[], label="选择题目", value=None
+                bank_stats = gr.Markdown(
+                    "（习题库为空）", elem_classes=["bank-stats"]
+                )
+                entry_selector = gr.Dropdown(
+                    choices=[],
+                    label="选择题目",
+                    value=None,
+                    elem_classes=["bank-selector"],
+                )
+                detail_md = gr.Markdown(
+                    "（先在上方选择一道题）",
+                    latex_delimiters=LATEX_DELIMITERS,
+                    elem_classes=["bank-detail"],
+                )
+                bank_status = gr.Markdown(
+                    "",
+                    latex_delimiters=LATEX_DELIMITERS,
+                    elem_classes=["bank-status"],
+                )
+                with gr.Row(
+                    elem_classes=["bank-actions", "bank-actions-area"]
+                ):
+                    solution_checkbox = gr.Checkbox(
+                        label="显示正确解", value=False
                     )
-                with gr.Column(scale=2):
-                    with gr.Row():
-                        solution_checkbox = gr.Checkbox(
-                            label="显示正确解", value=False
-                        )
-                        edit_btn = gr.Button("✏️ 编辑")
-                        delete_btn = gr.Button("🗑️ 删除")
-                        similar_btn = gr.Button("🎯 生成同类型题")
+                    edit_btn = gr.Button("✏️ 编辑")
+                    delete_btn = gr.Button("🗑️ 删除")
+                with gr.Row(
+                    elem_classes=["mastery-row", "bank-mastery"],
+                    visible=False,
+                ) as mastery_row:
+                    mastery_correct_btn = gr.Button(
+                        "✅ 答对了", size="sm"
+                    )
+                    mastery_wrong_btn = gr.Button(
+                        "❌ 答错了", size="sm"
+                    )
+                with gr.Accordion(
+                    "🎯 练习与组卷",
+                    open=False,
+                    elem_classes=["bank-practice"],
+                ):
                     difficulty_radio = gr.Radio(
                         ["基础", "进阶", "挑战"],
                         value="进阶",
-                        label="变式难度（生成同类型题时使用）",
+                        label="变式难度",
                     )
-                    detail_md = gr.Markdown(
-                        "（先在上方选择一道题）",
-                        latex_delimiters=LATEX_DELIMITERS,
+                    with gr.Row():
+                        similar_btn = gr.Button("🎯 生成同类型题")
+                        quiz_btn = gr.Button("📝 按此类出题")
+                    with gr.Row():
+                        paper_size_textbox = gr.Textbox(
+                            value="5", label="题数(1-10)", scale=1
+                        )
+                        paper_btn = gr.Button("📄 组卷自测")
+                with gr.Accordion(
+                    "🗂️ 管理大类",
+                    open=False,
+                    elem_classes=["bank-manage"],
+                ):
+                    category_add_input = gr.Textbox(
+                        label="新大类名称", placeholder="如：三角函数"
                     )
-                    bank_status = gr.Markdown(
+                    category_add_btn = gr.Button("➕ 添加大类")
+                    category_manage_dropdown = gr.Dropdown(
+                        choices=[], label="选择要管理的大类"
+                    )
+                    category_rename_input = gr.Textbox(
+                        label="重命名为", placeholder="输入新名称"
+                    )
+                    category_rename_btn = gr.Button("✏️ 重命名")
+                    category_delete_btn = gr.Button("🗑️ 删除大类")
+                    category_mgmt_status = gr.Markdown("")
+                    category_confirm_state = gr.State(value="")
+                with gr.Accordion(
+                    "题目表单（收藏 / 手动新建 / 编辑）",
+                    open=False,
+                    elem_classes=["bank-form"],
+                ) as entry_form:
+                    edit_id_state = gr.State(value="")
+                    form_title = gr.Textbox(
+                        label="索引描述（必填，纯中文，用于查找）",
+                        lines=1,
+                        placeholder="如：讨论反常积分的绝对收敛条件",
+                    )
+                    form_question = gr.Textbox(
+                        label="题目内容",
+                        lines=4,
+                        placeholder="输入完整题目，用中文描述即可；公式建议用 $...$ 包裹以便排版",
+                    )
+                    form_mistake = gr.Textbox(
+                        label="我的卡点 / 错误做法（可选）", lines=2
+                    )
+                    form_solution = gr.Textbox(
+                        label="正确解（可选，建议自己写一遍）", lines=4
+                    )
+                    form_error_type = gr.Dropdown(
+                        choices=ERROR_TYPES, label="错误类型（可选）"
+                    )
+                    form_category = gr.Dropdown(
+                        choices=["未分类"] + list(DEFAULT_CATEGORIES),
+                        label="大类（可选）",
+                        value="未分类",
+                    )
+                    form_mastery = gr.Dropdown(
+                        choices=MASTERY_LEVELS,
+                        label="掌握度（手动纠正用）",
+                        value="未掌握",
+                    )
+                    form_tags = gr.Textbox(
+                        label="标签（多个用顿号或逗号分隔）", lines=1
+                    )
+                    with gr.Row():
+                        form_save_btn = gr.Button(
+                            "💾 保存", variant="primary"
+                        )
+                        form_cancel_btn = gr.Button("取消")
+                    form_status = gr.Markdown(
                         "", latex_delimiters=LATEX_DELIMITERS
                     )
-                    with gr.Accordion(
-                        "题目表单（收藏 / 手动新建 / 编辑）", open=False
-                    ) as entry_form:
-                        edit_id_state = gr.State(value="")
-                        form_title = gr.Textbox(
-                            label="索引描述（必填，纯中文，用于查找）",
-                            lines=1,
-                            placeholder="如：讨论反常积分的绝对收敛条件",
-                        )
-                        form_question = gr.Textbox(
-                            label="题目内容",
-                            lines=4,
-                            placeholder="输入完整题目，用中文描述即可；公式建议用 $...$ 包裹以便排版",
-                        )
-                        form_mistake = gr.Textbox(
-                            label="我的卡点 / 错误做法（可选）", lines=2
-                        )
-                        form_solution = gr.Textbox(
-                            label="正确解（可选，建议自己写一遍）", lines=4
-                        )
-                        form_error_type = gr.Dropdown(
-                            choices=ERROR_TYPES, label="错误类型（可选）"
-                        )
-                        form_tags = gr.Textbox(
-                            label="标签（多个用顿号或逗号分隔）", lines=1
-                        )
-                        with gr.Row():
-                            form_save_btn = gr.Button(
-                                "💾 保存", variant="primary"
-                            )
-                            form_cancel_btn = gr.Button("取消")
-                        form_status = gr.Markdown(
-                            "", latex_delimiters=LATEX_DELIMITERS
-                        )
                     force_save_state = gr.State(value="")
                     selected_id_state = gr.State(value="")
+                    mastery_correct_state = gr.State(value=True)
+                    mastery_wrong_state = gr.State(value=False)
 
     clear_confirm_state = gr.State(value="")
     delete_confirm_state = gr.State(value="")
+    paper_state = gr.State(value=_new_paper_state())
     confirm_timer = gr.Timer(value=5, active=True)
 
     # ===== 学习 Tab 事件 =====
@@ -1817,14 +2595,123 @@ with gr.Blocks(
             form_mistake,
             form_solution,
             form_error_type,
+            form_category,
+            form_mastery,
             form_tags,
             edit_id_state,
             bank_status,
             form_status,
         ],
     )
+    quiz_event = quiz_btn.click(
+        generate_category_quiz,
+        inputs=[
+            bank_category_filter,
+            selected_id_state,
+            difficulty_radio,
+            chatbot,
+            level_radio,
+            mode_radio,
+            thinking_checkbox,
+            model_radio,
+            effort_radio,
+            answer_style_radio,
+            usage_state,
+            stage_state,
+        ],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+            mode_radio,
+            bank_status,
+        ],
+    )
+    paper_event = paper_btn.click(
+        generate_paper,
+        inputs=[
+            bank_category_filter,
+            selected_id_state,
+            paper_size_textbox,
+            difficulty_radio,
+            chatbot,
+            level_radio,
+            mode_radio,
+            thinking_checkbox,
+            model_radio,
+            effort_radio,
+            answer_style_radio,
+            usage_state,
+            stage_state,
+            paper_state,
+        ],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+            paper_state,
+            mode_radio,
+            bank_status,
+        ],
+    )
+    grade_paper_event = grade_paper_btn.click(
+        grade_paper,
+        inputs=[
+            textbox,
+            chatbot,
+            level_radio,
+            mode_radio,
+            thinking_checkbox,
+            model_radio,
+            effort_radio,
+            answer_style_radio,
+            usage_state,
+            stage_state,
+            paper_state,
+        ],
+        outputs=[
+            chatbot,
+            textbox,
+            result_status,
+            usage_status,
+            usage_state,
+            stage_state,
+            reasoning_md,
+            paper_state,
+            mode_radio,
+            bank_status,
+        ],
+    )
+    mastery_correct_btn.click(
+        mark_mastery,
+        inputs=[selected_id_state, mastery_correct_state],
+        outputs=[detail_md, bank_stats, bank_status],
+    )
+    mastery_wrong_btn.click(
+        mark_mastery,
+        inputs=[selected_id_state, mastery_wrong_state],
+        outputs=[detail_md, bank_stats, bank_status],
+    )
     stop_btn.click(
-        None, None, None, cancels=[send_event, submit_event, continue_event]
+        None,
+        None,
+        None,
+        cancels=[
+            send_event,
+            submit_event,
+            continue_event,
+            quiz_event,
+            paper_event,
+            grade_paper_event,
+        ],
     )
     clear_btn.click(
         confirm_clear,
@@ -1839,6 +2726,7 @@ with gr.Blocks(
             reasoning_md,
             clear_btn,
             clear_confirm_state,
+            paper_state,
         ],
     )
     refresh_btn.click(render_usage_panel, inputs=[], outputs=[usage_panel])
@@ -1854,22 +2742,79 @@ with gr.Blocks(
     )
     confirm_timer.tick(
         reset_confirm_buttons,
-        inputs=[clear_confirm_state, delete_confirm_state],
-        outputs=[clear_confirm_state, delete_confirm_state, clear_btn, delete_btn],
+        inputs=[clear_confirm_state, delete_confirm_state, category_confirm_state],
+        outputs=[
+            clear_confirm_state,
+            delete_confirm_state,
+            category_confirm_state,
+            clear_btn,
+            delete_btn,
+            category_delete_btn,
+        ],
     )
 
     # ===== 习题库 Tab 事件 =====
     bank_refresh_btn.click(
         refresh_bank,
-        inputs=[bank_tag_filter, bank_search],
+        inputs=[
+            bank_tag_filter,
+            bank_search,
+            bank_category_filter,
+            bank_mastery_filter,
+        ],
         outputs=[
             bank_stats,
             bank_tag_filter,
+            bank_category_filter,
+            bank_mastery_filter,
             entry_selector,
             detail_md,
             selected_id_state,
             solution_checkbox,
             bank_status,
+            mastery_row,
+        ],
+    )
+    bank_category_filter.change(
+        refresh_bank,
+        inputs=[
+            bank_tag_filter,
+            bank_search,
+            bank_category_filter,
+            bank_mastery_filter,
+        ],
+        outputs=[
+            bank_stats,
+            bank_tag_filter,
+            bank_category_filter,
+            bank_mastery_filter,
+            entry_selector,
+            detail_md,
+            selected_id_state,
+            solution_checkbox,
+            bank_status,
+            mastery_row,
+        ],
+    )
+    bank_mastery_filter.change(
+        refresh_bank,
+        inputs=[
+            bank_tag_filter,
+            bank_search,
+            bank_category_filter,
+            bank_mastery_filter,
+        ],
+        outputs=[
+            bank_stats,
+            bank_tag_filter,
+            bank_category_filter,
+            bank_mastery_filter,
+            entry_selector,
+            detail_md,
+            selected_id_state,
+            solution_checkbox,
+            bank_status,
+            mastery_row,
         ],
     )
     new_btn.click(
@@ -1882,6 +2827,8 @@ with gr.Blocks(
             form_mistake,
             form_solution,
             form_error_type,
+            form_category,
+            form_mastery,
             form_tags,
             edit_id_state,
             bank_status,
@@ -1891,7 +2838,13 @@ with gr.Blocks(
     entry_selector.change(
         select_entry,
         inputs=[entry_selector, solution_checkbox],
-        outputs=[detail_md, selected_id_state, solution_checkbox, bank_status],
+        outputs=[
+            detail_md,
+            selected_id_state,
+            solution_checkbox,
+            bank_status,
+            mastery_row,
+        ],
     )
     solution_checkbox.change(
         toggle_solution,
@@ -1909,6 +2862,8 @@ with gr.Blocks(
             form_mistake,
             form_solution,
             form_error_type,
+            form_category,
+            form_mastery,
             form_tags,
             edit_id_state,
             form_status,
@@ -1923,10 +2878,13 @@ with gr.Blocks(
             bank_status,
             bank_stats,
             bank_tag_filter,
+            bank_category_filter,
+            bank_mastery_filter,
             entry_selector,
             detail_md,
             selected_id_state,
             solution_checkbox,
+            mastery_row,
         ],
     )
     similar_btn.click(
@@ -1954,6 +2912,54 @@ with gr.Blocks(
             reasoning_md,
         ],
     )
+    category_add_btn.click(
+        manage_add_category,
+        inputs=[category_add_input],
+        outputs=[
+            bank_category_filter,
+            category_manage_dropdown,
+            form_category,
+            category_mgmt_status,
+        ],
+    )
+    category_rename_btn.click(
+        manage_rename_category,
+        inputs=[category_manage_dropdown, category_rename_input],
+        outputs=[
+            bank_category_filter,
+            category_manage_dropdown,
+            form_category,
+            category_mgmt_status,
+        ],
+    )
+    category_delete_btn.click(
+        manage_delete_category,
+        inputs=[
+            category_manage_dropdown,
+            category_confirm_state,
+            bank_category_filter,
+            bank_tag_filter,
+            bank_search,
+            bank_mastery_filter,
+        ],
+        outputs=[
+            category_mgmt_status,
+            category_confirm_state,
+            category_delete_btn,
+            bank_category_filter,
+            bank_mastery_filter,
+            category_manage_dropdown,
+            form_category,
+            bank_stats,
+            bank_tag_filter,
+            entry_selector,
+            detail_md,
+            selected_id_state,
+            solution_checkbox,
+            bank_status,
+            mastery_row,
+        ],
+    )
     form_save_btn.click(
         save_entry,
         inputs=[
@@ -1963,6 +2969,8 @@ with gr.Blocks(
             form_mistake,
             form_solution,
             form_error_type,
+            form_category,
+            form_mastery,
             form_tags,
             force_save_state,
         ],
@@ -1971,10 +2979,13 @@ with gr.Blocks(
             force_save_state,
             bank_stats,
             bank_tag_filter,
+            bank_category_filter,
+            bank_mastery_filter,
             entry_selector,
             detail_md,
             selected_id_state,
             solution_checkbox,
+            mastery_row,
         ],
     )
     form_cancel_btn.click(
