@@ -74,7 +74,7 @@ from core.usage import (
 )
 from core.vision_client import VisionClient
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
@@ -1782,6 +1782,19 @@ def _paper_pool(
     )
 
 
+def _pick_paper_categories(pool: list[dict], max_cats: int = 3) -> list[str]:
+    """按题数从多到少选出组卷素材涉及的大类（未分类视为一个伪大类）。
+
+    返回空列表表示池为空；返回 1 个大类表示应出同类卷；
+    返回 ≥2 个大类表示素材横跨多类，应出混合卷。
+    """
+    counts: dict[str, int] = {}
+    for entry in pool:
+        cat = (entry.get("category") or "").strip() or "未分类"
+        counts[cat] = counts.get(cat, 0) + 1
+    return sorted(counts, key=lambda c: counts[c], reverse=True)[:max(1, max_cats)]
+
+
 def _clamp_paper_size(size: str | int | None) -> int:
     try:
         n = int(str(size or "").strip())
@@ -1829,25 +1842,59 @@ def generate_paper(
             f"⚠️ {source_desc}下还没有题目，先收藏几道题或换个范围。",
         )
         return
+    # 素材池横跨多个大类时自动出混合卷（交错练习），否则维持同类卷
+    categories = _pick_paper_categories(pool)
+    mixed = len(categories) >= 2
     # 素材总量控制在单条消息长度上限内（MAX_MESSAGE_LEN 默认 2000 字符）
     budget = 1700
     refs_parts: list[str] = []
-    for e in pool[:5]:
-        q = (e.get("question") or "").strip()
-        if not q:
-            continue
-        item = f"【参考题 {len(refs_parts) + 1}】\n{q[:300]}"
-        if len("\n\n".join(refs_parts + [item])) > budget:
-            break
-        refs_parts.append(item)
+    if mixed:
+        # 混合卷：每个大类最多取 2 道参考题，总数上限 6，参考题标注来源大类
+        for cat in categories:
+            cat_entries = [
+                e
+                for e in pool
+                if ((e.get("category") or "").strip() or "未分类") == cat
+            ]
+            for e in cat_entries[:2]:
+                q = (e.get("question") or "").strip()
+                if not q:
+                    continue
+                item = f"【参考题 {len(refs_parts) + 1}·{cat}】\n{q[:300]}"
+                if len("\n\n".join(refs_parts + [item])) > budget:
+                    break
+                refs_parts.append(item)
+            if len(refs_parts) >= 6:
+                break
+    else:
+        for e in pool[:5]:
+            q = (e.get("question") or "").strip()
+            if not q:
+                continue
+            item = f"【参考题 {len(refs_parts) + 1}】\n{q[:300]}"
+            if len("\n\n".join(refs_parts + [item])) > budget:
+                break
+            refs_parts.append(item)
     refs = "\n\n".join(refs_parts)
-    message = (
-        f"【组卷自测】请根据下面这些题（同知识点、题型方法保持一致），"
-        f"生成一套共 {size} 道「{difficulty}」难度变式题"
-        "（每道改数字或条件即可，方法不变），按 1 到 "
-        f"{size} 编号输出：只出题、不写答案和解析，等用户作答后统一批改。\n\n"
-        f"{refs}"
-    )
+    if mixed:
+        message = (
+            f"【组卷自测·混合卷】请根据下面这些参考题"
+            f"（覆盖 {len(categories)} 个不同知识点：{'、'.join(categories)}），"
+            f"生成一套共 {size} 道「{difficulty}」难度变式题："
+            "交叉覆盖多个知识点，把不同知识点的题交错排布、不要按知识点分组，"
+            "卷面上不要标注每道题的知识点名称（让学生自己判断该用什么方法）；"
+            "每道题改数字或条件即可、题型方法保持一致，"
+            f"按 1 到 {size} 编号输出：只出题、不写答案和解析，等用户作答后统一批改。\n\n"
+            f"{refs}"
+        )
+    else:
+        message = (
+            f"【组卷自测】请根据下面这些题（同知识点、题型方法保持一致），"
+            f"生成一套共 {size} 道「{difficulty}」难度变式题"
+            "（每道改数字或条件即可，方法不变），按 1 到 "
+            f"{size} 编号输出：只出题、不写答案和解析，等用户作答后统一批改。\n\n"
+            f"{refs}"
+        )
     stage_state = dict(stage_state or {})
     stage_state["stage"] = "practice_wait"
     stage_state["hints"] = 0
@@ -1876,11 +1923,23 @@ def generate_paper(
             if m.get("role") == "assistant" and m.get("content"):
                 questions_text = m["content"]
                 break
-        new_paper = {"active": True, "questions": questions_text, "size": size}
-        note = (
-            f"📄 已根据 {len(refs_parts)} 道{source_desc}生成 {size} 道题，"
-            "请把全部作答写进输入框，然后点「批改本卷」。"
-        )
+        new_paper = {
+            "active": True,
+            "questions": questions_text,
+            "size": size,
+            "mixed": mixed,
+        }
+        if mixed:
+            note = (
+                f"🌪️ 已根据 {len(categories)} 个大类（{'、'.join(categories)}）"
+                f"的 {len(refs_parts)} 道素材题生成 {size} 道混合卷，"
+                "题序已交错、不标注知识点，请把全部作答写进输入框，然后点「批改本卷」。"
+            )
+        else:
+            note = (
+                f"📄 已根据 {len(refs_parts)} 道{source_desc}生成 {size} 道题，"
+                "请把全部作答写进输入框，然后点「批改本卷」。"
+            )
         if mode_switched:
             note += "\n（已自动切换到互动模式）"
         yield (h, t, s, usage_text, u, st, r, new_paper, mode_update, note)
@@ -1932,10 +1991,18 @@ def grade_paper(
         )
         return
     size = int(paper_state.get("size") or 0)
+    if paper_state.get("mixed"):
+        mixed_hint = (
+            "本卷为混合卷：批改时请顺带指出每道题所属知识点，"
+            "并在小结里点明哪类知识点掌握得最弱、建议优先复习哪一类。"
+        )
+    else:
+        mixed_hint = ""
     message = (
         f"【批改本卷】请帮我批改这份共 {size} 道题的作答：逐题判定对错"
         "（哪道对、哪道错、错在哪），最后给一句小结：共对几道。"
-        "只批改、不重出题。\n\n作答：\n"
+        "只批改、不重出题。"
+        f"{mixed_hint}\n\n作答：\n"
         f"{answers[:1500]}"
     )
     stage_state = dict(stage_state or {})

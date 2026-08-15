@@ -577,3 +577,129 @@ def test_generate_category_quiz_empty_pool(monkeypatch, tmp_path):
         )
     )
     assert "还没有题目" in results[-1][8]
+
+
+def test_pick_paper_categories(monkeypatch, tmp_path):
+    """选材大类：按题数排序、上限控制、未分类视为伪大类。"""
+    pool = [
+        {"category": "代数"},
+        {"category": "代数"},
+        {"category": "几何"},
+        {"category": ""},
+        {"category": ""},
+    ]
+    assert app_module._pick_paper_categories([]) == []
+    cats = app_module._pick_paper_categories(pool)
+    assert cats[0] == "代数"  # 题数最多优先
+    assert "几何" in cats and "未分类" in cats
+    assert len(app_module._pick_paper_categories(pool, max_cats=2)) == 2
+    # 只有未分类时视作单一伪大类
+    assert app_module._pick_paper_categories([{"category": ""}]) == ["未分类"]
+
+
+def test_generate_paper_auto_mixed(monkeypatch, tmp_path):
+    """素材横跨多个大类时自动出混合卷（多类参考素材 + 混合提示语）。"""
+    _patch_env(monkeypatch, tmp_path)
+    app_module.client = _FakeClient()
+    bank.add_entry({"question": "代数题A", "category": "代数"}, username="user1")
+    bank.add_entry({"question": "几何题B", "category": "几何"}, username="user1")
+    bank.add_entry({"question": "数列题C", "category": "数列"}, username="user1")
+    results = list(
+        app_module.generate_paper(
+            "全部",
+            "",
+            "5",
+            "进阶",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "deepseek-v4-flash",
+            "high",
+            None,
+            {"total_tokens": 0, "turns": 0},
+            {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            {"active": False, "questions": "", "size": 0},
+            _fake_request(),
+        )
+    )
+    last = results[-1]
+    assert last[7]["active"] is True and last[7]["size"] == 5
+    assert last[7]["mixed"] is True
+    user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
+    quiz_msg = next(u for u in user_msgs if "组卷自测" in u)
+    assert "混合卷" in quiz_msg
+    assert "代数" in quiz_msg and "几何" in quiz_msg and "数列" in quiz_msg
+    # 参考素材来自多个大类（带大类标签）
+    assert "代数题A" in quiz_msg and "几何题B" in quiz_msg and "数列题C" in quiz_msg
+    assert last[9] and "混合卷" in last[9]
+
+
+def test_generate_paper_single_category_still_single(monkeypatch, tmp_path):
+    """筛选单个大类时维持同类卷（与 v1.2.0 行为一致）。"""
+    _patch_env(monkeypatch, tmp_path)
+    app_module.client = _FakeClient()
+    bank.add_entry({"question": "代数题A", "category": "代数"}, username="user1")
+    bank.add_entry({"question": "代数题B", "category": "代数"}, username="user1")
+    bank.add_entry({"question": "几何题", "category": "几何"}, username="user1")
+    results = list(
+        app_module.generate_paper(
+            "代数",
+            "",
+            "7",
+            "进阶",
+            [],
+            "高中",
+            "解答模式",
+            False,
+            "deepseek-v4-flash",
+            "high",
+            None,
+            {"total_tokens": 0, "turns": 0},
+            {"stage": None, "hints": 0, "last_mode": "解答模式"},
+            {"active": False, "questions": "", "size": 0},
+            _fake_request(),
+        )
+    )
+    last = results[-1]
+    assert last[7]["active"] is True and last[7]["size"] == 7
+    assert last[7]["mixed"] is False
+    user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
+    quiz_msg = next(u for u in user_msgs if "组卷自测" in u)
+    assert "混合卷" not in quiz_msg
+    assert "代数题A" in quiz_msg and "代数题B" in quiz_msg
+    assert "几何题" not in quiz_msg
+
+
+def test_grade_paper_mixed_mentions_categories(monkeypatch, tmp_path):
+    """混合卷批改时附带知识点与最弱大类提示。"""
+    _patch_env(monkeypatch, tmp_path)
+    app_module.client = _FakeClient()
+    paper = {
+        "active": True,
+        "questions": "1. x=?\n2. y=?",
+        "size": 2,
+        "mixed": True,
+    }
+    results = list(
+        app_module.grade_paper(
+            "1. x=2 2. y=3",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "deepseek-v4-flash",
+            "high",
+            None,
+            {"total_tokens": 0, "turns": 0},
+            {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            paper,
+            _fake_request(),
+        )
+    )
+    last = results[-1]
+    assert "批改完成" in last[2]
+    user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
+    assert any(
+        "批改本卷" in u and "混合卷" in u and "知识点" in u for u in user_msgs
+    )
