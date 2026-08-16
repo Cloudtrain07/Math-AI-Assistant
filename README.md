@@ -2,7 +2,7 @@
 
 基于 **Python + Gradio + DeepSeek 大模型**的数学学习助手，采用苏格拉底式引导教学，支持 LaTeX 公式渲染、流式输出、拍照识题、本地验算与公网访问。
 
-当前版本：**v1.2.0**（版本更新记录见 [CHANGELOG.md](CHANGELOG.md)）
+当前版本：**v1.2.2**（版本更新记录见 [CHANGELOG.md](CHANGELOG.md)）
 
 ## 功能特性
 
@@ -21,14 +21,16 @@
 - **每日自动备份**：`data/`（账号、历史、习题库、日志）每日自动打包到 `data/backups/`，保留最近 14 份，防误删
 - **界面优化**：蓝白黑冷色主题；学习页常用设置与高级/主人设置分组折叠；状态分「本次结果」与「累计用量」两区；新对话与删除习题带二次确认；习题库左右两栏布局；移动端自适应（聊天框高度、公式横向滚动）
 - **LaTeX 渲染**：自动把模型输出的不规范公式归一化为 KaTeX 可渲染格式
+- **上下文压缩**：长对话自动把较早内容压缩成摘要继续携带，降低 token 成本
 - **拍照识题**：上传/粘贴题目图片，用百炼视觉模型自动转写为文字
+- **手写公式识别**：上传手写公式/题目时可勾选「手写公式模式」，输出更准确的 LaTeX 转写
 - **本地验算**：用 sympy 验算回答中的公式（含不等式的 `\lt` 写法自动还原）
 - **会话用量统计**：状态栏显示本次用量与本会话累计 token、轮数
 - **每日成本护栏**：每账号每天最多 `DAILY_TOKEN_LIMIT`（默认 100 万）、全局每天最多 `GLOBAL_DAILY_TOKEN_LIMIT`（默认 300 万），超限自动拒绝
 - **输入限制**：单条消息超过 `MAX_MESSAGE_LEN`（默认 2000 字符）会被直接拒绝，不占用额度
 - **访问日志**：记录登录、提问、回复与超额事件，`data/access.log` 只保留最近 1000 条
 - **错误诊断日志**：API 异常与"空回复"的完整信息（错误类型、token、配置）自动写入 `data/error.log`
-- **主人用量面板**：本机（localhost）点击“刷新用量”可查看今日全局/各访客用量、登录与提问次数
+- **主人用量面板**：本机（localhost）点击“刷新用量”可查看今日全局/各账号用量、登录与提问次数
 - **公网访问**：启动时自动建立 Cloudflare 快速隧道，任何设备凭账号密码访问
 - **消息复制**：每条消息自带复制按钮
 
@@ -74,16 +76,20 @@ python app.py
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | - | DeepSeek API 密钥（必填） |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 默认模型（可在界面下拉切换 `flash` / `pro`） |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 地址（一般无需修改） |
 | `DEEPSEEK_THINKING` | `false` | 是否开启思考模式 |
 | `DEEPSEEK_REASONING_EFFORT` | `high` | 默认思考强度：`low/high/max`（可在界面下拉切换） |
-| `MAX_HISTORY_MESSAGES` | `20` | 保留的最大历史消息条数 |
+| `MAX_HISTORY_MESSAGES` | `20` | 保留的最大历史消息条数，超过后较早消息自动压缩为摘要 |
 | `MAX_OUTPUT_TOKENS` | `30000` | 单次回答最大输出 token |
 | `MAX_WAIT_SECONDS` | `600` | 单次请求最长等待秒数（含思考时间），超时自动停止 |
 | `MAX_MESSAGE_LEN` | `2000` | 单条消息最大长度（字符），超长拒绝 |
 | `DAILY_TOKEN_LIMIT` | `1000000` | 每账号每日 token 上限 |
 | `GLOBAL_DAILY_TOKEN_LIMIT` | `3000000` | 全局每日 token 总上限 |
 | `ACCOUNT_COUNT` | `5` | 首次启动生成的账号数量（之后以 data/accounts.json 为准） |
+| `AUTO_OPEN_BROWSER` | `true` | 启动时是否自动打开浏览器：`true` / `false` |
+| `GRADIO_SERVER_NAME` | `0.0.0.0` | Gradio 监听地址，默认允许局域网访问 |
 | `DASHSCOPE_API_KEY` | - | 百炼视觉密钥（拍照识题，可选） |
+| `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 百炼 OpenAI 兼容接口地址（一般无需修改） |
 | `VISION_MODEL` | `qwen3.7-flash-2026-07-15` | 视觉模型名 |
 
 ## 目录结构
@@ -102,6 +108,7 @@ Math_AI_Assistant/
 │   ├── accounts.py         # 多账号管理（生成、登录校验、密码重置）
 │   ├── backup.py           # 每日自动备份（zip 打包 + 保留 14 份）
 │   ├── calculator.py       # sympy 本地验算（含长度/条数/超时限制）
+│   ├── compressor.py       # 长会话上下文压缩（增量摘要）
 │   ├── config.py           # 配置读取与校验
 │   ├── deepseek_client.py  # DeepSeek API 封装（流式）
 │   ├── exercise_bank.py    # 习题库（按账号增删改查、查重、筛选）
@@ -111,7 +118,7 @@ Math_AI_Assistant/
 │   ├── tunnel.py           # cloudflared 快速隧道（自愈 + 残留清理）
 │   ├── usage.py            # 会话/每日用量统计与限额
 │   └── vision_client.py    # 百炼视觉识图
-└── tests/                  # pytest 回归测试（75 用例）
+└── tests/                  # pytest 回归测试（80 用例）
 ```
 
 ## 测试
@@ -121,12 +128,12 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-覆盖：LaTeX 归一化、验算、用量/限额逻辑、访问日志裁剪、隧道解析与残留清理、配置校验、respond 主流程、思考面板展示、继续生成、多账号管理、按账号历史隔离、习题库增删改查与查重筛选、自动验算闭环、历史恢复、二次确认、变式难度选择、每日备份、日志轮转。
+覆盖：LaTeX 归一化、验算、用量/限额逻辑、访问日志裁剪、隧道解析与残留清理、配置校验、respond 主流程、思考面板展示、继续生成、多账号管理、按账号历史隔离、上下文压缩、习题库增删改查与查重筛选、自动验算闭环、历史恢复、二次确认、变式难度选择、每日备份、日志轮转。
 
 ## 其他说明
 
 - **错误处理与诊断**：API 请求失败会给出中文友好提示并保留已生成的部分内容；失败详情（错误类型、消息、token、模型与思考配置）自动写入 `data/error.log`，便于排查
 - **数据目录**：`data/`（账号清单、按账号的聊天历史与习题库、用量、访问信息、日志）已加入 `.gitignore`，不会入库
-- **隐私提示**：`data/access.log` 与用量统计中包含访客 IP，仅用于成本统计与安全防护
+- **隐私提示**：`data/access.log` 包含访客 IP（仅用于安全防护）；用量统计按账号记录（v1.2 起），不包含 IP
 
 详细规划见 [PLAN.md](PLAN.md)。

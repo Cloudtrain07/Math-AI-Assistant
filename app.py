@@ -28,6 +28,7 @@ from core.accounts import (
 )
 from core.backup import daily_backup_loop, ensure_today_backup
 from core.calculator import CALCULATOR_AVAILABLE, verify_math
+from core.compressor import HistoryCompressor
 from core.config import get_settings
 from core.deepseek_client import DeepSeekClient, MaxWaitTimeout
 from core.exercise_bank import (
@@ -53,6 +54,8 @@ from core.prompts import (
     MODE_ANSWER,
     MODE_INTERACTIVE,
     VISION_COMPLETE_PROMPT,
+    VISION_HANDWRITTEN_COMPLETE_PROMPT,
+    VISION_HANDWRITTEN_PROMPT,
     build_system_prompt,
 )
 from core.storage import load_history, save_history
@@ -74,7 +77,7 @@ from core.usage import (
 )
 from core.vision_client import VisionClient
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
@@ -152,7 +155,9 @@ except ValueError as exc:
     startup_hint = str(exc)
 else:
     startup_hint = ""
-# 每日每访客 token 上限（成本护栏）
+# 上下文压缩器（按账号增量维护长会话摘要）
+history_compressor = HistoryCompressor()
+# 每日每账号 token 上限（成本护栏）
 DAILY_LIMIT = settings.daily_token_limit if settings is not None else 1_000_000
 # 全局每日 token 总上限（成本护栏第二道保险）
 GLOBAL_DAILY_LIMIT = (
@@ -226,6 +231,7 @@ def to_api_messages(
     answer_style: str | None = None,
     stage: str | None = None,
     mode_changed: bool = False,
+    summary: str | None = None,
 ) -> list[dict[str, str]]:
     """把界面历史转换为 DeepSeek 需要的消息列表，并控制上下文长度。"""
     messages: list[dict[str, str]] = [
@@ -239,6 +245,13 @@ def to_api_messages(
             {
                 "role": "system",
                 "content": "【模式切换】现在起按新模式作答，忽略此前对话中的旧模式行为。",
+            }
+        )
+    if summary:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"【更早对话摘要】\n{summary}",
             }
         )
     if settings is not None:
@@ -305,7 +318,7 @@ def _log_event(kind: str, text: str) -> None:
         with _log_lock:
             with open(DATA_DIR / "chat.log", "a", encoding="utf-8") as f:
                 f.write(line)
-        trim_log_file(DATA_DIR / "chat.log", max_lines=LOG_MAX_LINES)
+            trim_log_file(DATA_DIR / "chat.log", max_lines=LOG_MAX_LINES)
     except Exception:
         pass
 
@@ -317,7 +330,7 @@ def _write_error_log(record: dict) -> None:
         with _log_lock:
             with open(DATA_DIR / "error.log", "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        trim_log_file(DATA_DIR / "error.log", max_lines=LOG_MAX_LINES)
+            trim_log_file(DATA_DIR / "error.log", max_lines=LOG_MAX_LINES)
     except Exception:
         pass
 
@@ -520,7 +533,7 @@ def advance_stage(
     }
 
 
-def recognize_image(image: str | None):
+def recognize_image(image: str | None, handwritten: bool = False):
     """上传/粘贴图片后自动识别：填入输入框并清空图片区，避免重复识别。"""
     if not image:
         yield "", "", gr.skip()
@@ -534,7 +547,9 @@ def recognize_image(image: str | None):
         return
     yield "", "🔍 正在识别题目图片…", gr.skip()
     try:
-        recognized, truncated = vision_client.transcribe_image(image)
+        recognized, truncated = vision_client.transcribe_image(
+            image, prompt=VISION_HANDWRITTEN_PROMPT if handwritten else None
+        )
     except Exception as exc:
         yield "", f"❌ 图片识别失败：{exc}", gr.skip()
         return
@@ -545,7 +560,12 @@ def recognize_image(image: str | None):
         yield recognized, "🔍 识别可能不完整，正在尝试补全…", gr.skip()
         try:
             completed, truncated2 = vision_client.transcribe_image(
-                image, prompt=VISION_COMPLETE_PROMPT.format(partial=recognized)
+                image,
+                prompt=(
+                    VISION_HANDWRITTEN_COMPLETE_PROMPT.format(partial=recognized)
+                    if handwritten
+                    else VISION_COMPLETE_PROMPT.format(partial=recognized)
+                ),
             )
         except Exception:
             completed = ""
@@ -582,6 +602,7 @@ def respond(
     stage_state: dict,
     request: gr.Request,
     verify: bool = True,
+    force_continue: bool = False,
 ):
     """纯文本聊天：流式回复，累计会话用量，并按互动模式阶段引导。
 
@@ -641,14 +662,22 @@ def respond(
         log_access_event(
             "超额拒绝",
             f"账号={username}",
-            f"本访客={daily_used}",
+            f"本账号={daily_used}",
             f"全局={global_used}",
         )
         yield history, "", quota_msg, "", usage_state, stage_state, ""
         return
 
     # 根据用户新消息推进互动模式阶段（解答模式无阶段）
-    new_stage = advance_stage(mode, message, stage_state, has_history=bool(history))
+    if force_continue:
+        # 继续生成时保留当前阶段，避免把“题目原文+继续”误判为新题或切到批改
+        new_stage = dict(stage_state)
+        new_stage["mode_changed"] = False
+        if mode != MODE_INTERACTIVE:
+            new_stage["stage"] = None
+            new_stage["last_mode"] = mode
+    else:
+        new_stage = advance_stage(mode, message, stage_state, has_history=bool(history))
 
     user_content = normalize_math_text(message, auto_close=True)
     _log_event("发送", user_content)
@@ -670,6 +699,12 @@ def respond(
             "",
         )
         return
+    # 长会话自动压缩：把掉出窗口的早期消息合并成摘要，作为系统消息注入
+    summary = ""
+    if settings is not None and len(history) > settings.max_history_messages:
+        summary = history_compressor.get_summary(
+            username, history, settings.max_history_messages, client
+        )
 
     answer = ""
     reasoning_text = ""
@@ -686,6 +721,7 @@ def respond(
                     answer_style,
                     stage=new_stage["stage"],
                     mode_changed=new_stage["mode_changed"],
+                    summary=summary,
                 ),
                 thinking=thinking,
                 reasoning_effort=reasoning_effort,
@@ -749,7 +785,7 @@ def respond(
                 f"账号={username}",
                 f"错误={exc.__class__.__name__}",
                 f"估算tokens={turn_total}",
-                f"本访客={daily_used}",
+                f"本账号={daily_used}",
             )
         else:
             log_access_event(
@@ -819,15 +855,16 @@ def respond(
             "回复",
             f"账号={username}",
             f"tokens={turn_total}",
-            f"本访客={daily_used}",
+            f"本账号={daily_used}",
             f"全局={global_used}",
         )
+    _log_event("回复", answer)
     result_text = format_usage(usage)
     if truncated:
         result_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
     usage_text = format_cumulative(usage_state)
     usage_text += (
-        f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本访客），"
+        f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号），"
         f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
     )
     reasoning_display = normalize_math_text(reasoning_text, auto_close=True)
@@ -902,6 +939,7 @@ def continue_last_answer(
         usage_state,
         stage_state,
         request,
+        force_continue=True,
     )
 
 
@@ -909,6 +947,7 @@ def clear_conversation(request: gr.Request):
     """开启新对话：清空当前账号的聊天记录、用量与阶段状态并持久化。"""
     username = request.username if request and request.username else "unknown"
     save_history([], username=username)
+    history_compressor.reset(username)
     return (
         gr.update(value=[]),
         "",
@@ -1022,7 +1061,7 @@ def _auto_verify_loop(answer: str, history: list[dict], username: str) -> str:
         parts.append(f"{ok} 条成立")
     if other:
         parts.append(f"{other} 条无法自动判定")
-    note = "，".join(parts) + "。"
+    note = "，".join(parts) + "。（验算仅针对公式本身，不代表解题过程正确）"
     if bad:
         correction = _recheck_wrong_answer(answer)
         if correction:
@@ -2379,6 +2418,10 @@ with gr.Blocks(
                     sources=["upload", "clipboard"],
                     type="filepath",
                 )
+                handwritten_checkbox = gr.Checkbox(
+                    label="✍️ 手写公式模式（只识别手写公式/题目，输出 LaTeX）",
+                    value=False,
+                  )
             with gr.Accordion("思考过程（仅当轮，不会写入历史）", open=False):
                 reasoning_md = gr.Markdown(
                     "（本轮暂无思考过程）",
@@ -2576,7 +2619,7 @@ with gr.Blocks(
     # ===== 学习 Tab 事件 =====
     image_input.upload(
         recognize_image,
-        inputs=[image_input],
+        inputs=[image_input, handwritten_checkbox],
         outputs=[textbox, result_status, image_input],
     )
 

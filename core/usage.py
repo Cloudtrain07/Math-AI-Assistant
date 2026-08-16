@@ -58,7 +58,7 @@ def _write_daily(path: Path, data: dict) -> None:
 
 
 def get_daily_used(date: str, ip: str, path: Path | None = None) -> int:
-    """读取指定日期、访客 IP 的已用 token 数。"""
+    """读取指定日期、账号的已用 token 数（v1.2 起按账号记录）。"""
     path = path or DAILY_USAGE_FILE
     with _daily_lock:
         data = _read_daily(path)
@@ -66,7 +66,7 @@ def get_daily_used(date: str, ip: str, path: Path | None = None) -> int:
 
 
 def add_daily_usage(date: str, ip: str, tokens: int, path: Path | None = None) -> int:
-    """累加指定日期、访客 IP 的 token 用量，并同步累加全局总量，返回该 IP 当日累计值。"""
+    """累加指定日期、账号的 token 用量，并同步累加全局总量，返回该账号当日累计值。"""
     path = path or DAILY_USAGE_FILE
     with _daily_lock:
         data = _read_daily(path)
@@ -81,7 +81,7 @@ def add_daily_usage(date: str, ip: str, tokens: int, path: Path | None = None) -
 
 
 def get_daily_total(date: str, path: Path | None = None) -> int:
-    """读取指定日期的全局已用 token；旧数据无 __total__ 时回退为各 IP 求和。"""
+    """读取指定日期的全局已用 token；旧数据无 __total__ 时回退为各账号求和。"""
     path = path or DAILY_USAGE_FILE
     with _daily_lock:
         data = _read_daily(path)
@@ -98,7 +98,7 @@ def get_daily_total(date: str, path: Path | None = None) -> int:
 
 
 def get_daily_ip_usage(date: str, path: Path | None = None) -> dict:
-    """读取指定日期各访客 IP 的用量（排除保留键）。"""
+    """读取指定日期各账号的用量（排除保留键）。"""
     path = path or DAILY_USAGE_FILE
     with _daily_lock:
         data = _read_daily(path)
@@ -171,7 +171,7 @@ def check_daily_quota(
         global_used, global_limit
     ):
         return (
-            f"⚠️ 今日额度已用尽（每访客 {daily_limit:,} / 全局 "
+            f"⚠️ 今日额度已用尽（每账号 {daily_limit:,} / 全局 "
             f"{global_limit:,} tokens），请明天再试。"
         )
     return None

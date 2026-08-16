@@ -18,12 +18,13 @@ DEFAULT_TIMEOUT = 90.0
 
 
 def find_cloudflared(search_dirs: list[Path] | None = None) -> Path | None:
-    """在指定目录（默认项目根目录）与 PATH 中查找 cloudflared.exe。"""
+    """在指定目录（默认项目根目录）与 PATH 中查找 cloudflared / cloudflared.exe。"""
     dirs = [Path(d) for d in (search_dirs if search_dirs is not None else [PROJECT_DIR])]
     for directory in dirs:
-        candidate = directory / "cloudflared.exe"
-        if candidate.exists():
-            return candidate
+        for name in ("cloudflared.exe", "cloudflared"):
+            candidate = directory / name
+            if candidate.exists():
+                return candidate
     found = shutil.which("cloudflared")
     if found:
         return Path(found)

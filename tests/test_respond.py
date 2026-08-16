@@ -107,7 +107,7 @@ def test_respond_success_path(monkeypatch, tmp_path):
     assert usage_state == {"total_tokens": 123, "turns": 1}
     assert "123" in status_text
     assert "累计" in usage_text and "123" in usage_text
-    assert "本访客" in usage_text
+    assert "本账号" in usage_text
     assert stage_state["stage"] == "initial_hint"
     assert fake_client.calls == 1
     today = __import__("datetime").date.today().isoformat()
@@ -385,6 +385,38 @@ def test_continue_last_answer(monkeypatch, tmp_path):
     assert "求导" in last_user and "继续" in last_user
     assert final_history[-1]["role"] == "assistant"
     assert final_history[-1]["content"] == "你好世界"
+
+
+
+def test_continue_last_answer_keeps_stage(monkeypatch, tmp_path):
+    fake_client = _FakeClient()
+    monkeypatch.setattr(app_module, "client", fake_client)
+    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    history = [
+        {"role": "user", "content": "出道题"},
+        {"role": "assistant", "content": "题目写到一半"},
+    ]
+    results = list(
+        app_module.continue_last_answer(
+            history,
+            "高中",
+            "互动模式",
+            False,
+            "deepseek-v4-flash",
+            "high",
+            None,
+            {"total_tokens": 0, "turns": 0},
+            {"stage": "practice_wait", "hints": 0, "last_mode": "互动模式"},
+            _fake_request(),
+        )
+    )
+    assert results[-1][5]["stage"] == "practice_wait"
 
 
 def test_continue_last_answer_no_history():

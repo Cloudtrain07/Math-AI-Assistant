@@ -94,9 +94,9 @@ def log_access_event(*parts: str, target: Path | None = None) -> None:
         with _log_lock:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
+            trim_log_file(path)
     except Exception:
         return
-    trim_log_file(path)
 
 
 def is_owner_host(ip: str | None) -> bool:

@@ -72,7 +72,7 @@ class VisionClient:
                     max(1, round(img.width * ratio)),
                     max(1, round(img.height * ratio)),
                 )
-                img = img.resize(new_size, Image.LANCZOS)
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=JPEG_QUALITY)
             raw = buf.getvalue()

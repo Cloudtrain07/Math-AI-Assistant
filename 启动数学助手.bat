@@ -24,6 +24,10 @@ if %errorlevel%==0 (
 
 echo 正在启动数学学习 AI 助手，浏览器会自动打开，请稍候...
 echo 手机访问：http://%LAN_IP%:7860（手机需连接同一 Wi-Fi）
-echo 若页面内容没有更新，请关闭旧的浏览器标签页后重新打开 http://127.0.0.1:7860
-".venv\Scripts\python.exe" app.py
+echo If the page is not updated, close the old browser tab and reopen http://127.0.0.1:7860
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" app.py
+) else (
+    python app.py
+)
 pause
