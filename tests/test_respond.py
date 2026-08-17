@@ -98,6 +98,7 @@ def test_respond_success_path(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -141,6 +142,7 @@ def test_respond_quota_rejected(monkeypatch, tmp_path):
             None,
             state0,
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -174,6 +176,7 @@ def test_respond_overlong_message_rejected(monkeypatch):
             None,
             state0,
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -208,6 +211,7 @@ def test_respond_escape_keyword_full_solution(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -238,6 +242,7 @@ def test_respond_practice_keyword_practice_wait(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -267,6 +272,7 @@ def test_respond_answer_mode_stage_none(monkeypatch, tmp_path):
             "完整步骤+答案",
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -302,6 +308,7 @@ def test_respond_new_problem_resets_stage(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             stage_state,
+            None,
             _fake_request(),
         )
     )
@@ -332,6 +339,7 @@ def test_respond_reasoning_panel_and_status(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -375,6 +383,7 @@ def test_continue_last_answer(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             _fake_request(),
         )
     )
@@ -413,6 +422,7 @@ def test_continue_last_answer_keeps_stage(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": "practice_wait", "hints": 0, "last_mode": "互动模式"},
+            None,
             _fake_request(),
         )
     )
@@ -431,6 +441,7 @@ def test_continue_last_answer_no_history():
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             _fake_request(),
         )
     )

@@ -230,6 +230,7 @@ def test_generate_similar_no_selection(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
+            None,
             _fake_request(),
         )
     )
@@ -253,6 +254,7 @@ def test_generate_similar_with_entry(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
+            None,
             _fake_request(),
         )
     )
@@ -369,6 +371,7 @@ def test_generate_category_quiz_with_selected_entry(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
+            None,
             _fake_request(),
         )
     )
@@ -400,6 +403,7 @@ def test_generate_category_quiz_by_category_pool(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             _fake_request(),
         )
     )
@@ -454,6 +458,7 @@ def test_generate_paper(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
             {"active": False, "questions": "", "size": 0},
+            None,
             _fake_request(),
         )
     )
@@ -485,6 +490,7 @@ def test_generate_paper_empty_pool(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
             {"active": False, "questions": "", "size": 0},
+            None,
             _fake_request(),
         )
     )
@@ -509,6 +515,7 @@ def test_grade_paper(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
             paper,
+            None,
             _fake_request(),
         )
     )
@@ -534,6 +541,7 @@ def test_grade_paper_no_paper_or_answers(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
             {"active": False, "questions": "", "size": 0},
+            None,
             _fake_request(),
         )
     )
@@ -551,6 +559,7 @@ def test_grade_paper_no_paper_or_answers(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
             {"active": True, "questions": "1. x", "size": 1},
+            None,
             _fake_request(),
         )
     )
@@ -573,6 +582,7 @@ def test_generate_category_quiz_empty_pool(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             _fake_request(),
         )
     )
@@ -620,6 +630,7 @@ def test_generate_paper_auto_mixed(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
             {"active": False, "questions": "", "size": 0},
+            None,
             _fake_request(),
         )
     )
@@ -658,6 +669,7 @@ def test_generate_paper_single_category_still_single(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
             {"active": False, "questions": "", "size": 0},
+            None,
             _fake_request(),
         )
     )
@@ -694,6 +706,7 @@ def test_grade_paper_mixed_mentions_categories(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
             paper,
+            None,
             _fake_request(),
         )
     )

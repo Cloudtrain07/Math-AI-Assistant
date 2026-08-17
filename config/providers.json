@@ -1,0 +1,20 @@
+[
+  {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+    "default_model": "deepseek-v4-flash",
+    "thinking_param": "deepseek"
+  },
+  {
+    "id": "dashscope",
+    "name": "阿里云百炼",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key_env": "QWEN_API_KEY",
+    "models": ["qwen3.8-max", "qwen3.7-plus", "qwen3.7-flash"],
+    "default_model": "qwen3.7-flash",
+    "thinking_param": "qwen"
+  }
+]

@@ -1,15 +1,15 @@
 # 🧮 数学学习 AI 助手（Math_AI_Assistant）
 
-基于 **Python + Gradio + DeepSeek 大模型**的数学学习助手，采用苏格拉底式引导教学，支持 LaTeX 公式渲染、流式输出、拍照识题、本地验算与公网访问。
+基于 **Python + Gradio + 多模型大模型**的数学学习助手，采用苏格拉底式引导教学，支持 LaTeX 公式渲染、流式输出、拍照识题、本地验算与公网访问。
 
-当前版本：**v1.2.2**（版本更新记录见 [CHANGELOG.md](CHANGELOG.md)）
+当前版本：**v1.3.0**（版本更新记录见 [CHANGELOG.md](CHANGELOG.md)）
 
 ## 功能特性
 
 - **流式对话**：按学段（小学/初中/高中/大学）与教学模式（互动/解答）组装提示词，互动模式内置阶段引导、批改与练习子流程
 - **思考进度与超时保护**：深度思考期间状态栏每秒刷新已用时与估算思考 token；超过 `MAX_WAIT_SECONDS`（默认 600 秒）自动停止，避免无限等待
 - **思考过程展示**：深度思考的思维链以可折叠面板展示（公式按 LaTeX 渲染），仅当轮可见、不写入历史、不回传 API
-- **模型/思考强度切换**：界面可直接切换 `deepseek-v4-flash` / `deepseek-v4-pro` 与思考强度 `low / high / max`，无需改配置重启
+- **多模型服务商切换**：支持 DeepSeek、OpenAI、阿里云百炼等 OpenAI 兼容服务商；界面选择服务商后自动加载对应模型，并可切换思考强度 `low / high / max`
 - **继续生成**：回答因长度限制被截断时，可一键带上题目原文继续生成
 - **多账号**：默认 5 个独立账号（可自由增删），账号间聊天历史、每日用量与访问日志相互隔离，可同时在线使用
 - **习题库**：手动收藏题目（聊天一键带入或手动新建），按账号独立保存；录入时填写必填的「索引描述」（纯中文，用于查找），支持大类分类（可自定义增删改）、大类/掌握度/标签筛选、关键词搜索、正确解隐藏查看、编辑删除、按难度（基础/进阶/挑战）生成同类型变式题复习
@@ -74,7 +74,8 @@ python app.py
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | - | DeepSeek API 密钥（必填） |
+| `DEEPSEEK_API_KEY` | - | DeepSeek API 密钥（可选，至少配置一个服务商 Key 才能对话） |
+| `OPENAI_API_KEY` | - | OpenAI API 密钥（可选） |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 默认模型（可在界面下拉切换 `flash` / `pro`） |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 地址（一般无需修改） |
 | `DEEPSEEK_THINKING` | `false` | 是否开启思考模式 |
@@ -103,6 +104,8 @@ Math_AI_Assistant/
 ├── .gitignore
 ├── README.md
 ├── PLAN.md                 # 分步实施计划
+├── config/
+│   └── providers.json        # 自定义多服务商配置（可选）
 ├── core/
 │   ├── access.py           # 公网密码 / 访问信息文件 / 访问日志 / 主人判定
 │   ├── accounts.py         # 多账号管理（生成、登录校验、密码重置）
@@ -110,7 +113,9 @@ Math_AI_Assistant/
 │   ├── calculator.py       # sympy 本地验算（含长度/条数/超时限制）
 │   ├── compressor.py       # 长会话上下文压缩（增量摘要）
 │   ├── config.py           # 配置读取与校验
-│   ├── deepseek_client.py  # DeepSeek API 封装（流式）
+│   ├── llm_client.py       # 统一大模型客户端（OpenAI 兼容多服务商）
+│   ├── providers.py        # 多服务商配置加载与校验
+│   ├── deepseek_client.py  # DeepSeek 兼容客户端（兼容旧代码）
 │   ├── exercise_bank.py    # 习题库（按账号增删改查、查重、筛选）
 │   ├── math_format.py      # LaTeX 归一化（< > 转义等）
 │   ├── prompts.py          # 系统提示词（双模式教学 + 防注入）

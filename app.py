@@ -29,8 +29,17 @@ from core.accounts import (
 from core.backup import daily_backup_loop, ensure_today_backup
 from core.calculator import CALCULATOR_AVAILABLE, verify_math
 from core.compressor import HistoryCompressor
-from core.config import get_settings
-from core.deepseek_client import DeepSeekClient, MaxWaitTimeout
+from core.config import get_base_settings, get_settings
+from core.llm_client import LLMClient, MaxWaitTimeout
+from core.providers import (
+    get_available_providers,
+    get_default_provider,
+    get_provider,
+    get_provider_models,
+    get_provider_supports_thinking,
+    load_providers,
+    provider_has_key,
+)
 from core.exercise_bank import (
     DEFAULT_CATEGORIES,
     ERROR_TYPES,
@@ -77,7 +86,7 @@ from core.usage import (
 )
 from core.vision_client import VisionClient
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
@@ -146,15 +155,23 @@ PAGE_CSS = """
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 try:
-    settings = get_settings()
-    client = DeepSeekClient(settings)
+    settings = get_base_settings()
+    all_providers = load_providers()
+    available_providers = get_available_providers(all_providers)
+    clients = {p["id"]: LLMClient(p, settings) for p in available_providers}
+    default_provider = get_default_provider(all_providers)
+    client = clients.get(default_provider["id"]) if default_provider else None
+    ui_providers = available_providers or all_providers
+    startup_hint = ("未找到可用的 API Key（DeepSeek / OpenAI），请检查 .env 后重启。" if not client else "")
+    # 客户端已在上方按服务商构建
 except ValueError as exc:
     # 未配置 API Key 时应用仍可启动，界面给出提示，方便先看效果
     settings = None
     client = None
+    ui_providers = []
     startup_hint = str(exc)
 else:
-    startup_hint = ""
+    pass
 # 上下文压缩器（按账号增量维护长会话摘要）
 history_compressor = HistoryCompressor()
 # 每日每账号 token 上限（成本护栏）
@@ -600,6 +617,7 @@ def respond(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    provider_id: str | None,
     request: gr.Request,
     verify: bool = True,
     force_continue: bool = False,
@@ -688,7 +706,9 @@ def respond(
     if _recognition_incomplete(message):
         _log_event("发送-原始疑似不完整", message)
     history.append({"role": "user", "content": user_content})
-    if client is None:
+    # 根据界面选择的服务商使用对应客户端
+    active_client = clients.get(provider_id) or client
+    if active_client is None:
         yield (
             history + [{"role": "assistant", "content": f"⚠️ {startup_hint}"}],
             "",
@@ -703,7 +723,7 @@ def respond(
     summary = ""
     if settings is not None and len(history) > settings.max_history_messages:
         summary = history_compressor.get_summary(
-            username, history, settings.max_history_messages, client
+            username, history, settings.max_history_messages, active_client
         )
 
     answer = ""
@@ -713,7 +733,7 @@ def respond(
     thinking_started = time.monotonic()
     try:
         for piece, reasoning_piece, chunk_usage, finish_reason in (
-            client.chat_stream_with_usage(
+            active_client.chat_stream_with_usage(
                 to_api_messages(
                     history,
                     level,
@@ -881,7 +901,9 @@ def respond(
     # 第二段：本地验算（发现错误时模型复核），结果追加到「本次结果」
     verify_note = ""
     if verify:
-        verify_note = _auto_verify_loop(answer, final_history, username)
+        verify_note = _auto_verify_loop(
+            answer, final_history, username, active_client
+        )
     if verify_note:
         result_text += "\n\n" + verify_note
     yield (
@@ -905,6 +927,7 @@ def continue_last_answer(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    provider_id: str | None,
     request: gr.Request,
 ):
     """「继续生成」按钮：取最近一条题目原文，拼上继续指令后复用完整回复流程。"""
@@ -938,6 +961,7 @@ def continue_last_answer(
         answer_style,
         usage_state,
         stage_state,
+        provider_id,
         request,
         force_continue=True,
     )
@@ -1023,9 +1047,9 @@ def restore_level(request: gr.Request) -> str:
     return level
 
 
-def _recheck_wrong_answer(answer: str) -> str:
+def _recheck_wrong_answer(answer: str, active_client=None) -> str:
     """验算发现不成立时，请模型快速复核并给出修正；失败返回空串。"""
-    complete_fn = getattr(client, "complete", None)
+    complete_fn = getattr(active_client or client, "complete", None)
     if complete_fn is None:
         return ""
     prompt = (
@@ -1044,7 +1068,9 @@ def _recheck_wrong_answer(answer: str) -> str:
     return (text or "").strip()
 
 
-def _auto_verify_loop(answer: str, history: list[dict], username: str) -> str:
+def _auto_verify_loop(
+    answer: str, history: list[dict], username: str, active_client=None
+) -> str:
     """自动验算回答中的公式；发现不成立时请模型复核，返回状态摘要。"""
     if not CALCULATOR_AVAILABLE or not answer:
         return ""
@@ -1063,7 +1089,7 @@ def _auto_verify_loop(answer: str, history: list[dict], username: str) -> str:
         parts.append(f"{other} 条无法自动判定")
     note = "，".join(parts) + "。（验算仅针对公式本身，不代表解题过程正确）"
     if bad:
-        correction = _recheck_wrong_answer(answer)
+        correction = _recheck_wrong_answer(answer, active_client)
         if correction:
             history.append(
                 {"role": "assistant", "content": f"（🔍 自动复核）{correction}"}
@@ -1640,6 +1666,7 @@ def generate_similar(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    provider_id: str | None,
     request: gr.Request,
 ):
     """选中题目生成同类型变式，发进聊天区走正常问答流程。"""
@@ -1675,6 +1702,7 @@ def generate_similar(
         answer_style,
         usage_state,
         stage_state,
+        provider_id,
         request,
     ):
         last = item
@@ -1705,6 +1733,7 @@ def generate_category_quiz(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    provider_id: str | None,
     request: gr.Request,
 ):
     """按大类出题：选中单题优先，否则用大类筛选结果作素材池，进入练习闭环。"""
@@ -1780,6 +1809,7 @@ def generate_category_quiz(
         answer_style,
         usage_state,
         stage_state,
+        provider_id,
         request,
     ):
         last = item
@@ -1856,7 +1886,9 @@ def generate_paper(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    # UNIQUE_PAPER_SIG
     paper_state: dict,
+    provider_id: str | None,
     request: gr.Request,
 ):
     """组卷自测：按大类素材一次生成 N 道变式题，存入试卷状态等待作答。"""
@@ -1950,6 +1982,7 @@ def generate_paper(
         answer_style,
         usage_state,
         stage_state,
+        provider_id,
         request,
         verify=False,
     ):
@@ -1996,6 +2029,7 @@ def grade_paper(
     usage_state: dict,
     stage_state: dict,
     paper_state: dict,
+    provider_id: str | None,
     request: gr.Request,
 ):
     """批改本卷：把输入框里的整套作答交给 AI 统一批改并小结。"""
@@ -2060,6 +2094,7 @@ def grade_paper(
         answer_style,
         usage_state,
         stage_state,
+        provider_id,
         request,
         verify=False,
     ):
@@ -2345,6 +2380,25 @@ def reset_confirm_buttons(
     )
 
 
+def on_provider_change(provider_id: str):
+    """服务商切换时，动态更新模型列表与思考相关控件。"""
+    provider = get_provider(provider_id)
+    if provider is None:
+        return (
+            gr.update(choices=[]),
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
+    models = get_provider_models(provider)
+    supports_thinking = get_provider_supports_thinking(provider)
+    return (
+        gr.update(choices=models, value=provider.get("default_model")),
+        gr.update(visible=supports_thinking),
+        gr.update(visible=supports_thinking),
+    )
+
+
+
 with gr.Blocks(
     title="数学学习 AI 助手",
     theme=gr.themes.Base(
@@ -2373,9 +2427,18 @@ with gr.Blocks(
                 level_radio = gr.Radio(
                     ["小学", "初中", "高中", "大学"], value="高中", label="学段"
                 )
+                provider_radio = gr.Radio(
+                      choices=[(p["name"], p["id"]) for p in ui_providers],
+                      value=(default_provider["id"] if default_provider else None),
+                      label="服务商",
+                  )
                 model_radio = gr.Radio(
-                    ["deepseek-v4-flash", "deepseek-v4-pro"],
-                    value=settings.model if settings else "deepseek-v4-flash",
+                    (default_provider.get("models") if default_provider else ["deepseek-v4-flash", "deepseek-v4-pro"]),
+                    value=(
+                        default_provider.get("default_model")
+                        if default_provider
+                        else (settings.model if settings else "deepseek-v4-flash")
+                    ),
                     label="模型",
                 )
                 effort_radio = gr.Radio(
@@ -2412,6 +2475,9 @@ with gr.Blocks(
             usage_status = gr.Markdown("")
             usage_state = gr.State(value=new_usage_state())
             stage_state = gr.State(value=_new_stage_state())
+            provider_state = gr.State(
+                  value=(default_provider["id"] if default_provider else None)
+              )
             with gr.Accordion("📷 题目图片（上传 / 粘贴后自动识别）", open=True):
                 image_input = gr.Image(
                     label="题目图片（上传/粘贴后自动识别）",
@@ -2636,6 +2702,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+              provider_radio,
         ],
         outputs=[
             chatbot,
@@ -2660,6 +2727,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+              provider_radio,
         ],
         outputs=[
             chatbot,
@@ -2683,6 +2751,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+              provider_radio,
         ],
         outputs=[
             chatbot,
@@ -2728,6 +2797,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+              provider_radio,
         ],
         outputs=[
             chatbot,
@@ -2757,6 +2827,9 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+              # UNIQUE_PAPER_EVENT
+              provider_radio,
+                # UNIQUE_PAPER_AFTER
             paper_state,
         ],
         outputs=[
@@ -2785,6 +2858,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+              provider_radio,
             paper_state,
         ],
         outputs=[
@@ -2845,6 +2919,12 @@ with gr.Blocks(
         inputs=[reset_account_dropdown, reset_pwd_textbox],
         outputs=[reset_pwd_status],
     )
+    provider_radio.change(
+          on_provider_change,
+          inputs=[provider_radio],
+          outputs=[model_radio, thinking_checkbox, effort_radio],
+      )
+
     mode_radio.change(
         toggle_answer_style,
         inputs=[mode_radio],
@@ -3011,6 +3091,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+              provider_radio,
         ],
         outputs=[
             chatbot,
