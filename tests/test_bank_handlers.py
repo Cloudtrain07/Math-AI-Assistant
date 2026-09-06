@@ -231,6 +231,7 @@ def test_generate_similar_no_selection(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
             None,
+            None,
             _fake_request(),
         )
     )
@@ -254,6 +255,7 @@ def test_generate_similar_with_entry(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
+            None,
             None,
             _fake_request(),
         )
@@ -372,15 +374,16 @@ def test_generate_category_quiz_with_selected_entry(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
             None,
+            None,
             _fake_request(),
         )
     )
     last = results[-1]
-    assert last[7]["value"] == "互动模式"
+    assert last[8]["value"] == "互动模式"
     assert last[5]["stage"] == "practice_wait"
     user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
     assert any("按类出题" in u and "求 $x$ 的值" in u for u in user_msgs)
-    assert "自动切换" in last[8]
+    assert "自动切换" in last[9]
 
 
 def test_generate_category_quiz_by_category_pool(monkeypatch, tmp_path):
@@ -403,6 +406,7 @@ def test_generate_category_quiz_by_category_pool(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             None,
             _fake_request(),
         )
@@ -457,19 +461,20 @@ def test_generate_paper(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
+            None,
             {"active": False, "questions": "", "size": 0},
             None,
             _fake_request(),
         )
     )
     last = results[-1]
-    assert last[7]["active"] is True and last[7]["size"] == 7
-    assert last[8]["value"] == "互动模式"
+    assert last[8]["active"] is True and last[8]["size"] == 7
+    assert last[9]["value"] == "互动模式"
     user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
     quiz_msg = next(u for u in user_msgs if "组卷自测" in u)
     assert "7" in quiz_msg and "代数题A" in quiz_msg and "代数题B" in quiz_msg
     assert "几何题" not in quiz_msg
-    assert last[9]
+    assert last[10]
 
 
 def test_generate_paper_empty_pool(monkeypatch, tmp_path):
@@ -489,6 +494,7 @@ def test_generate_paper_empty_pool(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             {"active": False, "questions": "", "size": 0},
             None,
             _fake_request(),
@@ -514,6 +520,7 @@ def test_grade_paper(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             paper,
             None,
             _fake_request(),
@@ -521,7 +528,7 @@ def test_grade_paper(monkeypatch, tmp_path):
     )
     last = results[-1]
     assert "批改完成" in last[2]
-    assert last[7]["active"] is False
+    assert last[8]["active"] is False
     user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
     assert any("批改本卷" in u and "x=2" in u for u in user_msgs)
 
@@ -540,6 +547,7 @@ def test_grade_paper_no_paper_or_answers(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             {"active": False, "questions": "", "size": 0},
             None,
             _fake_request(),
@@ -558,6 +566,7 @@ def test_grade_paper_no_paper_or_answers(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             {"active": True, "questions": "1. x", "size": 1},
             None,
             _fake_request(),
@@ -582,6 +591,7 @@ def test_generate_category_quiz_empty_pool(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             None,
             _fake_request(),
         )
@@ -629,21 +639,22 @@ def test_generate_paper_auto_mixed(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             {"active": False, "questions": "", "size": 0},
             None,
             _fake_request(),
         )
     )
     last = results[-1]
-    assert last[7]["active"] is True and last[7]["size"] == 5
-    assert last[7]["mixed"] is True
+    assert last[8]["active"] is True and last[8]["size"] == 5
+    assert last[8]["mixed"] is True
     user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
     quiz_msg = next(u for u in user_msgs if "组卷自测" in u)
     assert "混合卷" in quiz_msg
     assert "代数" in quiz_msg and "几何" in quiz_msg and "数列" in quiz_msg
     # 参考素材来自多个大类（带大类标签）
     assert "代数题A" in quiz_msg and "几何题B" in quiz_msg and "数列题C" in quiz_msg
-    assert last[9] and "混合卷" in last[9]
+    assert last[10] and "混合卷" in last[10]
 
 
 def test_generate_paper_single_category_still_single(monkeypatch, tmp_path):
@@ -668,14 +679,15 @@ def test_generate_paper_single_category_still_single(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "解答模式"},
+            None,
             {"active": False, "questions": "", "size": 0},
             None,
             _fake_request(),
         )
     )
     last = results[-1]
-    assert last[7]["active"] is True and last[7]["size"] == 7
-    assert last[7]["mixed"] is False
+    assert last[8]["active"] is True and last[8]["size"] == 7
+    assert last[8]["mixed"] is False
     user_msgs = [m["content"] for m in last[0] if m["role"] == "user"]
     quiz_msg = next(u for u in user_msgs if "组卷自测" in u)
     assert "混合卷" not in quiz_msg
@@ -705,6 +717,7 @@ def test_grade_paper_mixed_mentions_categories(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             {"stage": None, "hints": 0, "last_mode": "互动模式"},
+            None,
             paper,
             None,
             _fake_request(),

@@ -63,8 +63,6 @@ from core.prompts import (
     MODE_ANSWER,
     MODE_INTERACTIVE,
     VISION_COMPLETE_PROMPT,
-    VISION_HANDWRITTEN_COMPLETE_PROMPT,
-    VISION_HANDWRITTEN_PROMPT,
     build_system_prompt,
 )
 from core.storage import load_history, save_history
@@ -84,9 +82,9 @@ from core.usage import (
     new_usage_state,
     record_usage,
 )
-from core.vision_client import VisionClient
+from core.vision_client import VisionClient, image_to_data_url
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
@@ -234,6 +232,22 @@ def _new_stage_state() -> dict:
     return {"stage": "initial_hint", "hints": 0, "last_mode": MODE_INTERACTIVE}
 
 
+def _new_image_state() -> dict:
+    """待发图片状态：path 为上传的临时文件路径，fresh 表示本回合刚上传。
+
+    - 上传后首次发送携带图片并把 fresh 置 False；
+    - 同一题目继续讨论时每轮都重新附带原图（模型无跨轮图片记忆）；
+    - 新题开始 / 用户移除图片 / 服务商不支持视觉时清空。
+    """
+    return {"path": None, "fresh": False}
+
+
+# 图片随消息附带的标记：写入历史供界面显示与上下文压缩参考（图片本身不持久化）
+IMAGE_NOTE = "📷（已附题目图片）"
+# 只传图不打字时自动使用的提问语
+_IMAGE_ONLY_PROMPT = "请解答图中的题目。"
+
+
 # 视觉客户端（可选）：未配置 DASHSCOPE_API_KEY 时，上传图片会给出提示
 if settings is not None and settings.vision_api_key:
     vision_client = VisionClient(settings)
@@ -249,9 +263,14 @@ def to_api_messages(
     stage: str | None = None,
     mode_changed: bool = False,
     summary: str | None = None,
-) -> list[dict[str, str]]:
-    """把界面历史转换为 DeepSeek 需要的消息列表，并控制上下文长度。"""
-    messages: list[dict[str, str]] = [
+    image_data_url: str | None = None,
+) -> list[dict]:
+    """把界面历史转换为 API 消息列表，并控制上下文长度。
+
+    image_data_url 非空时，最后一条 user 消息以多模态 content 数组发送
+    （原生视觉直传）；历史本身始终保持纯文本。
+    """
+    messages: list[dict] = [
         {
             "role": "system",
             "content": build_system_prompt(level, mode, answer_style, stage),
@@ -279,18 +298,48 @@ def to_api_messages(
             "assistant",
         ):
             messages.append({"role": item["role"], "content": item["content"]})
+    if image_data_url and messages[-1]["role"] == "user":
+        text_content = messages[-1]["content"]
+        messages[-1] = {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+                {"type": "text", "text": text_content},
+            ],
+        }
     return messages
 
 
+def _usage_part(usage, attr: str) -> int | None:
+    """安全读取 API usage 对象的细分字段；缺失时返回 None（不累计）。"""
+    if usage is None:
+        return None
+    value = getattr(usage, attr, None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def format_usage(usage) -> str:
-    """把 API 返回的 token 用量格式化为一行提示。"""
+    """把 API 返回的 token 用量格式化为一行提示（含输入/输出拆分）。"""
     if usage is None:
         return ""
     total = int(getattr(usage, "total_tokens", 0) or 0)
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
     reasoning = 0
     details = getattr(usage, "completion_tokens_details", None)
     if details is not None:
         reasoning = int(getattr(details, "reasoning_tokens", 0) or 0)
+    reasoning_part = f"，其中思考链约 {reasoning}" if reasoning else ""
+    if prompt is not None and completion is not None:
+        return (
+            f"⚡ 本次 输入 {int(prompt):,} + 输出 {int(completion):,}"
+            f" ≈ 共 {total:,} tokens{reasoning_part}"
+        )
     if reasoning:
         return f"⚡ 本次约 {total} tokens（其中思考链约 {reasoning}）"
     return f"⚡ 本次约 {total} tokens"
@@ -550,60 +599,50 @@ def advance_stage(
     }
 
 
-def recognize_image(image: str | None, handwritten: bool = False):
-    """上传/粘贴图片后自动识别：填入输入框并清空图片区，避免重复识别。"""
+def on_image_upload(image: str | None, provider_id: str | None):
+    """上传/粘贴题目图片：统一进入待发状态，发送时按服务商能力直附或转写。
+
+    outputs：[textbox, result_status, image_input, image_state]
+    """
     if not image:
-        yield "", "", gr.skip()
+        yield gr.skip(), "", gr.skip(), _new_image_state()
         return
-    if vision_client is None:
-        yield (
-            "",
-            "⚠️ 未配置视觉 Key：请在 .env 中填写 DASHSCOPE_API_KEY（参考 .env.example）",
-            gr.skip(),
-        )
-        return
-    yield "", "🔍 正在识别题目图片…", gr.skip()
-    try:
-        recognized, truncated = vision_client.transcribe_image(
-            image, prompt=VISION_HANDWRITTEN_PROMPT if handwritten else None
-        )
-    except Exception as exc:
-        yield "", f"❌ 图片识别失败：{exc}", gr.skip()
-        return
+    _log_event("图片就绪", str(image))
+    yield (
+        gr.skip(),
+        "🖼️ 图片已就绪：输入你的问题后点击发送。"
+        "看图服务商（智谱/千问）直接看图；文本服务商（DeepSeek 等）发送时自动转写。"
+        "也可以不打字直接发送。同一题继续讨论会自动携带，换新题或点 × 移除后停止。",
+        image,
+        {"path": image, "fresh": True},
+    )
+
+
+def _transcribe_pending_image(image_path: str) -> str:
+    """发送时转写待发图片（文本服务商路径）；失败抛异常由调用方提示。
+
+    含"识别不完整"的自动补全重试；成功返回转写文本。
+    """
+    recognized, _truncated = vision_client.transcribe_image(image_path)
     if not recognized:
-        recognized = "（未能识别出题目内容，请手动输入）"
+        recognized = "（未能识别出图片中的题目内容）"
     # 自动补全重试：识别不完整时用补全提示词再问一次
     if _recognition_incomplete(recognized):
-        yield recognized, "🔍 识别可能不完整，正在尝试补全…", gr.skip()
         try:
-            completed, truncated2 = vision_client.transcribe_image(
-                image,
-                prompt=(
-                    VISION_HANDWRITTEN_COMPLETE_PROMPT.format(partial=recognized)
-                    if handwritten
-                    else VISION_COMPLETE_PROMPT.format(partial=recognized)
-                ),
+            completed, _ = vision_client.transcribe_image(
+                image_path,
+                prompt=VISION_COMPLETE_PROMPT.format(partial=recognized),
             )
         except Exception:
             completed = ""
-            truncated2 = False
         if (
             completed
             and completed.strip().upper() != "ERROR"
             and not _recognition_incomplete(completed)
         ):
             recognized = completed
-            truncated = truncated or truncated2
-    if _recognition_incomplete(recognized):
-        status_text = "⚠️ 识别结果可能不完整（公式未闭合），请核对题目后再发送或重拍。"
-    elif truncated:
-        status_text = "⚠️ 识别结果可能不完整（题目较长被截断），请核对题目后再发送。"
-    else:
-        status_text = (
-            f"✅ 已识别题目（共 {len(recognized)} 字），请在输入框确认或修改后点击发送。"
-        )
     _log_event("识别", recognized)
-    yield recognized, status_text, None
+    return recognized
 
 
 def respond(
@@ -617,14 +656,18 @@ def respond(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    image_state: dict | None,
     provider_id: str | None,
     request: gr.Request,
     verify: bool = True,
     force_continue: bool = False,
+    attach_image: bool = True,
 ):
-    """纯文本聊天：流式回复，累计会话用量，并按互动模式阶段引导。
+    """聊天主流程：流式回复，累计会话用量，并按互动模式阶段引导。
 
-    思考链仅当轮展示（reasoning_md 输出），不写入历史、不回传 API。
+    发送时按所选服务商能力路由图片：支持原生视觉则直接附图；
+    文本服务商自动转写为文字再发送。attach_image=False 供习题库等
+    内部消息使用（不携带待发图片）。思考链仅当轮展示。
     """
     history = list(history or [])
     stage_state = dict(stage_state or _new_stage_state())
@@ -641,17 +684,25 @@ def respond(
         "practice_grade",
     ):
         stage_state["stage"] = "initial_hint"
+    image_state = dict(image_state or _new_image_state())
+    image_state.setdefault("path", None)
+    image_state.setdefault("fresh", False)
+    has_pending_image = bool(image_state.get("path")) and not force_continue
     if not message.strip():
-        yield (
-            history,
-            "",
-            "💡 请先输入问题，或上传题目图片等待自动识别。",
-            "",
-            usage_state,
-            stage_state,
-            "",
-        )
-        return
+        if not has_pending_image:
+            yield (
+                history,
+                "",
+                "💡 请先输入问题，或上传题目图片后直接发送。",
+                "",
+                usage_state,
+                stage_state,
+                "",
+                image_state,
+            )
+            return
+        # 只传图不打字：自动按看图解题发送
+        message = _IMAGE_ONLY_PROMPT
 
     username = request.username if request and request.username else "unknown"
     ip = (request.client.host if request and request.client else None) or "unknown"
@@ -667,6 +718,7 @@ def respond(
             usage_state,
             stage_state,
             "",
+            image_state,
         )
         return
 
@@ -683,7 +735,16 @@ def respond(
             f"本账号={daily_used}",
             f"全局={global_used}",
         )
-        yield history, "", quota_msg, "", usage_state, stage_state, ""
+        yield (
+            history,
+            "",
+            quota_msg,
+            "",
+            usage_state,
+            stage_state,
+            "",
+            image_state,
+        )
         return
 
     # 根据用户新消息推进互动模式阶段（解答模式无阶段）
@@ -717,8 +778,90 @@ def respond(
             usage_state,
             new_stage,
             "",
+            image_state,
         )
         return
+
+    # —— 图片路由：发送时按所选服务商能力决定直附原图或转写成文字 ——
+    image_path = image_state.get("path")
+    fresh_image = bool(image_state.get("fresh"))
+    new_image_state = dict(image_state)
+    image_data_url = None
+    image_status = ""
+    if image_path and not force_continue and attach_image:
+        prev_stage = (stage_state or {}).get("stage")
+        stale_image = (
+            # 互动模式：上一题已进入小结/解答/批改阶段，且消息像一道新题
+            (
+                prev_stage in ("summary", "full_solution", "grading")
+                and _looks_like_new_problem(message)
+            )
+            # 解答模式无阶段信号，仅靠消息内容判断
+            or (prev_stage is None and _looks_like_new_problem(message))
+        )
+        if stale_image and not fresh_image:
+            # 新题开始：上一题的图片作废
+            new_image_state = _new_image_state()
+        elif getattr(active_client, "supports_vision", False):
+            try:
+                image_data_url = image_to_data_url(image_path)
+            except Exception as exc:
+                image_status = f"⚠️ 图片读取失败（{exc}），已按纯文本发送。"
+                new_image_state = _new_image_state()
+            else:
+                # 图片随本题每轮重附（模型无跨轮图片记忆）；fresh 仅在首次发送后清除
+                new_image_state = {"path": image_path, "fresh": False}
+                history[-1] = {
+                    "role": "user",
+                    "content": f"{user_content}\n{IMAGE_NOTE}",
+                }
+        else:
+            # 文本服务商：发送时自动转写，转写文字随问题一起进历史（持久记录）
+            if vision_client is None:
+                yield (
+                    history,
+                    "",
+                    "⚠️ 当前服务商不支持看图，且未配置转写视觉 Key："
+                    "请在 .env 填写 DASHSCOPE_API_KEY 后重启，"
+                    "或切换到智谱 / 千问等看图服务商。",
+                    "",
+                    usage_state,
+                    new_stage,
+                    "",
+                    dict(image_state),
+                )
+                return
+            yield (
+                history,
+                "",
+                "🔍 正在转写图片…",
+                "",
+                usage_state,
+                new_stage,
+                "",
+                dict(image_state),
+            )
+            try:
+                recognized = _transcribe_pending_image(image_path)
+            except Exception as exc:
+                yield (
+                    history,
+                    "",
+                    f"❌ 图片转写失败：{exc}\n\n"
+                    "图片已保留：可直接重发；或改用看图服务商（智谱 / 千问）直接看图。",
+                    "",
+                    usage_state,
+                    new_stage,
+                    "",
+                    dict(image_state),
+                )
+                return
+            history[-1] = {
+                "role": "user",
+                "content": f"{recognized}\n\n{user_content}",
+            }
+            new_image_state = _new_image_state()
+
     # 长会话自动压缩：把掉出窗口的早期消息合并成摘要，作为系统消息注入
     summary = ""
     if settings is not None and len(history) > settings.max_history_messages:
@@ -742,6 +885,7 @@ def respond(
                     stage=new_stage["stage"],
                     mode_changed=new_stage["mode_changed"],
                     summary=summary,
+                    image_data_url=image_data_url,
                 ),
                 thinking=thinking,
                 reasoning_effort=reasoning_effort,
@@ -776,6 +920,7 @@ def respond(
                     usage_state,
                     new_stage,
                     normalize_math_text(reasoning_text, auto_close=True),
+                    new_image_state,
                 )
             else:
                 display = normalize_math_text(answer)
@@ -787,6 +932,7 @@ def respond(
                     usage_state,
                     new_stage,
                     normalize_math_text(reasoning_text, auto_close=True),
+                    new_image_state,
                 )
     except Exception as exc:
         turn_total = None
@@ -797,7 +943,12 @@ def respond(
         _log_error(
             exc, account=username, turn_total=turn_total, partial=bool(answer)
         )
-        usage_state = record_usage(usage_state, turn_total)
+        usage_state = record_usage(
+            usage_state,
+            turn_total,
+            prompt_tokens=_usage_part(usage, "prompt_tokens"),
+            completion_tokens=_usage_part(usage, "completion_tokens"),
+        )
         if turn_total is not None:
             daily_used = add_daily_usage(today, username, turn_total)
             log_access_event(
@@ -827,11 +978,17 @@ def respond(
             usage_state,
             new_stage,
             normalize_math_text(reasoning_text, auto_close=True),
+            new_image_state,
         )
         return
 
     if not answer:
-        usage_state = record_usage(usage_state, None)
+        usage_state = record_usage(
+            usage_state,
+            None,
+            prompt_tokens=_usage_part(usage, "prompt_tokens"),
+            completion_tokens=_usage_part(usage, "completion_tokens"),
+        )
         turn_total = (
             int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None
         )
@@ -857,6 +1014,7 @@ def respond(
             usage_state,
             new_stage,
             normalize_math_text(reasoning_text, auto_close=True),
+            new_image_state,
         )
         return
 
@@ -867,7 +1025,12 @@ def respond(
     turn_total = (
         int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None
     )
-    usage_state = record_usage(usage_state, turn_total)
+    usage_state = record_usage(
+        usage_state,
+        turn_total,
+        prompt_tokens=_usage_part(usage, "prompt_tokens"),
+        completion_tokens=_usage_part(usage, "completion_tokens"),
+    )
     if turn_total is not None:
         daily_used = add_daily_usage(today, username, turn_total)
         global_used = get_daily_total(today)
@@ -880,6 +1043,8 @@ def respond(
         )
     _log_event("回复", answer)
     result_text = format_usage(usage)
+    if image_status:
+        result_text = f"{image_status}\n\n{result_text}" if result_text else image_status
     if truncated:
         result_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
     usage_text = format_cumulative(usage_state)
@@ -897,6 +1062,7 @@ def respond(
         usage_state,
         new_stage,
         reasoning_display,
+        new_image_state,
     )
     # 第二段：本地验算（发现错误时模型复核），结果追加到「本次结果」
     verify_note = ""
@@ -914,6 +1080,7 @@ def respond(
         usage_state,
         new_stage,
         reasoning_display,
+        new_image_state,
     )
 
 
@@ -927,16 +1094,19 @@ def continue_last_answer(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    image_state: dict | None,
     provider_id: str | None,
     request: gr.Request,
 ):
     """「继续生成」按钮：取最近一条题目原文，拼上继续指令后复用完整回复流程。"""
     history = list(history or [])
+    image_state = dict(image_state or _new_image_state())
     last_user = ""
     for item in reversed(history):
         content = item.get("content")
         if item.get("role") == "user" and isinstance(content, str) and content.strip():
-            last_user = content
+            # 去掉附图标记，避免「继续」消息里重复出现
+            last_user = content.replace(f"\n{IMAGE_NOTE}", "").replace(IMAGE_NOTE, "")
             break
     if not last_user:
         yield (
@@ -947,6 +1117,7 @@ def continue_last_answer(
             usage_state,
             stage_state,
             gr.skip(),
+            image_state,
         )
         return
     message = f"{last_user}\n（请继续完成上一条回答）"
@@ -961,6 +1132,7 @@ def continue_last_answer(
         answer_style,
         usage_state,
         stage_state,
+        image_state,
         provider_id,
         request,
         force_continue=True,
@@ -980,6 +1152,7 @@ def clear_conversation(request: gr.Request):
         new_usage_state(),
         _new_stage_state(),
         "（本轮无思考过程）",
+        _new_image_state(),
     )
 
 
@@ -1666,6 +1839,7 @@ def generate_similar(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    image_state: dict | None,
     provider_id: str | None,
     request: gr.Request,
 ):
@@ -1702,13 +1876,15 @@ def generate_similar(
         answer_style,
         usage_state,
         stage_state,
+        image_state,
         provider_id,
         request,
+        attach_image=False,
     ):
         last = item
         yield item
     if last is not None:
-        h, t, s, usage_text, u, st, r = last
+        h, t, s, usage_text, u, st, r, img = last
         yield (
             h,
             t,
@@ -1717,6 +1893,7 @@ def generate_similar(
             u,
             st,
             r,
+            img,
         )
 
 
@@ -1733,6 +1910,7 @@ def generate_category_quiz(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    image_state: dict | None,
     provider_id: str | None,
     request: gr.Request,
 ):
@@ -1809,17 +1987,19 @@ def generate_category_quiz(
         answer_style,
         usage_state,
         stage_state,
+        image_state,
         provider_id,
         request,
+        attach_image=False,
     ):
         last = item
         yield (*item, mode_update, "")
     if last is not None:
-        h, t, s, usage_text, u, st, r = last
+        h, t, s, usage_text, u, st, r, img = last
         note = f"📚 已从 {len(refs_parts)} 道{source_desc}中选材出题，作答后我会批改。"
         if mode_switched:
             note += "\n（已自动切换到互动模式进行练习）"
-        yield (h, t, s, usage_text, u, st, r, mode_update, note)
+        yield (h, t, s, usage_text, u, st, r, img, mode_update, note)
 
 
 def _new_paper_state() -> dict:
@@ -1886,6 +2066,7 @@ def generate_paper(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    image_state: dict | None,
     # UNIQUE_PAPER_SIG
     paper_state: dict,
     provider_id: str | None,
@@ -1982,14 +2163,16 @@ def generate_paper(
         answer_style,
         usage_state,
         stage_state,
+        image_state,
         provider_id,
         request,
         verify=False,
+        attach_image=False,
     ):
         last = item
         yield (*item, gr.update(), mode_update, "")
     if last is not None:
-        h, t, s, usage_text, u, st, r = last
+        h, t, s, usage_text, u, st, r, img = last
         questions_text = ""
         for m in reversed(h or []):
             if m.get("role") == "assistant" and m.get("content"):
@@ -2014,7 +2197,7 @@ def generate_paper(
             )
         if mode_switched:
             note += "\n（已自动切换到互动模式）"
-        yield (h, t, s, usage_text, u, st, r, new_paper, mode_update, note)
+        yield (h, t, s, usage_text, u, st, r, img, new_paper, mode_update, note)
 
 
 def grade_paper(
@@ -2028,6 +2211,7 @@ def grade_paper(
     answer_style: str | None,
     usage_state: dict,
     stage_state: dict,
+    image_state: dict | None,
     paper_state: dict,
     provider_id: str | None,
     request: gr.Request,
@@ -2094,14 +2278,16 @@ def grade_paper(
         answer_style,
         usage_state,
         stage_state,
+        image_state,
         provider_id,
         request,
         verify=False,
+        attach_image=False,
     ):
         last = item
         yield (*item, gr.update(), gr.update(), "")
     if last is not None:
-        h, t, s, usage_text, u, st, r = last
+        h, t, s, usage_text, u, st, r, img = last
         yield (
             h,
             t,
@@ -2110,6 +2296,7 @@ def grade_paper(
             u,
             st,
             r,
+            img,
             _new_paper_state(),
             gr.update(),
             "",
@@ -2278,6 +2465,7 @@ def confirm_clear(
             gr.update(value="⚠️ 再点一次确认清空"),
             "armed",
             _new_paper_state(),
+            gr.update(),
         )
     (
         new_history,
@@ -2287,6 +2475,7 @@ def confirm_clear(
         new_usage,
         new_stage,
         _reasoning,
+        new_image_state,
     ) = clear_conversation(request)
     return (
         new_history,
@@ -2299,6 +2488,7 @@ def confirm_clear(
         gr.update(value="🗑️ 新对话"),
         "",
         _new_paper_state(),
+        new_image_state,
     )
 
 
@@ -2398,6 +2588,11 @@ def on_provider_change(provider_id: str):
     )
 
 
+def clear_image_state():
+    """用户点击图片组件的 × 移除图片：清空待发图片状态。"""
+    return _new_image_state()
+
+
 
 with gr.Blocks(
     title="数学学习 AI 助手",
@@ -2475,19 +2670,16 @@ with gr.Blocks(
             usage_status = gr.Markdown("")
             usage_state = gr.State(value=new_usage_state())
             stage_state = gr.State(value=_new_stage_state())
+            image_state = gr.State(value=_new_image_state())
             provider_state = gr.State(
                   value=(default_provider["id"] if default_provider else None)
               )
-            with gr.Accordion("📷 题目图片（上传 / 粘贴后自动识别）", open=True):
+            with gr.Accordion("📷 题目图片（上传 / 粘贴后直接发送）", open=True):
                 image_input = gr.Image(
-                    label="题目图片（上传/粘贴后自动识别）",
+                    label="看图模型直接看图；文本模型发送时自动转写",
                     sources=["upload", "clipboard"],
                     type="filepath",
                 )
-                handwritten_checkbox = gr.Checkbox(
-                    label="✍️ 手写公式模式（只识别手写公式/题目，输出 LaTeX）",
-                    value=False,
-                  )
             with gr.Accordion("思考过程（仅当轮，不会写入历史）", open=False):
                 reasoning_md = gr.Markdown(
                     "（本轮暂无思考过程）",
@@ -2684,9 +2876,14 @@ with gr.Blocks(
 
     # ===== 学习 Tab 事件 =====
     image_input.upload(
-        recognize_image,
-        inputs=[image_input, handwritten_checkbox],
-        outputs=[textbox, result_status, image_input],
+        on_image_upload,
+        inputs=[image_input, provider_radio],
+        outputs=[textbox, result_status, image_input, image_state],
+    )
+    image_input.clear(
+        clear_image_state,
+        inputs=None,
+        outputs=[image_state],
     )
 
     send_event = send_btn.click(
@@ -2702,6 +2899,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+            image_state,
               provider_radio,
         ],
         outputs=[
@@ -2712,6 +2910,7 @@ with gr.Blocks(
             usage_state,
             stage_state,
             reasoning_md,
+            image_state,
         ],
     )
     submit_event = textbox.submit(
@@ -2727,6 +2926,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+            image_state,
               provider_radio,
         ],
         outputs=[
@@ -2737,6 +2937,7 @@ with gr.Blocks(
             usage_state,
             stage_state,
             reasoning_md,
+            image_state,
         ],
     )
     continue_event = continue_btn.click(
@@ -2751,6 +2952,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+            image_state,
               provider_radio,
         ],
         outputs=[
@@ -2761,6 +2963,7 @@ with gr.Blocks(
             usage_state,
             stage_state,
             reasoning_md,
+            image_state,
         ],
     )
     collect_event = collect_btn.click(
@@ -2797,6 +3000,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+            image_state,
               provider_radio,
         ],
         outputs=[
@@ -2807,6 +3011,7 @@ with gr.Blocks(
             usage_state,
             stage_state,
             reasoning_md,
+            image_state,
             mode_radio,
             bank_status,
         ],
@@ -2827,6 +3032,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+            image_state,
               # UNIQUE_PAPER_EVENT
               provider_radio,
                 # UNIQUE_PAPER_AFTER
@@ -2840,6 +3046,7 @@ with gr.Blocks(
             usage_state,
             stage_state,
             reasoning_md,
+            image_state,
             paper_state,
             mode_radio,
             bank_status,
@@ -2858,6 +3065,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+            image_state,
               provider_radio,
             paper_state,
         ],
@@ -2869,6 +3077,7 @@ with gr.Blocks(
             usage_state,
             stage_state,
             reasoning_md,
+            image_state,
             paper_state,
             mode_radio,
             bank_status,
@@ -2911,6 +3120,7 @@ with gr.Blocks(
             clear_btn,
             clear_confirm_state,
             paper_state,
+            image_state,
         ],
     )
     refresh_btn.click(render_usage_panel, inputs=[], outputs=[usage_panel])
@@ -3091,6 +3301,7 @@ with gr.Blocks(
             answer_style_radio,
             usage_state,
             stage_state,
+            image_state,
               provider_radio,
         ],
         outputs=[
@@ -3101,6 +3312,7 @@ with gr.Blocks(
             usage_state,
             stage_state,
             reasoning_md,
+            image_state,
         ],
     )
     category_add_btn.click(

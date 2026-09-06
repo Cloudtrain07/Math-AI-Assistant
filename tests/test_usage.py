@@ -25,27 +25,50 @@ from core.usage import (
 
 
 def test_new_state_zero():
-    assert new_usage_state() == {"total_tokens": 0, "turns": 0}
+    assert new_usage_state() == {
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "turns": 0,
+    }
 
 
 def test_record_accumulates():
     state = new_usage_state()
     state = record_usage(state, 100)
     state = record_usage(state, 250)
-    assert state == {"total_tokens": 350, "turns": 2}
+    assert state["total_tokens"] == 350
+    assert state["turns"] == 2
 
 
 def test_record_none_only_counts_turn():
     state = new_usage_state()
     state = record_usage(state, None)
-    assert state == {"total_tokens": 0, "turns": 1}
+    assert state["total_tokens"] == 0
+    assert state["turns"] == 1
 
 
 def test_record_does_not_mutate_input():
     state = new_usage_state()
     returned = record_usage(state, 100)
-    assert state == {"total_tokens": 0, "turns": 0}
-    assert returned == {"total_tokens": 100, "turns": 1}
+    assert state["total_tokens"] == 0 and state["turns"] == 0
+    assert returned["total_tokens"] == 100 and returned["turns"] == 1
+
+
+def test_record_prompt_completion_split():
+    state = new_usage_state()
+    state = record_usage(state, 500, prompt_tokens=400, completion_tokens=100)
+    state = record_usage(state, 300, prompt_tokens=200, completion_tokens=100)
+    assert state == {
+        "total_tokens": 800,
+        "prompt_tokens": 600,
+        "completion_tokens": 200,
+        "turns": 2,
+    }
+    # 缺细分的轮次只累计总数
+    state = record_usage(state, 50)
+    assert state["total_tokens"] == 850
+    assert state["prompt_tokens"] == 600
 
 
 def test_format_cumulative():
@@ -53,6 +76,22 @@ def test_format_cumulative():
     text = format_cumulative(state)
     assert "累计 579 tokens" in text
     assert "2 轮" in text
+
+
+def test_format_cumulative_with_split():
+    state = record_usage(
+        new_usage_state(), 500, prompt_tokens=400, completion_tokens=100
+    )
+    text = format_cumulative(state)
+    assert "输入 400 + 输出 100" in text
+    assert "1 轮" in text
+
+
+def test_format_cumulative_fallback_without_split():
+    state = {"total_tokens": 579, "turns": 2}
+    text = format_cumulative(state)
+    assert "累计 579 tokens" in text
+    assert "输入" not in text
 
 
 def test_daily_usage_accumulates(tmp_path):

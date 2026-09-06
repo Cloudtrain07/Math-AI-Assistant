@@ -53,6 +53,11 @@ class LLMClient:
     def model(self) -> str:
         return self._model
 
+    @property
+    def supports_vision(self) -> bool:
+        """该服务商主模型是否原生支持图片输入。"""
+        return bool(self._provider.get("supports_vision", False))
+
     def _build_extra_params(
         self, thinking: bool | None, reasoning_effort: str | None
     ) -> dict:
@@ -76,7 +81,7 @@ class LLMClient:
 
     def _chat_stream_with_usage(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict],
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         model: str | None = None,
@@ -126,7 +131,7 @@ class LLMClient:
 
     def chat_stream_with_usage(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict],
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         model: str | None = None,
@@ -138,7 +143,7 @@ class LLMClient:
 
     def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict],
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         max_tokens: int = 500,

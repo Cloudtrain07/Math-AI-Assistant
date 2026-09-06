@@ -19,3 +19,7 @@ cloudflared.exe
 # IDE
 .idea/
 .vscode/
+
+# 编辑工具自动备份与 pytest 临时目录
+*.bak_*
+.pytest_tmp*/

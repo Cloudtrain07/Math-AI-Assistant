@@ -99,10 +99,11 @@ def test_respond_success_path(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             _stage0(),
             None,
+            None,
             _fake_request(),
         )
     )
-    final_history, _, status_text, usage_text, usage_state, stage_state, _ = results[-1]
+    final_history, _, status_text, usage_text, usage_state, stage_state, _, _ = results[-1]
 
     assert final_history[-1]["content"] == "你好世界"
     assert usage_state == {"total_tokens": 123, "turns": 1}
@@ -143,10 +144,11 @@ def test_respond_quota_rejected(monkeypatch, tmp_path):
             state0,
             _stage0(),
             None,
+            None,
             _fake_request(),
         )
     )
-    final_history, _, status_text, _, usage_state, stage_state, _ = results[-1]
+    final_history, _, status_text, _, usage_state, stage_state, _, _ = results[-1]
 
     assert "额度已用尽" in status_text
     assert final_history == []
@@ -177,10 +179,11 @@ def test_respond_overlong_message_rejected(monkeypatch):
             state0,
             _stage0(),
             None,
+            None,
             _fake_request(),
         )
     )
-    final_history, _, status_text, _, usage_state, stage_state, _ = results[-1]
+    final_history, _, status_text, _, usage_state, stage_state, _, _ = results[-1]
 
     assert "过长" in status_text
     assert final_history == []
@@ -212,10 +215,11 @@ def test_respond_escape_keyword_full_solution(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             _stage0(),
             None,
+            None,
             _fake_request(),
         )
     )
-    final_history, _, _, _, _, stage_state, _ = results[-1]
+    final_history, _, _, _, _, stage_state, _, _ = results[-1]
     assert stage_state["stage"] == "full_solution"
     assert final_history[-1]["content"] == "你好世界"
 
@@ -243,10 +247,11 @@ def test_respond_practice_keyword_practice_wait(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             _stage0(),
             None,
+            None,
             _fake_request(),
         )
     )
-    _, _, _, _, _, stage_state, _ = results[-1]
+    _, _, _, _, _, stage_state, _, _ = results[-1]
     assert stage_state["stage"] == "practice_wait"
 
 
@@ -273,10 +278,11 @@ def test_respond_answer_mode_stage_none(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             _stage0(),
             None,
+            None,
             _fake_request(),
         )
     )
-    _, _, _, _, _, stage_state, _ = results[-1]
+    _, _, _, _, _, stage_state, _, _ = results[-1]
     assert stage_state["stage"] is None
     assert stage_state["last_mode"] == "解答模式"
 
@@ -309,10 +315,11 @@ def test_respond_new_problem_resets_stage(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             stage_state,
             None,
+            None,
             _fake_request(),
         )
     )
-    _, _, _, _, _, new_stage, _ = results[-1]
+    _, _, _, _, _, new_stage, _, _ = results[-1]
     assert new_stage["stage"] == "initial_hint"
     assert new_stage["hints"] == 0
 
@@ -339,6 +346,7 @@ def test_respond_reasoning_panel_and_status(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             None,
             _fake_request(),
         )
@@ -384,10 +392,11 @@ def test_continue_last_answer(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             _stage0(),
             None,
+            None,
             _fake_request(),
         )
     )
-    final_history, _, _, _, _, _, _ = results[-1]
+    final_history, _, _, _, _, _, _, _ = results[-1]
     last_user = next(
         m["content"] for m in reversed(final_history) if m["role"] == "user"
     )
@@ -423,6 +432,7 @@ def test_continue_last_answer_keeps_stage(monkeypatch, tmp_path):
             {"total_tokens": 0, "turns": 0},
             {"stage": "practice_wait", "hints": 0, "last_mode": "互动模式"},
             None,
+            None,
             _fake_request(),
         )
     )
@@ -441,6 +451,7 @@ def test_continue_last_answer_no_history():
             None,
             {"total_tokens": 0, "turns": 0},
             _stage0(),
+            None,
             None,
             _fake_request(),
         )

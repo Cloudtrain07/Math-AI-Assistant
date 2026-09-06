@@ -19,27 +19,47 @@ _RESERVED_KEYS = (_TOTAL_KEY, _LOGINS_KEY, _QUESTIONS_KEY)
 
 
 def new_usage_state() -> dict:
-    """新建会话累计状态：累计 token 数与完成轮数。"""
-    return {"total_tokens": 0, "turns": 0}
+    """新建会话累计状态：累计 token 数（含输入/输出细分）与完成轮数。"""
+    return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
 
 
-def record_usage(state: dict, turn_total: int | None) -> dict:
+def record_usage(
+    state: dict,
+    turn_total: int | None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+) -> dict:
     """记录一轮回复的用量，返回新状态（不修改入参）。
 
-    turn_total 为 None 时（如请求失败/无用量信息）只累计轮数，不累计 token。
+    turn_total 为 None 时（如请求失败/无用量信息）只累计轮数，不累计 token；
+    prompt/completion 缺失时（如按字符估算的兜底路径）只累计总数。
     """
     result = dict(state)
     result["turns"] = result.get("turns", 0) + 1
     if turn_total is not None:
         result["total_tokens"] = result.get("total_tokens", 0) + int(turn_total)
+    if prompt_tokens is not None:
+        result["prompt_tokens"] = result.get("prompt_tokens", 0) + int(prompt_tokens)
+    if completion_tokens is not None:
+        result["completion_tokens"] = result.get("completion_tokens", 0) + int(
+            completion_tokens
+        )
     return result
 
 
 def format_cumulative(state: dict) -> str:
-    """生成状态栏提示：本会话累计 X tokens（共 N 轮）。"""
+    """生成状态栏提示：本会话累计 X tokens（共 N 轮），有细分时显示输入/输出拆分。"""
     total = int(state.get("total_tokens", 0) or 0)
     turns = int(state.get("turns", 0) or 0)
-    return f"📊 本会话累计 {total} tokens（共 {turns} 轮）"
+    prompt = state.get("prompt_tokens")
+    completion = state.get("completion_tokens")
+    # 细分从未记录过（旧状态或全部走了估算兜底）时不显示拆分，避免"输入 0 + 输出 0"误导
+    if not prompt and not completion:
+        return f"📊 本会话累计 {total} tokens（共 {turns} 轮）"
+    return (
+        f"📊 本会话累计 {total} tokens"
+        f"（输入 {int(prompt):,} + 输出 {int(completion):,}，共 {turns} 轮）"
+    )
 
 
 def _read_daily(path: Path) -> dict:

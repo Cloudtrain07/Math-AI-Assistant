@@ -79,6 +79,8 @@ def test_auto_verify_detects_wrong_and_rechecks(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage(),
+            None,
+            None,
             _fake_request(),
         )
     )
@@ -109,6 +111,8 @@ def test_auto_verify_correct_answer_no_recheck(monkeypatch, tmp_path):
             None,
             {"total_tokens": 0, "turns": 0},
             _stage(),
+            None,
+            None,
             _fake_request(),
         )
     )

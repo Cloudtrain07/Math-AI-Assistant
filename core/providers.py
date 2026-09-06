@@ -35,6 +35,7 @@ DEFAULT_PROVIDERS: list[dict] = [
         "models": ["gpt-4o", "gpt-4o-mini"],
         "default_model": "gpt-4o-mini",
         "thinking_param": "openai",
+        "supports_vision": True,
     },
 ]
 
@@ -47,6 +48,7 @@ _ALLOWED_FIELDS = {
     "models",
     "default_model",
     "thinking_param",
+    "supports_vision",
 }
 
 
@@ -75,6 +77,7 @@ def _sanitize_provider(item: object) -> dict | None:
         "models": models,
         "default_model": default_model,
         "thinking_param": str(provider.get("thinking_param") or "deepseek").strip(),
+        "supports_vision": bool(provider.get("supports_vision", False)),
     }
 
 
@@ -144,3 +147,8 @@ def get_provider_models(provider: dict) -> list[str]:
 
 def get_provider_supports_thinking(provider: dict) -> bool:
     return str(provider.get("thinking_param") or "none").lower() != "none"
+
+
+def get_provider_supports_vision(provider: dict) -> bool:
+    """该服务商的主模型是否原生支持图片输入（可直接看图，无需先转写）。"""
+    return bool(provider.get("supports_vision", False))
