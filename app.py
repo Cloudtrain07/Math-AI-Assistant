@@ -83,6 +83,7 @@ from core.usage import (
     record_usage,
 )
 from core.vision_client import VisionClient, image_to_data_url
+from core import dialogue_state
 
 APP_VERSION = "1.3.1"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
@@ -182,54 +183,6 @@ GLOBAL_DAILY_LIMIT = (
 MAX_MESSAGE_LEN = settings.max_message_len if settings else 2000
 
 _log_lock = threading.Lock()
-
-# 互动模式阶段关键词（启发式，用户可用「给答案」等口令纠正）
-ESCAPE_KEYWORDS = (
-    "给答案",
-    "直接讲",
-    "没时间",
-    "别问了",
-    "直接解",
-    "说答案",
-    "给我答案",
-    "直接给答案",
-    "讲一下",
-    "讲讲",
-)
-PRACTICE_KEYWORDS = (
-    "出题",
-    "练练",
-    "再来一道",
-    "巩固",
-    "出道题",
-    "练习题",
-    "再来一题",
-    "换个题",
-)
-GRADING_KEYWORDS = (
-    "我的做法",
-    "我的过程",
-    "我的解答",
-    "我的思路",
-    "我这样写",
-    "我这样算",
-    "我算得",
-    "我解出来",
-    "我算出来",
-    "帮我看看",
-    "帮我看",
-    "检查一下",
-    "请批改",
-    "帮我批改",
-    "改一下",
-    "对吗",
-    "对不对",
-)
-
-
-def _new_stage_state() -> dict:
-    """互动模式的初始阶段状态。"""
-    return {"stage": "initial_hint", "hints": 0, "last_mode": MODE_INTERACTIVE}
 
 
 def _new_image_state() -> dict:
@@ -458,147 +411,6 @@ def _recognition_incomplete(text: str) -> bool:
     return stripped.count("$") % 2 == 1
 
 
-def _looks_like_new_problem(text: str) -> bool:
-    """粗略判断用户消息是否是一道新题（含数学定界符/运算符，或较长的问句）。"""
-    t = (text or "").strip()
-    if len(t) >= 15 and (
-        t.endswith(("？", "?"))
-        or any(k in t for k in ("求", "解", "证明", "已知", "设", "怎么", "如何", "为什么", "计算"))
-    ):
-        return True
-    return any(ch in t for ch in "=<>≤≥×÷√∫∑±∞²³") or "$" in t or "\\" in t
-
-
-def advance_stage(
-    mode: str, message: str, current: dict | None, has_history: bool = False
-) -> dict:
-    """根据用户新消息计算本轮回复应遵循的阶段（纯函数，供测试）。
-
-    优先级：解答模式 → 逃生词 → 练习词 → 批改词 → 新题判定 → 常规推进。
-    """
-    current = dict(current or {})
-    stage = current.get("stage")
-    hints = int(current.get("hints") or 0)
-    last_mode = current.get("last_mode") or MODE_INTERACTIVE
-    mode_changed = mode != last_mode
-    if mode != MODE_INTERACTIVE:
-        return {
-            "stage": None,
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": mode_changed,
-        }
-
-    text = (message or "").strip()
-    if mode_changed:
-        new_stage = "targeted_hint" if has_history else "initial_hint"
-        return {
-            "stage": new_stage,
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": True,
-        }
-    if any(k in text for k in ESCAPE_KEYWORDS):
-        return {
-            "stage": "full_solution",
-            "hints": hints,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if any(k in text for k in PRACTICE_KEYWORDS):
-        return {
-            "stage": "practice_wait",
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if any(k in text for k in GRADING_KEYWORDS):
-        return {
-            "stage": "grading",
-            "hints": hints,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage in ("summary", "full_solution", "grading") and _looks_like_new_problem(
-        text
-    ):
-        return {
-            "stage": "initial_hint",
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if not has_history:
-        return {
-            "stage": "initial_hint",
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage in (None, "initial_hint"):
-        return {
-            "stage": "targeted_hint",
-            "hints": hints + 1,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage == "targeted_hint":
-        if hints + 1 >= 3:
-            return {
-                "stage": "full_solution",
-                "hints": 0,
-                "last_mode": mode,
-                "mode_changed": False,
-            }
-        return {
-            "stage": "targeted_hint",
-            "hints": hints + 1,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage == "full_solution":
-        return {
-            "stage": "targeted_hint",
-            "hints": 1,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage == "practice_wait":
-        return {
-            "stage": "practice_grade",
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage == "practice_grade":
-        return {
-            "stage": "practice_grade",
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage == "grading":
-        return {
-            "stage": "summary",
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    if stage == "summary":
-        return {
-            "stage": "summary",
-            "hints": 0,
-            "last_mode": mode,
-            "mode_changed": False,
-        }
-    return {
-        "stage": "initial_hint",
-        "hints": 0,
-        "last_mode": mode,
-        "mode_changed": False,
-    }
-
-
 def on_image_upload(image: str | None, provider_id: str | None):
     """上传/粘贴题目图片：统一进入待发状态，发送时按服务商能力直附或转写。
 
@@ -669,11 +481,13 @@ def respond(
     文本服务商自动转写为文字再发送。attach_image=False 供习题库等
     内部消息使用（不携带待发图片）。思考链仅当轮展示。
     """
-    history = list(history or [])
-    stage_state = dict(stage_state or _new_stage_state())
-    stage_state.setdefault("stage", None)
-    stage_state.setdefault("hints", 0)
-    stage_state.setdefault("last_mode", MODE_INTERACTIVE)
+
+    #承接以前的会话历史记录，并且排除只输入空格的情况
+    history = list(history or [])       #这是为了承接以前的历史记录，[]是为了防止history为None时报错
+    stage_state = dict(stage_state or dialogue_state.new_stage_state())       #同上
+    stage_state.setdefault("stage", None)   #引导阶段
+    stage_state.setdefault("hints", 0)     #提示次数
+    stage_state.setdefault("last_mode", MODE_INTERACTIVE)    #最近一次使用的模式
     if mode == MODE_INTERACTIVE and stage_state.get("stage") not in (
         "initial_hint",
         "targeted_hint",
@@ -688,9 +502,9 @@ def respond(
     image_state.setdefault("path", None)
     image_state.setdefault("fresh", False)
     has_pending_image = bool(image_state.get("path")) and not force_continue
-    if not message.strip():
+    if not message.strip():   #strip()的作用是为了去掉前后空格，防止用户输入空格
         if not has_pending_image:
-            yield (
+            yield (              #yield是一个生成器语法，可以暂停函数的执行并返回一个值，下次调用时从暂停的地方继续执行
                 history,
                 "",
                 "💡 请先输入问题，或上传题目图片后直接发送。",
@@ -704,6 +518,7 @@ def respond(
         # 只传图不打字：自动按看图解题发送
         message = _IMAGE_ONLY_PROMPT
 
+    #长度检查
     username = request.username if request and request.username else "unknown"
     ip = (request.client.host if request and request.client else None) or "unknown"
     if len(message) > MAX_MESSAGE_LEN:
@@ -722,9 +537,10 @@ def respond(
         )
         return
 
-    today = datetime.date.today().isoformat()
-    daily_used = get_daily_used(today, username)
-    global_used = get_daily_total(today)
+    #日配额检查
+    today = datetime.date.today().isoformat()    #获取当前日期
+    daily_used = get_daily_used(today, username)       #获取当前账号今日使用量
+    global_used = get_daily_total(today)        #获取当天全局用量
     quota_msg = check_daily_quota(
         daily_used, global_used, DAILY_LIMIT, GLOBAL_DAILY_LIMIT
     )
@@ -756,9 +572,9 @@ def respond(
             new_stage["stage"] = None
             new_stage["last_mode"] = mode
     else:
-        new_stage = advance_stage(mode, message, stage_state, has_history=bool(history))
+        new_stage = dialogue_state.advance_stage(mode, message, stage_state, has_history=bool(history))
 
-    user_content = normalize_math_text(message, auto_close=True)
+    user_content = normalize_math_text(message, auto_close=True)     #补全用户输入公式，并且改成新的变量
     _log_event("发送", user_content)
     log_access_event(
         "提问", f"账号={username}", f"IP={ip}", f"长度={len(message)}"
@@ -794,10 +610,10 @@ def respond(
             # 互动模式：上一题已进入小结/解答/批改阶段，且消息像一道新题
             (
                 prev_stage in ("summary", "full_solution", "grading")
-                and _looks_like_new_problem(message)
+                and dialogue_state.looks_like_new_problem(message)
             )
             # 解答模式无阶段信号，仅靠消息内容判断
-            or (prev_stage is None and _looks_like_new_problem(message))
+            or (prev_stage is None and dialogue_state.looks_like_new_problem(message))
         )
         if stale_image and not fresh_image:
             # 新题开始：上一题的图片作废
@@ -869,6 +685,7 @@ def respond(
             username, history, settings.max_history_messages, active_client
         )
 
+    #正式开始流式调用大模型回答
     answer = ""
     reasoning_text = ""
     usage = None
@@ -887,11 +704,13 @@ def respond(
                     summary=summary,
                     image_data_url=image_data_url,
                 ),
+                #从外部函数传入数据到内部
                 thinking=thinking,
                 reasoning_effort=reasoning_effort,
                 model=model,
             )
         ):
+            #流式输出到前端
             if reasoning_piece:
                 reasoning_text += reasoning_piece
             if piece:
@@ -1150,7 +969,7 @@ def clear_conversation(request: gr.Request):
         "🗑️ 已开启新对话。",
         "",
         new_usage_state(),
-        _new_stage_state(),
+        dialogue_state.new_stage_state(),
         "（本轮无思考过程）",
         _new_image_state(),
     )
@@ -2669,7 +2488,7 @@ with gr.Blocks(
             result_status = gr.Markdown("")
             usage_status = gr.Markdown("")
             usage_state = gr.State(value=new_usage_state())
-            stage_state = gr.State(value=_new_stage_state())
+            stage_state = gr.State(value=dialogue_state.new_stage_state())
             image_state = gr.State(value=_new_image_state())
             provider_state = gr.State(
                   value=(default_provider["id"] if default_provider else None)
