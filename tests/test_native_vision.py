@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
 from core.providers import _sanitize_provider, get_provider_supports_vision
+from core.message_builder import to_api_messages
 
 
 class _FakeUsage:
@@ -122,7 +123,7 @@ def test_sanitize_provider_defaults_vision_false():
 
 
 def test_to_api_messages_without_image_stays_text():
-    messages = app_module.to_api_messages(
+    messages = to_api_messages(
         [{"role": "user", "content": "1+1=?"}],
         "高中",
         "解答模式",
@@ -131,7 +132,7 @@ def test_to_api_messages_without_image_stays_text():
 
 
 def test_to_api_messages_with_image_builds_content_array():
-    messages = app_module.to_api_messages(
+    messages = to_api_messages(
         [{"role": "user", "content": "这道题怎么做"}],
         "高中",
         "解答模式",
@@ -147,7 +148,7 @@ def test_to_api_messages_with_image_builds_content_array():
 
 
 def test_to_api_messages_image_without_user_message_is_ignored():
-    messages = app_module.to_api_messages(
+    messages = to_api_messages(
         [], "高中", "解答模式", image_data_url="data:image/jpeg;base64,QUJD"
     )
     assert all(m["role"] == "system" for m in messages)

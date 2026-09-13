@@ -63,7 +63,6 @@ from core.prompts import (
     MODE_ANSWER,
     MODE_INTERACTIVE,
     VISION_COMPLETE_PROMPT,
-    build_system_prompt,
 )
 from core.storage import load_history, save_history
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
@@ -84,6 +83,7 @@ from core.usage import (
 )
 from core.vision_client import VisionClient, image_to_data_url
 from core import dialogue_state
+from core import message_builder
 
 APP_VERSION = "1.3.1"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
@@ -206,61 +206,6 @@ if settings is not None and settings.vision_api_key:
     vision_client = VisionClient(settings)
 else:
     vision_client = None
-
-
-def to_api_messages(
-    history: list[dict],
-    level: str,
-    mode: str,
-    answer_style: str | None = None,
-    stage: str | None = None,
-    mode_changed: bool = False,
-    summary: str | None = None,
-    image_data_url: str | None = None,
-) -> list[dict]:
-    """把界面历史转换为 API 消息列表，并控制上下文长度。
-
-    image_data_url 非空时，最后一条 user 消息以多模态 content 数组发送
-    （原生视觉直传）；历史本身始终保持纯文本。
-    """
-    messages: list[dict] = [
-        {
-            "role": "system",
-            "content": build_system_prompt(level, mode, answer_style, stage),
-        }
-    ]
-    if mode_changed:
-        messages.append(
-            {
-                "role": "system",
-                "content": "【模式切换】现在起按新模式作答，忽略此前对话中的旧模式行为。",
-            }
-        )
-    if summary:
-        messages.append(
-            {
-                "role": "system",
-                "content": f"【更早对话摘要】\n{summary}",
-            }
-        )
-    if settings is not None:
-        history = history[-settings.max_history_messages :]
-    for item in history:
-        if isinstance(item.get("content"), str) and item.get("role") in (
-            "user",
-            "assistant",
-        ):
-            messages.append({"role": item["role"], "content": item["content"]})
-    if image_data_url and messages[-1]["role"] == "user":
-        text_content = messages[-1]["content"]
-        messages[-1] = {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": image_data_url}},
-                {"type": "text", "text": text_content},
-            ],
-        }
-    return messages
 
 
 def _usage_part(usage, attr: str) -> int | None:
@@ -694,7 +639,7 @@ def respond(
     try:
         for piece, reasoning_piece, chunk_usage, finish_reason in (
             active_client.chat_stream_with_usage(
-                to_api_messages(
+                message_builder.to_api_messages(
                     history,
                     level,
                     mode,
@@ -703,6 +648,9 @@ def respond(
                     mode_changed=new_stage["mode_changed"],
                     summary=summary,
                     image_data_url=image_data_url,
+                    max_history_messages=(
+                        settings.max_history_messages if settings is not None else None
+                    ),
                 ),
                 #从外部函数传入数据到内部
                 thinking=thinking,
