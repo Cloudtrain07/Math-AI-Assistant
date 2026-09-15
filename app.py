@@ -362,13 +362,13 @@ def on_image_upload(image: str | None, provider_id: str | None):
     outputs：[textbox, result_status, image_input, image_state]
     """
     if not image:
-        yield gr.skip(), "", gr.skip(), _new_image_state()
-        return
+        yield gr.skip(), "", gr.skip(), _new_image_state()    #输出重置UI的指令
+        return  #退出函数
     _log_event("图片就绪", str(image))
     yield (
         gr.skip(),
         "🖼️ 图片已就绪：输入你的问题后点击发送。"
-        "看图服务商（智谱/千问）直接看图；文本服务商（DeepSeek 等）发送时自动转写。"
+        "看图服务商直接看图；纯文本服务商发送时自动转写。"
         "也可以不打字直接发送。同一题继续讨论会自动携带，换新题或点 × 移除后停止。",
         image,
         {"path": image, "fresh": True},
