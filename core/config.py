@@ -23,9 +23,6 @@ class Settings:
     max_message_len: int
     daily_token_limit: int
     global_daily_token_limit: int
-    vision_api_key: str
-    vision_base_url: str
-    vision_model: str
 
 
 def _env_int(name: str, default: int) -> int:
@@ -63,13 +60,6 @@ def get_base_settings() -> Settings:
         max_message_len=_env_int("MAX_MESSAGE_LEN", 2000),
         daily_token_limit=_env_int("DAILY_TOKEN_LIMIT", 1_000_000),
         global_daily_token_limit=_env_int("GLOBAL_DAILY_TOKEN_LIMIT", 3_000_000),
-        # 视觉识图配置（可选）：未配置时仅影响「拍照识题」功能
-        vision_api_key=os.getenv("DASHSCOPE_API_KEY", "").strip(),
-        vision_base_url=os.getenv(
-            "DASHSCOPE_BASE_URL",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        ).strip(),
-        vision_model=os.getenv("VISION_MODEL", "qwen3.7-flash-2026-07-15").strip(),
     )
 
 
@@ -102,11 +92,4 @@ def get_settings() -> Settings:
         max_message_len=_env_int("MAX_MESSAGE_LEN", 2000),
         daily_token_limit=_env_int("DAILY_TOKEN_LIMIT", 1_000_000),
         global_daily_token_limit=_env_int("GLOBAL_DAILY_TOKEN_LIMIT", 3_000_000),
-        # 视觉识图配置（可选）：未配置时仅影响「拍照识题」功能
-        vision_api_key=os.getenv("DASHSCOPE_API_KEY", "").strip(),
-        vision_base_url=os.getenv(
-            "DASHSCOPE_BASE_URL",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        ).strip(),
-        vision_model=os.getenv("VISION_MODEL", "qwen3.7-flash-2026-07-15").strip(),
     )

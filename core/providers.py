@@ -150,5 +150,5 @@ def get_provider_supports_thinking(provider: dict) -> bool:
 
 
 def get_provider_supports_vision(provider: dict) -> bool:
-    """该服务商的主模型是否原生支持图片输入（可直接看图，无需先转写）。"""
+    """该服务商的主模型是否原生支持图片输入。"""
     return bool(provider.get("supports_vision", False))

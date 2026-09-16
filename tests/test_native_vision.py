@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""识图统一流程测试：上传只入待发区，发送时按服务商能力直附或转写。"""
+"""原生视觉流程测试：上传图片进入待发区，按服务商能力直接附图或明确拒绝。"""
 
 import sys
 from pathlib import Path
@@ -49,21 +49,6 @@ class _TextClient:
         self.seen_messages = messages
         yield "纯文本作答", None, None, None
         yield None, None, _FakeUsage(), "stop"
-
-
-class _FakeVisionAPI:
-    """假转写 API：替代 vision_client。"""
-
-    def __init__(self, text="转写的题目：已知 $x+1=2$，求 x", error=None):
-        self.text = text
-        self.error = error
-        self.calls = 0
-
-    def transcribe_image(self, image_path, prompt=None):
-        self.calls += 1
-        if self.error is not None:
-            raise self.error
-        return self.text, False
 
 
 def _fake_request():
@@ -154,14 +139,11 @@ def test_to_api_messages_image_without_user_message_is_ignored():
     assert all(m["role"] == "system" for m in messages)
 
 
-# ---------- on_image_upload：只入待发区，永不转写 ----------
+# ---------- on_image_upload：图片只进入待发区 ----------
 
 
-def test_on_image_upload_vision_provider_only_pends(monkeypatch):
-    def _fail_transcribe(*a, **k):
-        raise AssertionError("上传阶段不应触发转写")
+def test_on_image_upload_vision_provider_only_pends():
 
-    monkeypatch.setattr(app_module, "_transcribe_pending_image", _fail_transcribe)
     results = list(app_module.on_image_upload("/tmp/x.png", "glm"))
     textbox, status, image_out, image_state = results[-1]
     assert "图片已就绪" in status
@@ -169,11 +151,8 @@ def test_on_image_upload_vision_provider_only_pends(monkeypatch):
     assert image_state == {"path": "/tmp/x.png", "fresh": True}
 
 
-def test_on_image_upload_text_provider_only_pends(monkeypatch):
-    def _fail_transcribe(*a, **k):
-        raise AssertionError("上传阶段不应触发转写")
+def test_on_image_upload_text_provider_only_pends():
 
-    monkeypatch.setattr(app_module, "_transcribe_pending_image", _fail_transcribe)
     results = list(app_module.on_image_upload("/tmp/x.png", "deepseek"))
     textbox, status, image_out, image_state = results[-1]
     assert image_out == "/tmp/x.png"  # 与看图服务商行为一致：保留待发
@@ -184,7 +163,7 @@ def test_on_image_upload_text_provider_only_pends(monkeypatch):
 # ---------- respond：看图服务商直传路径 ----------
 
 
-def test_respond_attaches_image_for_vision_client(monkeypatch, tmp_path):
+def test_respond_attaches_image_for_vision_model(monkeypatch, tmp_path):
     _patch_common(monkeypatch, tmp_path)
     fake = _VisionClient()
     monkeypatch.setattr(app_module, "client", fake)
@@ -355,94 +334,13 @@ def test_respond_attach_image_false_passthrough(monkeypatch, tmp_path):
     assert image_state == {"path": png, "fresh": True}  # 待发状态原样保留
 
 
-# ---------- respond：文本服务商发送时转写路径 ----------
+# ---------- respond：纯文本模型拒绝图片 ----------
 
 
-def test_respond_transcribes_at_send_for_text_client(monkeypatch, tmp_path):
+def test_respond_text_client_rejects_image_and_keeps_pending(monkeypatch, tmp_path):
     _patch_common(monkeypatch, tmp_path)
     fake = _TextClient()
     monkeypatch.setattr(app_module, "client", fake)
-    monkeypatch.setattr(
-        app_module, "vision_client", _FakeVisionAPI("转写的题目内容")
-    )
-    png = _tiny_png(tmp_path)
-
-    thinking_yields = []
-    results = list(
-        app_module.respond(
-            "这道题怎么做",
-            [],
-            "高中",
-            "解答模式",
-            False,
-            "deepseek-v4-flash",
-            "high",
-            None,
-            {"total_tokens": 0, "turns": 0},
-            _stage_answer_mode(),
-            {"path": png, "fresh": True},
-            None,
-            _fake_request(),
-        )
-    )
-    last_history, _, status, _, _, _, _, image_state = results[-1]
-
-    # 有"正在转写"的过渡状态
-    thinking_yields = [r for r in results if r[2] and "转写" in r[2]]
-    assert thinking_yields
-    # API 收到"转写文字 + 用户问题"的组合纯文本
-    api_text = fake.seen_messages[-1]["content"]
-    assert isinstance(api_text, str)
-    assert "转写的题目内容" in api_text
-    assert "这道题怎么做" in api_text
-    # 历史条目为组合文本（转写持久化，追问不依赖图）
-    assert isinstance(last_history[0]["content"], str)
-    assert "转写的题目内容" in last_history[0]["content"]
-    # 待发图片已清空
-    assert image_state == {"path": None, "fresh": False}
-    assert "转写失败" not in status
-
-
-def test_respond_transcribe_failure_keeps_pending(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
-    fake = _TextClient()
-    monkeypatch.setattr(app_module, "client", fake)
-    monkeypatch.setattr(
-        app_module, "vision_client", _FakeVisionAPI(error=RuntimeError("网络超时"))
-    )
-    png = _tiny_png(tmp_path)
-
-    results = list(
-        app_module.respond(
-            "这道题怎么做",
-            [],
-            "高中",
-            "解答模式",
-            False,
-            "deepseek-v4-flash",
-            "high",
-            None,
-            {"total_tokens": 0, "turns": 0},
-            _stage_answer_mode(),
-            {"path": png, "fresh": True},
-            None,
-            _fake_request(),
-        )
-    )
-    _, _, status, _, _, _, _, image_state = results[-1]
-
-    # 失败提示明确，图片与状态保留，主模型未被调用
-    assert "转写失败" in status
-    assert "网络超时" in status
-    assert image_state == {"path": png, "fresh": True}
-    assert fake.calls == 0
-
-
-def test_respond_text_client_without_vision_key(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
-    fake = _TextClient()
-    monkeypatch.setattr(app_module, "client", fake)
-    monkeypatch.setattr(app_module, "vision_client", None)
     png = _tiny_png(tmp_path)
 
     results = list(
@@ -465,8 +363,8 @@ def test_respond_text_client_without_vision_key(monkeypatch, tmp_path):
     _, _, status, _, _, _, _, image_state = results[-1]
 
     # 明确给出两条出路；不调主模型；待发保留
-    assert "DASHSCOPE_API_KEY" in status
-    assert "看图服务商" in status
+    assert "不支持图片输入" in status
+    assert "支持原生视觉" in status
     assert image_state == {"path": png, "fresh": True}
     assert fake.calls == 0
 

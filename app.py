@@ -61,7 +61,6 @@ from core.math_format import normalize_math_text
 from core.prompts import (
     MODE_ANSWER,
     MODE_INTERACTIVE,
-    VISION_COMPLETE_PROMPT,
 )
 from core.storage import load_history, save_history
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
@@ -80,7 +79,7 @@ from core.usage import (
     new_usage_state,
     record_usage,
 )
-from core.vision_client import VisionClient, image_to_data_url
+from core.vision_client import image_to_data_url
 from core import dialogue_state
 from core import message_builder
 
@@ -198,13 +197,6 @@ def _new_image_state() -> dict:
 IMAGE_NOTE = "📷（已附题目图片）"
 # 只传图不打字时自动使用的提问语
 _IMAGE_ONLY_PROMPT = "请解答图中的题目。"
-
-
-# 视觉客户端（可选）：未配置 DASHSCOPE_API_KEY 时，上传图片会给出提示
-if settings is not None and settings.vision_api_key:
-    vision_client = VisionClient(settings)
-else:
-    vision_client = None
 
 
 def _usage_part(usage, attr: str) -> int | None:
@@ -356,7 +348,7 @@ def _recognition_incomplete(text: str) -> bool:
 
 
 def on_image_upload(image: str | None, provider_id: str | None):
-    """上传/粘贴题目图片：统一进入待发状态，发送时按服务商能力直附或转写。
+    """上传/粘贴题目图片：统一进入待发状态，由支持原生视觉的服务商直接处理。
 
     outputs：[textbox, result_status, image_input, image_state]
     """
@@ -367,38 +359,11 @@ def on_image_upload(image: str | None, provider_id: str | None):
     yield (
         gr.skip(),
         "🖼️ 图片已就绪：输入你的问题后点击发送。"
-        "看图服务商直接看图；纯文本服务商发送时自动转写。"
+        "支持原生视觉的服务商可直接看图；纯文本服务商不支持图片输入。"
         "也可以不打字直接发送。同一题继续讨论会自动携带，换新题或点 × 移除后停止。",
         image,
         {"path": image, "fresh": True},
     )
-
-
-def _transcribe_pending_image(image_path: str) -> str:
-    """发送时转写待发图片（文本服务商路径）；失败抛异常由调用方提示。
-
-    含"识别不完整"的自动补全重试；成功返回转写文本。
-    """
-    recognized, _truncated = vision_client.transcribe_image(image_path)
-    if not recognized:
-        recognized = "（未能识别出图片中的题目内容）"
-    # 自动补全重试：识别不完整时用补全提示词再问一次
-    if _recognition_incomplete(recognized):
-        try:
-            completed, _ = vision_client.transcribe_image(
-                image_path,
-                prompt=VISION_COMPLETE_PROMPT.format(partial=recognized),
-            )
-        except Exception:
-            completed = ""
-        if (
-            completed
-            and completed.strip().upper() != "ERROR"
-            and not _recognition_incomplete(completed)
-        ):
-            recognized = completed
-    _log_event("识别", recognized)
-    return recognized
 
 
 def respond(
@@ -421,7 +386,7 @@ def respond(
     """聊天主流程：流式回复，累计会话用量，并按互动模式阶段引导。
 
     发送时按所选服务商能力路由图片：支持原生视觉则直接附图；
-    文本服务商自动转写为文字再发送。attach_image=False 供习题库等
+    纯文本服务商收到图片时返回提示。attach_image=False 供习题库等
     内部消息使用（不携带待发图片）。思考链仅当轮展示。
     """
 
@@ -541,7 +506,7 @@ def respond(
         )
         return
 
-    # —— 图片路由：发送时按所选服务商能力决定直附原图或转写成文字 ——
+    # 图片路由：原生视觉模型直接附图，纯文本模型明确拒绝
     image_path = image_state.get("path")
     fresh_image = bool(image_state.get("fresh"))
     new_image_state = dict(image_state)
@@ -575,51 +540,19 @@ def respond(
                     "content": f"{user_content}\n{IMAGE_NOTE}",
                 }
         else:
-            # 文本服务商：发送时自动转写，转写文字随问题一起进历史（持久记录）
-            if vision_client is None:
-                yield (
-                    history,
-                    "",
-                    "⚠️ 当前服务商不支持看图，且未配置转写视觉 Key："
-                    "请在 .env 填写 DASHSCOPE_API_KEY 后重启，"
-                    "或切换到智谱 / 千问等看图服务商。",
-                    "",
-                    usage_state,
-                    new_stage,
-                    "",
-                    dict(image_state),
-                )
-                return
+            # 当前模型不支持原生视觉：停止发送并保留待发图片
             yield (
                 history,
                 "",
-                "🔍 正在转写图片…",
+                "⚠️ 当前服务商不支持图片输入，请切换到支持原生视觉的服务商后重试。",
                 "",
                 usage_state,
                 new_stage,
                 "",
                 dict(image_state),
             )
-            try:
-                recognized = _transcribe_pending_image(image_path)
-            except Exception as exc:
-                yield (
-                    history,
-                    "",
-                    f"❌ 图片转写失败：{exc}\n\n"
-                    "图片已保留：可直接重发；或改用看图服务商（智谱 / 千问）直接看图。",
-                    "",
-                    usage_state,
-                    new_stage,
-                    "",
-                    dict(image_state),
-                )
-                return
-            history[-1] = {
-                "role": "user",
-                "content": f"{recognized}\n\n{user_content}",
-            }
-            new_image_state = _new_image_state()
+            return
+            
 
     # 长会话自动压缩：把掉出窗口的早期消息合并成摘要，作为系统消息注入
     summary = ""
@@ -2367,7 +2300,7 @@ with gr.Blocks(
               )
             with gr.Accordion("📷 题目图片（上传 / 粘贴后直接发送）", open=True):
                 image_input = gr.Image(
-                    label="看图模型直接看图；文本模型发送时自动转写",
+                    label="支持原生视觉的模型可直接看图；纯文本模型不支持图片输入",
                     sources=["upload", "clipboard"],
                     type="filepath",
                 )

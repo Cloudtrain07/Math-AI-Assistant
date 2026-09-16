@@ -9,8 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.prompts import (
     MODE_ANSWER,
     MODE_INTERACTIVE,
-    VISION_COMPLETE_PROMPT,
-    VISION_TRANSCRIBE_PROMPT,
     build_system_prompt,
 )
 
@@ -54,8 +52,3 @@ def test_level_hint_injected():
 def test_prompt_requires_chinese_thinking():
     prompt = build_system_prompt("高中", MODE_ANSWER)
     assert "思维链请全程使用中文" in prompt
-
-
-def test_vision_prompts_still_exist():
-    assert "转写" in VISION_TRANSCRIBE_PROMPT
-    assert "{partial}" in VISION_COMPLETE_PROMPT
