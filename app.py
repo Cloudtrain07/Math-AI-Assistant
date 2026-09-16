@@ -27,7 +27,6 @@ from core.accounts import (
     reset_password,
 )
 from core.backup import daily_backup_loop, ensure_today_backup
-from core.calculator import CALCULATOR_AVAILABLE, verify_math
 from core.compressor import HistoryCompressor
 from core.config import get_base_settings, get_settings
 from core.llm_client import LLMClient, MaxWaitTimeout
@@ -416,7 +415,6 @@ def respond(
     image_state: dict | None,
     provider_id: str | None,
     request: gr.Request,
-    verify: bool = True,
     force_continue: bool = False,
     attach_image: bool = True,
 ):
@@ -820,25 +818,7 @@ def respond(
         f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
     )
     reasoning_display = normalize_math_text(reasoning_text, auto_close=True)
-    # 第一段：先立即输出答案，验算随后刷新，避免界面等待
-    yield (
-        final_history,
-        "",
-        result_text,
-        usage_text,
-        usage_state,
-        new_stage,
-        reasoning_display,
-        new_image_state,
-    )
-    # 第二段：本地验算（发现错误时模型复核），结果追加到「本次结果」
-    verify_note = ""
-    if verify:
-        verify_note = _auto_verify_loop(
-            answer, final_history, username, active_client
-        )
-    if verify_note:
-        result_text += "\n\n" + verify_note
+    # 输出最终答案
     yield (
         final_history,
         "",
@@ -985,60 +965,6 @@ def restore_level(request: gr.Request) -> str:
     if level not in ("小学", "初中", "高中", "大学"):
         level = "高中"
     return level
-
-
-def _recheck_wrong_answer(answer: str, active_client=None) -> str:
-    """验算发现不成立时，请模型快速复核并给出修正；失败返回空串。"""
-    complete_fn = getattr(active_client or client, "complete", None)
-    if complete_fn is None:
-        return ""
-    prompt = (
-        "下面是 AI 对一道数学题的解答，本地验算发现其中有公式不成立。"
-        "请重新检查，找出错误并给出修正后的关键步骤与最终答案。\n\n"
-        f"解答：\n{answer[:2000]}"
-    )
-    try:
-        text = complete_fn(
-            [{"role": "user", "content": prompt}],
-            thinking=False,
-            max_tokens=800,
-        )
-    except Exception:
-        return ""
-    return (text or "").strip()
-
-
-def _auto_verify_loop(
-    answer: str, history: list[dict], username: str, active_client=None
-) -> str:
-    """自动验算回答中的公式；发现不成立时请模型复核，返回状态摘要。"""
-    if not CALCULATOR_AVAILABLE or not answer:
-        return ""
-    results = verify_math(answer)
-    if not results:
-        return ""
-    ok = sum(1 for r in results if r["status"] == "成立")
-    bad = sum(1 for r in results if r["status"] == "不成立")
-    other = len(results) - ok - bad
-    parts = [f"🧮 自动验算 {len(results)} 条公式"]
-    if bad:
-        parts.append(f"发现 {bad} 条不成立")
-    if ok:
-        parts.append(f"{ok} 条成立")
-    if other:
-        parts.append(f"{other} 条无法自动判定")
-    note = "，".join(parts) + "。（验算仅针对公式本身，不代表解题过程正确）"
-    if bad:
-        correction = _recheck_wrong_answer(answer, active_client)
-        if correction:
-            history.append(
-                {"role": "assistant", "content": f"（🔍 自动复核）{correction}"}
-            )
-            save_history(history, username=username)
-            note += "\n\n🔍 已自动复核并给出修正，见上方补充消息。"
-        else:
-            note += "\n\n⚠️ 验算发现疑点，复核未成功，可回复「重新检查」。"
-    return note
 
 
 def toggle_answer_style(mode: str):
@@ -1933,7 +1859,6 @@ def generate_paper(
         image_state,
         provider_id,
         request,
-        verify=False,
         attach_image=False,
     ):
         last = item
@@ -2048,7 +1973,6 @@ def grade_paper(
         image_state,
         provider_id,
         request,
-        verify=False,
         attach_image=False,
     ):
         last = item
@@ -2371,7 +2295,7 @@ with gr.Blocks(
     gr.Markdown(
         "# 🧮 数学学习 AI 助手\n\n"
         "基于 DeepSeek 大模型，采用苏格拉底式引导，一步步带你学会数学。"
-        f"支持 LaTeX 公式、拍照识题、习题库与本地验算。版本 v{APP_VERSION}"
+        f"支持 LaTeX 公式、拍照识题、习题库。版本 v{APP_VERSION}"
     )
     with gr.Tabs() as tabs:
         with gr.Tab("学习"):
