@@ -304,7 +304,7 @@ def test_respond_empty_message_with_image_auto_prompt(monkeypatch, tmp_path):
 
 
 def test_respond_attach_image_false_passthrough(monkeypatch, tmp_path):
-    """习题库等内部消息不携带待发图片，待发状态原样透传。"""
+    """只发送文字时不携带待发图片，待发状态原样透传。"""
     _patch_common(monkeypatch, tmp_path)
     fake = _VisionClient()
     monkeypatch.setattr(app_module, "client", fake)
@@ -312,7 +312,7 @@ def test_respond_attach_image_false_passthrough(monkeypatch, tmp_path):
 
     results = list(
         app_module.respond(
-            "【习题库变式】请出一道同类题",
+            "这是一条只发送文字的消息",
             [],
             "高中",
             "解答模式",

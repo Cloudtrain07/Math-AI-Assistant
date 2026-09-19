@@ -14,10 +14,10 @@ from core import backup as backup_mod
 def _make_data(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     (data_dir / "history").mkdir(parents=True)
-    (data_dir / "exercise_bank").mkdir()
+    (data_dir / "extra_data").mkdir()
     (data_dir / "accounts.json").write_text("{}", encoding="utf-8")
     (data_dir / "history" / "user1.json").write_text("[]", encoding="utf-8")
-    (data_dir / "exercise_bank" / "user1.json").write_text("[]", encoding="utf-8")
+    (data_dir / "extra_data" / "example.json").write_text("[]", encoding="utf-8")
     (data_dir / "chat.log").write_text("x\n", encoding="utf-8")
     monkeypatch.setattr(backup_mod, "DATA_DIR", data_dir)
     return data_dir
@@ -31,7 +31,7 @@ def test_backup_zip_contents(monkeypatch, tmp_path):
         names = archive.namelist()
     assert "accounts.json" in names
     assert "history/user1.json" in names
-    assert "exercise_bank/user1.json" in names
+    assert "extra_data/example.json" in names
     assert "chat.log" in names
     assert not any(name.startswith("backups/") for name in names)
 
