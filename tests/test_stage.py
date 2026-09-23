@@ -91,3 +91,33 @@ def test_mode_switch_back_to_interactive():
     )
     assert result["stage"] == "targeted_hint"
     assert result["mode_changed"] is True
+
+
+def test_force_continue_keeps_interactive_stage():
+    current = _st("targeted_hint", hints=2, last_mode="互动模式")
+    original = current.copy()
+
+    result = advance_stage(
+        "互动模式", "继续", current, has_history=True, force_continue=True
+    )
+
+    assert result["stage"] == "targeted_hint"
+    assert result["hints"] == 2
+    assert result["last_mode"] == "互动模式"
+    assert result["mode_changed"] is False
+    assert current == original
+
+
+def test_force_continue_clears_non_interactive_stage():
+    current = _st("targeted_hint", hints=2, last_mode="互动模式")
+    original = current.copy()
+
+    result = advance_stage(
+        "解答模式", "继续", current, has_history=True, force_continue=True
+    )
+
+    assert result["stage"] is None
+    assert result["hints"] == 2
+    assert result["last_mode"] == "解答模式"
+    assert result["mode_changed"] is False
+    assert current == original

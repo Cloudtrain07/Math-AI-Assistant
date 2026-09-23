@@ -405,15 +405,13 @@ def respond(
         return
 
     # 根据用户新消息推进互动模式阶段（解答模式无阶段）
-    if force_continue:
-        # 继续生成时保留当前阶段，避免把“题目原文+继续”误判为新题或切到批改
-        new_stage = dict(stage_state)
-        new_stage["mode_changed"] = False
-        if mode != MODE_INTERACTIVE:
-            new_stage["stage"] = None
-            new_stage["last_mode"] = mode
-    else:
-        new_stage = dialogue_state.advance_stage(mode, message, stage_state, has_history=bool(history))
+    new_stage = dialogue_state.advance_stage(
+        mode,
+        message,
+        stage_state,
+        has_history=bool(history),
+        force_continue=force_continue,
+    )
 
     user_content = normalize_math_text(message, auto_close=True)     #补全用户输入公式，并且改成新的变量
     _log_event("发送", user_content)

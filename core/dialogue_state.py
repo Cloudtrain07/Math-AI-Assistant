@@ -66,7 +66,7 @@ def looks_like_new_problem(text: str) -> bool:
 
 
 def advance_stage(
-    mode: str, message: str, current: dict | None, has_history: bool = False
+    mode: str, message: str, current: dict | None, has_history: bool = False , force_continue: bool = False
 ) -> dict:
     """根据用户新消息计算本轮回复应遵循的阶段（纯函数，供测试）。
 
@@ -77,6 +77,12 @@ def advance_stage(
     hints = int(current.get("hints") or 0)
     last_mode = current.get("last_mode") or MODE_INTERACTIVE
     mode_changed = mode != last_mode
+    if force_continue:
+        current["mode_changed"] = False
+        if mode != MODE_INTERACTIVE:
+            current["stage"] = None
+            current["last_mode"] = mode
+        return current
     if mode != MODE_INTERACTIVE:
         return {
             "stage": None,
