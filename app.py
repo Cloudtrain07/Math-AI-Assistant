@@ -61,6 +61,7 @@ from core.usage import (
 )
 from core.vision_client import image_to_data_url
 from core import dialogue_state
+from core import chat_service
 from core import message_builder
 
 APP_VERSION = "1.3.1"
@@ -713,14 +714,8 @@ def continue_last_answer(
     """「继续生成」按钮：取最近一条题目原文，拼上继续指令后复用完整回复流程。"""
     history = list(history or [])
     image_state = dict(image_state or _new_image_state())
-    last_user = ""
-    for item in reversed(history):
-        content = item.get("content")
-        if item.get("role") == "user" and isinstance(content, str) and content.strip():
-            # 去掉附图标记，避免「继续」消息里重复出现
-            last_user = content.replace(f"\n{IMAGE_NOTE}", "").replace(IMAGE_NOTE, "")
-            break
-    if not last_user:
+    message = chat_service.build_continue_message(history, IMAGE_NOTE)
+    if message is None:
         yield (
             history,
             "",
@@ -732,7 +727,6 @@ def continue_last_answer(
             image_state,
         )
         return
-    message = f"{last_user}\n（请继续完成上一条回答）"
     yield from respond(
         message,
         history,
