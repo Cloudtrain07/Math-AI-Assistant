@@ -1,6 +1,8 @@
 # 环境与密钥
 .env
 .venv/
+# 本机服务商配置（各人自填，含各自的密钥环境变量指向）；模板见 config/providers.example.json
+/config/providers.json
 
 # Python
 __pycache__/

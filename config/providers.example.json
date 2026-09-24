@@ -1,0 +1,11 @@
+[
+  {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+    "default_model": "deepseek-v4-flash",
+    "thinking_param": "deepseek"
+  }
+]
