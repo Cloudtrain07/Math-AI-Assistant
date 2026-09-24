@@ -61,8 +61,7 @@ from core.usage import (
 )
 from core.vision_client import image_to_data_url
 from core import dialogue_state
-from core import chat_service
-from core import message_builder
+from core import chat_service 
 
 APP_VERSION = "1.3.1"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
@@ -486,11 +485,7 @@ def respond(
             
 
     # 长会话自动压缩：把掉出窗口的早期消息合并成摘要，作为系统消息注入
-    summary = ""
-    if settings is not None and len(history) > settings.max_history_messages:
-        summary = history_compressor.get_summary(
-            username, history, settings.max_history_messages, active_client
-        )
+   
 
     #正式开始流式调用大模型回答
     answer = ""
@@ -501,15 +496,17 @@ def respond(
     try:
         for piece, reasoning_piece, chunk_usage, finish_reason in (
             active_client.chat_stream_with_usage(
-                message_builder.to_api_messages(
-                    history,
-                    level,
-                    mode,
-                    answer_style,
+                chat_service.prepare_api_messages(
+                    username=username,
+                    history=history,
+                    level=level,
+                    mode=mode,
+                    answer_style=answer_style,
+                    active_client=active_client,
+                    history_compressor=history_compressor,
+                    image_data_url=image_data_url,
                     stage=new_stage["stage"],
                     mode_changed=new_stage["mode_changed"],
-                    summary=summary,
-                    image_data_url=image_data_url,
                     max_history_messages=(
                         settings.max_history_messages if settings is not None else None
                     ),

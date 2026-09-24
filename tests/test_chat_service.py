@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """继续生成消息的独立测试。"""
 
-from core.chat_service import build_continue_message
+from core.chat_service import build_continue_message, prepare_api_messages
+from unittest.mock import Mock
 
 
 def test_uses_latest_user_message_and_removes_image_note():
@@ -33,3 +34,67 @@ def test_latest_user_message_only_has_image_note():
     ]
 
     assert build_continue_message(history, "[附图]") is None
+
+
+def test_prepare_api_messages_without_compression():
+    history = [
+        {"role": "user", "content": "什么是导数？"},
+        {"role": "assistant", "content": "导数描述变化率。"},
+    ]
+    compressor = Mock()
+
+    messages = prepare_api_messages(
+        username="tester",
+        history=history,
+        level="高中",
+        mode="解答模式",
+        answer_style=None,
+        active_client=object(),
+        history_compressor=compressor,
+        image_data_url=None,
+        stage=None,
+        mode_changed=False,
+        max_history_messages=2,
+    )
+
+    compressor.get_summary.assert_not_called()
+    assert messages[-2:] == history
+    assert not any(
+        "【更早对话摘要】" in str(message["content"])
+        for message in messages
+    )
+
+
+def test_prepare_api_messages_with_compression():
+    history = [
+        {"role": "user", "content": "第一条较早的问题"},
+        {"role": "assistant", "content": "第一条较早的回答"},
+        {"role": "user", "content": "最近的问题"},
+    ]
+    compressor = Mock()
+    compressor.get_summary.return_value = "测试摘要"
+    active_client = object()
+
+    messages = prepare_api_messages(
+        username="tester",
+        history=history,
+        level="高中",
+        mode="解答模式",
+        answer_style=None,
+        active_client=active_client,
+        history_compressor=compressor,
+        image_data_url=None,
+        stage=None,
+        mode_changed=False,
+        max_history_messages=2,
+    )
+
+    compressor.get_summary.assert_called_once_with(
+        "tester", history, 2, active_client
+    )
+    assert any(
+        message["role"] == "system"
+        and "【更早对话摘要】\n测试摘要" in message["content"]
+        for message in messages
+    )
+    assert messages[-2:] == history[-2:]
