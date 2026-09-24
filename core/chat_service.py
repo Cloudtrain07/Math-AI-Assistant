@@ -30,6 +30,7 @@ def prepare_api_messages(
     mode_changed: bool,
     max_history_messages: int | None,
 ) -> list[dict]:
+    """准备发送给 API 的消息列表。"""
     summary = ""
     if max_history_messages is not None and len(history) > max_history_messages:
         summary = history_compressor.get_summary(username, history, max_history_messages, active_client)
@@ -44,3 +45,41 @@ def prepare_api_messages(
         image_data_url=image_data_url,
         max_history_messages=max_history_messages,
     )
+
+
+def stream_reply(
+    active_client,
+    messages: list[dict],
+    thinking: bool,
+    reasoning_effort: str,
+    model: str,
+):
+    """调用模型，并在每次收到片段后交出当前的累计结果。"""
+    answer = ""
+    reasoning_text = ""
+    usage = None
+    truncated = False
+
+    for piece, reasoning_piece, chunk_usage, finish_reason in (
+        active_client.chat_stream_with_usage(
+            messages,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+            model=model,
+        )
+    ):
+        if reasoning_piece:
+            reasoning_text += reasoning_piece
+        if piece:
+            answer += piece
+        if chunk_usage is not None:
+            usage = chunk_usage
+        if finish_reason == "length":
+            truncated = True
+
+        yield {
+            "answer": answer,
+            "reasoning_text": reasoning_text,
+            "usage": usage,
+            "truncated": truncated,
+        }

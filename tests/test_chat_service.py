@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """继续生成消息的独立测试。"""
 
-from core.chat_service import build_continue_message, prepare_api_messages
+from core.chat_service import build_continue_message, prepare_api_messages,stream_reply
 from unittest.mock import Mock
 
 
@@ -98,3 +98,52 @@ def test_prepare_api_messages_with_compression():
         for message in messages
     )
     assert messages[-2:] == history[-2:]
+
+
+def test_stream_reply_accumulates_model_chunks():
+    usage_marker = object()
+    messages = [{"role": "user", "content": "请解题"}]
+
+    class FakeClient:
+        def chat_stream_with_usage(
+            self, received_messages, thinking, reasoning_effort, model
+        ):
+            self.received = (
+                received_messages, thinking, reasoning_effort, model
+            )
+            yield "先求导", None, None, None
+            yield None, "正在分析", None, None
+            yield "，得到结果", None, usage_marker, "length"
+
+    client = FakeClient()
+    snapshots = list(
+        stream_reply(
+            client,
+            messages,
+            thinking=True,
+            reasoning_effort="high",
+            model="test-model",
+        )
+    )
+
+    assert client.received == (messages, True, "high", "test-model")
+    assert snapshots == [
+        {
+            "answer": "先求导",
+            "reasoning_text": "",
+            "usage": None,
+            "truncated": False,
+        },
+        {
+            "answer": "先求导",
+            "reasoning_text": "正在分析",
+            "usage": None,
+            "truncated": False,
+        },
+        {
+            "answer": "先求导，得到结果",
+            "reasoning_text": "正在分析",
+            "usage": usage_marker,
+            "truncated": True,
+        },
+    ]

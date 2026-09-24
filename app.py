@@ -484,48 +484,38 @@ def respond(
             return
             
 
-    # 长会话自动压缩：把掉出窗口的早期消息合并成摘要，作为系统消息注入
-   
-
     #正式开始流式调用大模型回答
     answer = ""
     reasoning_text = ""
     usage = None
-    truncated = False
+    truncated = False    #是否被截断
     thinking_started = time.monotonic()
     try:
-        for piece, reasoning_piece, chunk_usage, finish_reason in (
-            active_client.chat_stream_with_usage(
-                chat_service.prepare_api_messages(
-                    username=username,
-                    history=history,
-                    level=level,
-                    mode=mode,
-                    answer_style=answer_style,
-                    active_client=active_client,
-                    history_compressor=history_compressor,
-                    image_data_url=image_data_url,
-                    stage=new_stage["stage"],
-                    mode_changed=new_stage["mode_changed"],
-                    max_history_messages=(
-                        settings.max_history_messages if settings is not None else None
-                    ),
+        for state in chat_service.stream_reply(
+            active_client,
+            chat_service.prepare_api_messages(
+                username=username,
+                history=history,
+                level=level,
+                mode=mode,
+                answer_style=answer_style,
+                active_client=active_client,
+                history_compressor=history_compressor,
+                image_data_url=image_data_url,
+                stage=new_stage["stage"],
+                mode_changed=new_stage["mode_changed"],
+                max_history_messages=(
+                    settings.max_history_messages if settings is not None else None
                 ),
-                #从外部函数传入数据到内部
-                thinking=thinking,
-                reasoning_effort=reasoning_effort,
-                model=model,
-            )
+            ),
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+            model=model,
         ):
-            #流式输出到前端
-            if reasoning_piece:
-                reasoning_text += reasoning_piece
-            if piece:
-                answer += piece
-            if chunk_usage is not None:
-                usage = chunk_usage
-            if finish_reason == "length":
-                truncated = True
+            answer = state["answer"]
+            reasoning_text = state["reasoning_text"]
+            usage = state["usage"]
+            truncated = state["truncated"]
             if not answer:
                 # 思考阶段：状态栏显示已用时与估算思考 token，避免界面一片空白
                 tokens_part = (
@@ -560,6 +550,7 @@ def respond(
                     normalize_math_text(reasoning_text, auto_close=True),
                     new_image_state,
                 )
+    # 流式输出结束，由下面的逻辑继续处理最终结果
     except Exception as exc:
         turn_total = None
         if usage is not None:
