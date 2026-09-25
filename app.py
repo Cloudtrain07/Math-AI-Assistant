@@ -59,7 +59,6 @@ from core.usage import (
     new_usage_state,
     record_usage,
 )
-from core.vision_client import image_to_data_url
 from core import dialogue_state
 from core import chat_service 
 
@@ -436,52 +435,34 @@ def respond(
         )
         return
 
-    # 图片路由：原生视觉模型直接附图，纯文本模型明确拒绝
-    image_path = image_state.get("path")
-    fresh_image = bool(image_state.get("fresh"))
-    new_image_state = dict(image_state)
-    image_data_url = None
-    image_status = ""
-    if image_path and not force_continue and attach_image:
-        prev_stage = (stage_state or {}).get("stage")
-        stale_image = (
-            # 互动模式：上一题已进入小结/解答/批改阶段，且消息像一道新题
-            (
-                prev_stage in ("summary", "full_solution", "grading")
-                and dialogue_state.looks_like_new_problem(message)
-            )
-            # 解答模式无阶段信号，仅靠消息内容判断
-            or (prev_stage is None and dialogue_state.looks_like_new_problem(message))
+    # 决定本轮是否附图；Gradio 的输出仍由 respond 负责
+    image_result = chat_service.route_image_for_turn(
+        message=message,
+        history=history,
+        image_state=image_state,
+        previous_stage=stage_state.get("stage"),
+        supports_vision=bool(getattr(active_client, "supports_vision", False)),
+        force_continue=force_continue,
+        attach_image=attach_image,
+        image_note=IMAGE_NOTE,
+    )
+    history = image_result["history"]
+    image_data_url = image_result["image_data_url"]
+    new_image_state = image_result["image_state"]
+    image_status = image_result["image_status"]
+
+    if image_result["reject_message"] is not None:
+        yield (
+            history,
+            "",
+            image_result["reject_message"],
+            "",
+            usage_state,
+            new_stage,
+            "",
+            new_image_state,
         )
-        if stale_image and not fresh_image:
-            # 新题开始：上一题的图片作废
-            new_image_state = _new_image_state()
-        elif getattr(active_client, "supports_vision", False):
-            try:
-                image_data_url = image_to_data_url(image_path)
-            except Exception as exc:
-                image_status = f"⚠️ 图片读取失败（{exc}），已按纯文本发送。"
-                new_image_state = _new_image_state()
-            else:
-                # 图片随本题每轮重附（模型无跨轮图片记忆）；fresh 仅在首次发送后清除
-                new_image_state = {"path": image_path, "fresh": False}
-                history[-1] = {
-                    "role": "user",
-                    "content": f"{user_content}\n{IMAGE_NOTE}",
-                }
-        else:
-            # 当前模型不支持原生视觉：停止发送并保留待发图片
-            yield (
-                history,
-                "",
-                "⚠️ 当前服务商不支持图片输入，请切换到支持原生视觉的服务商后重试。",
-                "",
-                usage_state,
-                new_stage,
-                "",
-                dict(image_state),
-            )
-            return
+        return
             
 
     #正式开始流式调用大模型回答

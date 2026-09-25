@@ -2,6 +2,7 @@
 """继续生成消息的独立测试。"""
 
 from core.chat_service import build_continue_message, prepare_api_messages,stream_reply
+import core.chat_service as chat_service
 from unittest.mock import Mock
 
 
@@ -147,3 +148,131 @@ def test_stream_reply_accumulates_model_chunks():
             "truncated": True,
         },
     ]
+
+
+def test_route_image_attaches_fresh_image(monkeypatch):
+    monkeypatch.setattr(
+        chat_service,
+        "image_to_data_url",
+        lambda path: "data:image/jpeg;base64,TEST",
+    )
+    history = [{"role": "user", "content": "求解 x=1"}]
+    image_state = {"path": "question.png", "fresh": True}
+
+    result = chat_service.route_image_for_turn(
+        message="求解 x=1",
+        history=history,
+        image_state=image_state,
+        previous_stage="summary",
+        supports_vision=True,
+        force_continue=False,
+        attach_image=True,
+        image_note="[附图]",
+    )
+
+    assert result["image_data_url"] == "data:image/jpeg;base64,TEST"
+    assert result["history"] == [
+        {"role": "user", "content": "求解 x=1\n[附图]"}
+    ]
+    assert result["image_state"] == {"path": "question.png", "fresh": False}
+    assert result["image_status"] == ""
+    assert result["reject_message"] is None
+    assert history == [{"role": "user", "content": "求解 x=1"}]  # 不改原历史
+    assert image_state == {"path": "question.png", "fresh": True}
+
+
+def test_route_image_clears_old_image_for_new_problem(monkeypatch):
+    def should_not_read_image(path):
+        raise AssertionError("旧图不应该被读取")
+
+    monkeypatch.setattr(chat_service, "image_to_data_url", should_not_read_image)
+    history = [{"role": "user", "content": "求解 x=1"}]
+
+    result = chat_service.route_image_for_turn(
+        message="求解 x=1",
+        history=history,
+        image_state={"path": "old.png", "fresh": False},
+        previous_stage="summary",
+        supports_vision=True,
+        force_continue=False,
+        attach_image=True,
+        image_note="[附图]",
+    )
+
+    assert result["history"] == history
+    assert result["image_data_url"] is None
+    assert result["image_state"] == {"path": None, "fresh": False}
+    assert result["reject_message"] is None
+
+
+def test_route_image_rejects_text_client_and_keeps_pending_image():
+    history = [{"role": "user", "content": "这道题怎么做"}]
+    image_state = {"path": "question.png", "fresh": True}
+
+    result = chat_service.route_image_for_turn(
+        message="这道题怎么做",
+        history=history,
+        image_state=image_state,
+        previous_stage="initial_hint",
+        supports_vision=False,
+        force_continue=False,
+        attach_image=True,
+        image_note="[附图]",
+    )
+
+    assert "不支持图片输入" in result["reject_message"]
+    assert result["image_data_url"] is None
+    assert result["image_state"] == image_state
+    assert result["history"] == history
+
+
+def test_route_image_read_failure_falls_back_to_text(monkeypatch):
+    def fail_to_read(path):
+        raise ValueError("文件损坏")
+
+    monkeypatch.setattr(chat_service, "image_to_data_url", fail_to_read)
+    history = [{"role": "user", "content": "这道题怎么做"}]
+
+    result = chat_service.route_image_for_turn(
+        message="这道题怎么做",
+        history=history,
+        image_state={"path": "broken.png", "fresh": True},
+        previous_stage="initial_hint",
+        supports_vision=True,
+        force_continue=False,
+        attach_image=True,
+        image_note="[附图]",
+    )
+
+    assert result["image_data_url"] is None
+    assert result["history"] == history
+    assert result["image_state"] == {"path": None, "fresh": False}
+    assert "图片读取失败" in result["image_status"]
+    assert "已按纯文本发送" in result["image_status"]
+    assert result["reject_message"] is None  # 提示错误，但仍允许发文字
+
+
+def test_route_image_skips_attachment_for_continue_or_text_only(monkeypatch):
+    def should_not_read_image(path):
+        raise AssertionError("本轮不应该读取图片")
+
+    monkeypatch.setattr(chat_service, "image_to_data_url", should_not_read_image)
+    history = [{"role": "user", "content": "求解 x=1"}]
+    image_state = {"path": "question.png", "fresh": True}
+
+    for force_continue, attach_image in [(True, True), (False, False)]:
+        result = chat_service.route_image_for_turn(
+            message="求解 x=1",
+            history=history,
+            image_state=image_state,
+            previous_stage="summary",
+            supports_vision=True,
+            force_continue=force_continue,
+            attach_image=attach_image,
+            image_note="[附图]",
+        )
+
+        assert result["history"] == history
+        assert result["image_data_url"] is None
+        assert result["image_state"] == image_state
+        assert result["reject_message"] is None

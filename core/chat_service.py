@@ -1,6 +1,7 @@
 
 from core import message_builder
-
+from core import dialogue_state
+from core.vision_client import image_to_data_url
 
 def build_continue_message(history: list[dict], image_note: str) -> str | None:
     """根据最近一条用户消息，生成继续回答的指令。"""
@@ -83,3 +84,64 @@ def stream_reply(
             "usage": usage,
             "truncated": truncated,
         }
+
+
+def route_image_for_turn(
+    message: str,
+    history: list[dict],
+    image_state: dict,
+    previous_stage: str | None,
+    supports_vision: bool,
+    force_continue: bool,
+    attach_image: bool,
+    image_note: str,
+) -> dict:
+    """决定本轮是否附图，并返回更新后的历史、图片状态和提示。"""
+    new_history = list(history)
+    new_image_state = dict(image_state)
+    image_data_url = None
+    image_status = ""
+    reject_message = None
+
+    image_path = image_state.get("path")
+    fresh_image = bool(image_state.get("fresh"))
+
+    if image_path and not force_continue and attach_image:
+        looks_like_new = dialogue_state.looks_like_new_problem(message)
+        stale_image = (
+            previous_stage in ("summary", "full_solution", "grading")
+            or previous_stage is None
+        ) and looks_like_new
+
+        if stale_image and not fresh_image:
+            # 上一题留下的旧图，不带到新题中
+            new_image_state = {"path": None, "fresh": False}
+
+        elif supports_vision:
+            try:
+                image_data_url = image_to_data_url(image_path)
+            except Exception as exc:
+                # 读图失败仍继续发送文字
+                image_status = f"⚠️ 图片读取失败（{exc}），已按纯文本发送。"
+                new_image_state = {"path": None, "fresh": False}
+            else:
+                new_image_state = {"path": image_path, "fresh": False}
+                new_history[-1] = {
+                    "role": "user",
+                    "content": f"{new_history[-1]['content']}\n{image_note}",
+                }
+
+        else:
+            # 模型不支持看图：拒绝本轮请求，保留待发图片
+            reject_message = (
+                "⚠️ 当前服务商不支持图片输入，"
+                "请切换到支持原生视觉的服务商后重试。"
+            )
+
+    return {
+        "history": new_history,
+        "image_data_url": image_data_url,
+        "image_state": new_image_state,
+        "image_status": image_status,
+        "reject_message": reject_message,
+    }
