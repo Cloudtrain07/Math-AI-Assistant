@@ -323,46 +323,42 @@ def respond(
 
     #承接以前的会话历史记录，并且排除只输入空格的情况
     history = list(history or [])       #这是为了承接以前的历史记录，[]是为了防止history为None时报错
-    stage_state = dict(stage_state or dialogue_state.new_stage_state())       #同上
-    stage_state.setdefault("stage", None)   #引导阶段
-    stage_state.setdefault("hints", 0)     #提示次数
-    stage_state.setdefault("last_mode", MODE_INTERACTIVE)    #最近一次使用的模式
-    if mode == MODE_INTERACTIVE and stage_state.get("stage") not in (
-        "initial_hint",
-        "targeted_hint",
-        "full_solution",
-        "summary",
-        "grading",
-        "practice_wait",
-        "practice_grade",
-    ):
-        stage_state["stage"] = "initial_hint"
+    stage_state = dialogue_state.prepare_stage_state(mode, stage_state)
+    #图片状态
     image_state = dict(image_state or _new_image_state())
     image_state.setdefault("path", None)
     image_state.setdefault("fresh", False)
     has_pending_image = bool(image_state.get("path")) and not force_continue
-    if not message.strip():   #strip()的作用是为了去掉前后空格，防止用户输入空格
-        if not has_pending_image:
-            yield (              #yield是一个生成器语法，可以暂停函数的执行并返回一个值，下次调用时从暂停的地方继续执行
-                history,
-                "",
-                "💡 请先输入问题，或上传题目图片后直接发送。",
-                "",
-                usage_state,
-                stage_state,
-                "",
-                image_state,
-            )
-            return
-        # 只传图不打字：自动按看图解题发送
-        message = _IMAGE_ONLY_PROMPT
+    input_result = chat_service.prepare_user_message(
+        message=message,
+        has_pending_image=has_pending_image,
+        max_message_len=MAX_MESSAGE_LEN,
+        image_only_prompt=_IMAGE_ONLY_PROMPT,
+    )
+    message = input_result["message"]
 
-    #长度检查
+    if input_result["error"] == "empty":
+        yield (
+            history,
+            "",
+            "💡 请先输入问题，或上传题目图片后直接发送。",
+            "",
+            usage_state,
+            stage_state,
+            "",
+            image_state,
+        )
+        return
+
     username = request.username if request and request.username else "unknown"
     ip = (request.client.host if request and request.client else None) or "unknown"
-    if len(message) > MAX_MESSAGE_LEN:
+
+    if input_result["error"] == "too_long":
         log_access_event(
-            "过长拒绝", f"账号={username}", f"IP={ip}", f"长度={len(message)}"
+            "过长拒绝",
+            f"账号={username}",
+            f"IP={ip}",
+            f"长度={len(message)}",
         )
         yield (
             history,

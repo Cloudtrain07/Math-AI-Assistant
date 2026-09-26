@@ -199,3 +199,24 @@ def advance_stage(
         "last_mode": mode,
         "mode_changed": False,
     }
+
+
+def prepare_stage_state(mode: str, current: dict | None) -> dict:
+    """补齐阶段状态，并修正互动模式下不合法的阶段值。"""
+    result = dict(current or new_stage_state())
+    result.setdefault("stage", None)
+    result.setdefault("hints", 0)
+    result.setdefault("last_mode", MODE_INTERACTIVE)
+
+    if mode == MODE_INTERACTIVE and result.get("stage") not in (
+        "initial_hint",
+        "targeted_hint",
+        "full_solution",
+        "summary",
+        "grading",
+        "practice_wait",
+        "practice_grade",
+    ):
+        result["stage"] = "initial_hint"
+
+    return result

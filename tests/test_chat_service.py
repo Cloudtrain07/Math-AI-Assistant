@@ -276,3 +276,79 @@ def test_route_image_skips_attachment_for_continue_or_text_only(monkeypatch):
         assert result["image_data_url"] is None
         assert result["image_state"] == image_state
         assert result["reject_message"] is None
+
+
+def test_prepare_user_message_preserves_normal_text():
+    result = chat_service.prepare_user_message(
+        message="  这道题怎么做？  ",
+        has_pending_image=False,
+        max_message_len=100,
+        image_only_prompt="请解答图中的题目。",
+    )
+
+    assert result == {
+        "message": "  这道题怎么做？  ",
+        "error": None,
+    }
+
+
+def test_prepare_user_message_rejects_blank_without_image():
+    for message in ["", "   ", "\n\t"]:
+        result = chat_service.prepare_user_message(
+            message=message,
+            has_pending_image=False,
+            max_message_len=100,
+            image_only_prompt="请解答图中的题目。",
+        )
+
+        assert result == {"message": message, "error": "empty"}
+
+
+def test_prepare_user_message_uses_prompt_for_image_only():
+    result = chat_service.prepare_user_message(
+        message="   ",
+        has_pending_image=True,
+        max_message_len=100,
+        image_only_prompt="请解答图中的题目。",
+    )
+
+    assert result == {
+        "message": "请解答图中的题目。",
+        "error": None,
+    }
+
+
+def test_prepare_user_message_accepts_exact_length_limit():
+    result = chat_service.prepare_user_message(
+        message="12345",
+        has_pending_image=False,
+        max_message_len=5,
+        image_only_prompt="请解答图中的题目。",
+    )
+
+    assert result == {"message": "12345", "error": None}
+
+
+def test_prepare_user_message_rejects_overlong_text():
+    result = chat_service.prepare_user_message(
+        message="123456",
+        has_pending_image=False,
+        max_message_len=5,
+        image_only_prompt="请解答图中的题目。",
+    )
+
+    assert result == {"message": "123456", "error": "too_long"}
+
+
+def test_prepare_user_message_checks_generated_prompt_length():
+    result = chat_service.prepare_user_message(
+        message="",
+        has_pending_image=True,
+        max_message_len=5,
+        image_only_prompt="请解答图中的题目。",
+    )
+
+    assert result == {
+        "message": "请解答图中的题目。",
+        "error": "too_long",
+    }

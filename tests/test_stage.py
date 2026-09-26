@@ -3,6 +3,7 @@
 
 import sys
 from pathlib import Path
+from core import dialogue_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -121,3 +122,78 @@ def test_force_continue_clears_non_interactive_stage():
     assert result["last_mode"] == "解答模式"
     assert result["mode_changed"] is False
     assert current == original
+
+
+def test_prepare_stage_state_creates_defaults():
+    result = dialogue_state.prepare_stage_state(
+        mode=dialogue_state.MODE_INTERACTIVE,
+        current=None,
+    )
+
+    assert result == {
+        "stage": "initial_hint",
+        "hints": 0,
+        "last_mode": dialogue_state.MODE_INTERACTIVE,
+    }
+
+
+def test_prepare_stage_state_fills_missing_keys():
+    result = dialogue_state.prepare_stage_state(
+        mode=dialogue_state.MODE_INTERACTIVE,
+        current={"hints": 2},
+    )
+
+    assert result == {
+        "stage": "initial_hint",
+        "hints": 2,
+        "last_mode": dialogue_state.MODE_INTERACTIVE,
+    }
+
+
+def test_prepare_stage_state_preserves_valid_state_without_mutation():
+    current = {
+        "stage": "targeted_hint",
+        "hints": 3,
+        "last_mode": dialogue_state.MODE_INTERACTIVE,
+        "extra": "保留其他字段",
+    }
+    original = dict(current)
+
+    result = dialogue_state.prepare_stage_state(
+        mode=dialogue_state.MODE_INTERACTIVE,
+        current=current,
+    )
+
+    assert result == original
+    assert current == original
+    assert result is not current
+
+
+def test_prepare_stage_state_repairs_invalid_interactive_stage():
+    for stage in [None, "initial_hnit", "abc"]:
+        current = {"stage": stage}
+        result = dialogue_state.prepare_stage_state(
+            mode=dialogue_state.MODE_INTERACTIVE,
+            current=current,
+        )
+
+        assert result["stage"] == "initial_hint"
+        assert current["stage"] == stage  # 原字典没有被修改
+
+
+def test_prepare_stage_state_does_not_repair_stage_in_answer_mode():
+    current = {
+        "stage": "abc",
+        "hints": None,
+        "last_mode": None,
+    }
+
+    result = dialogue_state.prepare_stage_state(
+        mode="解答模式",
+        current=current,
+    )
+
+    # 非互动模式不在这里修正阶段；
+    # 已存在的键即使值是 None，也不会被 setdefault 覆盖。
+    assert result == current
+    assert result is not current

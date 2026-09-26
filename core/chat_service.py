@@ -145,3 +145,21 @@ def route_image_for_turn(
         "image_status": image_status,
         "reject_message": reject_message,
     }
+
+
+def prepare_user_message(
+    message: str,
+    has_pending_image: bool,
+    max_message_len: int,
+    image_only_prompt: str,
+) -> dict:
+    """准备本轮提问文字，返回文字和拒绝原因。"""
+    if not message.strip():
+        if not has_pending_image:
+            return {"message": message, "error": "empty"}
+        message = image_only_prompt
+
+    if len(message) > max_message_len:
+        return {"message": message, "error": "too_long"}
+
+    return {"message": message, "error": None}
