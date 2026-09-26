@@ -457,3 +457,57 @@ def test_continue_last_answer_no_history():
         )
     )
     assert "还没有可继续" in results[-1][2]
+
+
+def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
+    class EmptyAnswerUsage:
+        total_tokens = 123
+        prompt_tokens = 100
+        completion_tokens = 23
+
+    class EmptyAnswerClient:
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            yield None, "正在分析题目", None, None
+            yield None, None, EmptyAnswerUsage(), "length"
+
+    monkeypatch.setattr(app_module, "client", EmptyAnswerClient())
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_log_empty_reply", lambda **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            True,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    assert final_history[-1]["content"] == "（未收到正式回答）"
+    assert "没能生成正式回答" in status
+    assert state["turns"] == 1
+    assert state["prompt_tokens"] == 100
+    assert state["completion_tokens"] == 23
+    assert state["total_tokens"] == 123
+
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
+    assert usage_module.get_daily_total(today, path=usage_path) == 123

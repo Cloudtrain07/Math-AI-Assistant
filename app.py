@@ -577,15 +577,19 @@ def respond(
         return
 
     if not answer:
+        turn_total = (
+            int(getattr(usage, "total_tokens", 0) or 0)
+            if usage is not None
+            else None
+        )
         usage_state = record_usage(
             usage_state,
-            None,
+            turn_total,
             prompt_tokens=_usage_part(usage, "prompt_tokens"),
             completion_tokens=_usage_part(usage, "completion_tokens"),
         )
-        turn_total = (
-            int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None
-        )
+        if turn_total is not None:
+            daily_used = add_daily_usage(today, username, turn_total)
         _log_empty_reply(
             account=username, turn_total=turn_total, truncated=truncated
         )
