@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.usage import get_usage_total, get_usage_part
 from core.usage import (
     add_daily_login,
     add_daily_question,
@@ -191,3 +192,74 @@ def test_atomic_write_no_tmp_left(tmp_path):
     add_daily_usage("2026-08-05", "1.1.1.1", 5, path=path)
     assert path.exists()
     assert not (tmp_path / "u.json.tmp").exists()
+
+
+def test_get_usage_total_without_usage_returns_none():
+    assert get_usage_total(None) is None
+
+
+def test_get_usage_total_reads_integer_or_numeric_string():
+    class Usage:
+        total_tokens = 123
+
+    usage = Usage()
+    assert get_usage_total(usage) == 123
+
+    usage.total_tokens = "456"
+    assert get_usage_total(usage) == 456
+
+
+def test_get_usage_total_missing_or_none_returns_zero():
+    class Usage:
+        pass
+
+    usage = Usage()
+    assert get_usage_total(usage) == 0
+
+    usage.total_tokens = None
+    assert get_usage_total(usage) == 0
+
+
+def test_get_usage_total_invalid_value_keeps_raising():
+    import pytest
+
+    class Usage:
+        total_tokens = "不是数字"
+
+    with pytest.raises(ValueError):
+        get_usage_total(Usage())
+
+
+def test_get_usage_part_reads_requested_field():
+    class Usage:
+        prompt_tokens = "100"
+        completion_tokens = 23
+
+    usage = Usage()
+    assert get_usage_part(usage, "prompt_tokens") == 100
+    assert get_usage_part(usage, "completion_tokens") == 23
+
+
+def test_get_usage_part_missing_or_none_returns_none():
+    class Usage:
+        prompt_tokens = None
+
+    assert get_usage_part(None, "prompt_tokens") is None
+    assert get_usage_part(Usage(), "prompt_tokens") is None
+    assert get_usage_part(Usage(), "completion_tokens") is None
+
+
+def test_get_usage_part_invalid_value_returns_none():
+    class Usage:
+        prompt_tokens = "不是数字"
+        completion_tokens = object()
+
+    assert get_usage_part(Usage(), "prompt_tokens") is None
+    assert get_usage_part(Usage(), "completion_tokens") is None
+
+
+def test_get_usage_part_zero_is_preserved():
+    class Usage:
+        prompt_tokens = 0
+
+    assert get_usage_part(Usage(), "prompt_tokens") == 0

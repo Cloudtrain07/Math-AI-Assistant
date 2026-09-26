@@ -23,6 +23,28 @@ def new_usage_state() -> dict:
     return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
 
 
+def get_usage_total(usage) -> int | None:
+    """读取总用量；没有 usage 时返回 None，缺失总量时按 0 处理。"""
+    if usage is None:
+        return None
+    return int(getattr(usage, "total_tokens", 0) or 0)
+
+
+def get_usage_part(usage, attr: str) -> int | None:
+    """读取用量细分字段；字段缺失或无法转换时返回 None。"""
+    if usage is None:
+        return None
+
+    value = getattr(usage, attr, None)
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def record_usage(
     state: dict,
     turn_total: int | None,

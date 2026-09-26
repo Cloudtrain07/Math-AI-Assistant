@@ -58,6 +58,8 @@ from core.usage import (
     get_daily_total,
     new_usage_state,
     record_usage,
+    get_usage_total,
+    get_usage_part,
 )
 from core import dialogue_state
 from core import chat_service 
@@ -128,19 +130,6 @@ def _new_image_state() -> dict:
 IMAGE_NOTE = "📷（已附题目图片）"
 # 只传图不打字时自动使用的提问语
 _IMAGE_ONLY_PROMPT = "请解答图中的题目。"
-
-
-def _usage_part(usage, attr: str) -> int | None:
-    """安全读取 API usage 对象的细分字段；缺失时返回 None（不累计）。"""
-    if usage is None:
-        return None
-    value = getattr(usage, attr, None)
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def format_usage(usage) -> str:
@@ -529,10 +518,8 @@ def respond(
                 )
     # 流式输出结束，由下面的逻辑继续处理最终结果
     except Exception as exc:
-        turn_total = None
-        if usage is not None:
-            turn_total = int(getattr(usage, "total_tokens", 0) or 0)
-        elif answer:
+        turn_total = get_usage_total(usage)
+        if usage is None and answer:
             turn_total = estimate_tokens(answer)
         _log_error(
             exc, account=username, turn_total=turn_total, partial=bool(answer)
@@ -540,8 +527,8 @@ def respond(
         usage_state = record_usage(
             usage_state,
             turn_total,
-            prompt_tokens=_usage_part(usage, "prompt_tokens"),
-            completion_tokens=_usage_part(usage, "completion_tokens"),
+            prompt_tokens=get_usage_part(usage, "prompt_tokens"),
+            completion_tokens=get_usage_part(usage, "completion_tokens"),
         )
         if turn_total is not None:
             daily_used = add_daily_usage(today, username, turn_total)
@@ -577,16 +564,12 @@ def respond(
         return
 
     if not answer:
-        turn_total = (
-            int(getattr(usage, "total_tokens", 0) or 0)
-            if usage is not None
-            else None
-        )
+        turn_total = get_usage_total(usage)
         usage_state = record_usage(
             usage_state,
             turn_total,
-            prompt_tokens=_usage_part(usage, "prompt_tokens"),
-            completion_tokens=_usage_part(usage, "completion_tokens"),
+            prompt_tokens=get_usage_part(usage, "prompt_tokens"),
+            completion_tokens=get_usage_part(usage, "completion_tokens"),
         )
         if turn_total is not None:
             daily_used = add_daily_usage(today, username, turn_total)
@@ -626,8 +609,8 @@ def respond(
     usage_state = record_usage(
         usage_state,
         turn_total,
-        prompt_tokens=_usage_part(usage, "prompt_tokens"),
-        completion_tokens=_usage_part(usage, "completion_tokens"),
+        prompt_tokens=get_usage_part(usage, "prompt_tokens"),
+        completion_tokens=get_usage_part(usage, "completion_tokens"),
     )
     if turn_total is not None:
         daily_used = add_daily_usage(today, username, turn_total)
