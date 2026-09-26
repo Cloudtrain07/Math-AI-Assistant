@@ -603,9 +603,7 @@ def respond(
     display = normalize_math_text(answer, auto_close=True)
     final_history = history + [{"role": "assistant", "content": display}]
     save_history(final_history, username=username)
-    turn_total = (
-        int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None
-    )
+    turn_total = get_usage_total(usage)
     usage_state = record_usage(
         usage_state,
         turn_total,

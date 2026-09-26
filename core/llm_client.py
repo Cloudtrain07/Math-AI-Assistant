@@ -118,8 +118,12 @@ class LLMClient:
                         yield None, delta.reasoning_content, None, None
                     elif delta.content:
                         yield delta.content, None, None, None
-                if getattr(chunk, "usage", None) is not None:
-                    yield None, None, chunk.usage, finish_reason
+                    chunk_usage = getattr(chunk, "usage", None)
+                chunk_finish_reason = (
+                    chunk.choices[0].finish_reason if chunk.choices else None
+                )
+                if chunk_usage is not None or chunk_finish_reason:
+                    yield None, None, chunk_usage, finish_reason
                 if now - last_heartbeat >= 1.0:
                     last_heartbeat = now
                     yield None, None, None, None
