@@ -511,3 +511,269 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
     today = __import__("datetime").date.today().isoformat()
     assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
     assert usage_module.get_daily_total(today, path=usage_path) == 123
+
+
+# 没有返回usage，但是输出部分回复
+def test_respond_stream_error_keeps_partial_and_estimates_usage(
+    monkeypatch, tmp_path
+):
+    partial_answer = "已经生成的部分回答"
+    saved_histories = []
+    logged_errors = []
+
+    class InterruptedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            self.calls += 1
+            yield partial_answer, None, None, None
+            raise RuntimeError("模拟流式中断")
+
+    fake_client = InterruptedClient()
+
+    def capture_history(history, username=None):
+        saved_histories.append(
+            ([dict(message) for message in history], username)
+        )
+
+    def capture_error(exc, **details):
+        logged_errors.append((exc, details))
+
+    monkeypatch.setattr(app_module, "client", fake_client)
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(app_module, "save_history", capture_history)
+    monkeypatch.setattr(app_module, "_log_error", capture_error)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+
+    final_history, _, status, _, state, _, _, _ = results[-1]
+    expected_tokens = usage_module.estimate_tokens(partial_answer)
+
+    # 中断前的回答仍然出现在最终历史中，并保存一次。
+    assert final_history == [
+        {"role": "user", "content": "1+1=?"},
+        {"role": "assistant", "content": partial_answer},
+    ]
+    assert saved_histories == [(final_history, "user1")]
+    assert "已保留生成的部分内容" in status
+
+    # 没收到模型用量时，只估算部分回答的总用量。
+    assert state["total_tokens"] == expected_tokens
+    assert state["prompt_tokens"] == 0
+    assert state["completion_tokens"] == 0
+    assert state["turns"] == 1
+
+    # 账号和全局每日用量都只增加一次。
+    today = __import__("datetime").date.today().isoformat()
+    assert (
+        usage_module.get_daily_used(today, "user1", path=usage_path)
+        == expected_tokens
+    )
+    assert (
+        usage_module.get_daily_total(today, path=usage_path)
+        == expected_tokens
+    )
+
+    # 确认走了异常分支，没有重新调用模型。
+    assert fake_client.calls == 1
+    assert len(logged_errors) == 1
+    exc, details = logged_errors[0]
+    assert isinstance(exc, RuntimeError)
+    assert details["partial"] is True
+    assert details["turn_total"] == expected_tokens
+
+
+# 成功返回usage,随后流式中断
+def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
+    partial_answer = "已经生成的部分回答"
+    saved_histories = []
+
+    class ReceivedUsage:
+        total_tokens = 123
+        prompt_tokens = 100
+        completion_tokens = 23
+
+    class InterruptedClient:
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            yield partial_answer, None, None, None
+            yield None, None, ReceivedUsage(), None
+            raise RuntimeError("收到用量后模拟中断")
+
+    def capture_history(history, username=None):
+        saved_histories.append(
+            ([dict(message) for message in history], username)
+        )
+
+    def unexpected_estimate(text):
+        raise AssertionError("已有模型用量，不应该再估算")
+
+    monkeypatch.setattr(app_module, "client", InterruptedClient())
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(app_module, "save_history", capture_history)
+    monkeypatch.setattr(
+        app_module.chat_service,
+        "estimate_tokens",
+        unexpected_estimate,
+    )
+    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    assert final_history[-1] == {
+        "role": "assistant",
+        "content": partial_answer,
+    }
+    assert saved_histories == [(final_history, "user1")]
+    assert "已保留生成的部分内容" in status
+
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    assert state["prompt_tokens"] == 100
+    assert state["completion_tokens"] == 23
+
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_module.get_daily_used(
+        today, "user1", path=usage_path
+    ) == 123
+    assert usage_module.get_daily_total(
+        today, path=usage_path
+    ) == 123
+
+
+# 没有输出正式回复，也没有返回usage就报错了
+def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
+    saved_histories = []
+    daily_usage_calls = []
+    logged_errors = []
+
+    class FailedClient:
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            yield None, "正在分析题目", None, None
+            raise RuntimeError("正式回答前模拟中断")
+
+    monkeypatch.setattr(app_module, "client", FailedClient())
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(
+        app_module,
+        "save_history",
+        lambda *a, **k: saved_histories.append((a, k)),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_log_error",
+        lambda exc, **details: logged_errors.append((exc, details)),
+    )
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    # 这个场景不应该增加每日 token 用量。
+    monkeypatch.setattr(
+        app_module,
+        "add_daily_usage",
+        lambda *a, **k: daily_usage_calls.append((a, k)),
+    )
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+
+    final_history, _, status, _, state, _, reasoning, _ = results[-1]
+
+    assert final_history == [
+        {"role": "user", "content": "1+1=?"},
+    ]
+    assert saved_histories == []
+    assert daily_usage_calls == []
+    assert status
+    assert "已保留生成的部分内容" not in status
+    assert reasoning == "正在分析题目"
+
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 0
+    assert state["prompt_tokens"] == 0
+    assert state["completion_tokens"] == 0
+
+    assert len(logged_errors) == 1
+    exc, details = logged_errors[0]
+    assert isinstance(exc, RuntimeError)
+    assert details["partial"] is False
+    assert details["turn_total"] is None
+
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_module.get_daily_used(
+        today, "user1", path=usage_path
+    ) == 0
+    assert usage_module.get_daily_total(
+        today, path=usage_path
+    ) == 0

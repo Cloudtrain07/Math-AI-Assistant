@@ -57,9 +57,6 @@ from core.usage import (
     get_daily_questions,
     get_daily_total,
     new_usage_state,
-    record_usage,
-    get_usage_total,
-    get_usage_part,
 )
 from core import dialogue_state
 from core import chat_service 
@@ -516,19 +513,16 @@ def respond(
                     normalize_math_text(reasoning_text, auto_close=True),
                     new_image_state,
                 )
-    # 流式输出结束，由下面的逻辑继续处理最终结果
+    # 流式输出结束，由下面的逻辑继续处理报错
     except Exception as exc:
-        turn_total = get_usage_total(usage)
-        if usage is None and answer:
-            turn_total = estimate_tokens(answer)
+        turn_total, usage_state = chat_service.settle_reply_usage(
+            usage_state,
+            usage,
+            answer,
+            interrupted=True,
+        )
         _log_error(
             exc, account=username, turn_total=turn_total, partial=bool(answer)
-        )
-        usage_state = record_usage(
-            usage_state,
-            turn_total,
-            prompt_tokens=get_usage_part(usage, "prompt_tokens"),
-            completion_tokens=get_usage_part(usage, "completion_tokens"),
         )
         if turn_total is not None:
             daily_used = add_daily_usage(today, username, turn_total)
@@ -564,12 +558,10 @@ def respond(
         return
 
     if not answer:
-        turn_total = get_usage_total(usage)
-        usage_state = record_usage(
+        turn_total, usage_state = chat_service.settle_reply_usage(
             usage_state,
-            turn_total,
-            prompt_tokens=get_usage_part(usage, "prompt_tokens"),
-            completion_tokens=get_usage_part(usage, "completion_tokens"),
+            usage,
+            answer,
         )
         if turn_total is not None:
             daily_used = add_daily_usage(today, username, turn_total)
@@ -603,12 +595,10 @@ def respond(
     display = normalize_math_text(answer, auto_close=True)
     final_history = history + [{"role": "assistant", "content": display}]
     save_history(final_history, username=username)
-    turn_total = get_usage_total(usage)
-    usage_state = record_usage(
+    turn_total, usage_state = chat_service.settle_reply_usage(
         usage_state,
-        turn_total,
-        prompt_tokens=get_usage_part(usage, "prompt_tokens"),
-        completion_tokens=get_usage_part(usage, "completion_tokens"),
+        usage,
+        answer,
     )
     if turn_total is not None:
         daily_used = add_daily_usage(today, username, turn_total)

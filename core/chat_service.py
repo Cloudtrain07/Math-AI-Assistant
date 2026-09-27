@@ -2,6 +2,12 @@
 from core import message_builder
 from core import dialogue_state
 from core.vision_client import image_to_data_url
+from core.usage import (
+    estimate_tokens,
+    get_usage_part,
+    get_usage_total,
+    record_usage,
+)
 
 def build_continue_message(history: list[dict], image_note: str) -> str | None:
     """根据最近一条用户消息，生成继续回答的指令。"""
@@ -163,3 +169,27 @@ def prepare_user_message(
         return {"message": message, "error": "too_long"}
 
     return {"message": message, "error": None}
+
+
+def settle_reply_usage(
+    usage_state: dict,
+    usage,
+    answer: str,
+    *,
+    interrupted: bool = False,
+) -> tuple[int | None, dict]:
+    """结算本轮用量，不负责文件保存或界面输出。"""
+    turn_total = get_usage_total(usage)
+
+    # 只有异常中断、没有模型用量但已有回答时，才估算。
+    if interrupted and usage is None and answer:
+        turn_total = estimate_tokens(answer)
+
+    new_usage_state = record_usage(
+        usage_state,
+        turn_total,
+        prompt_tokens=get_usage_part(usage, "prompt_tokens"),
+        completion_tokens=get_usage_part(usage, "completion_tokens"),
+    )
+
+    return turn_total, new_usage_state

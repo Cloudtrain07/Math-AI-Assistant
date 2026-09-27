@@ -352,3 +352,148 @@ def test_prepare_user_message_checks_generated_prompt_length():
         "message": "请解答图中的题目。",
         "error": "too_long",
     }
+
+
+# 检查用量，分别为真实用量、异常估算、正常结束不估算、空回答不估算、零用量有效、原状态不被修改
+def test_settle_reply_usage_uses_model_usage():
+    from core.chat_service import settle_reply_usage
+
+    class Usage:
+        total_tokens = 123
+        prompt_tokens = 100
+        completion_tokens = 23
+
+    turn_total, state = settle_reply_usage(
+        {
+            "total_tokens": 10,
+            "prompt_tokens": 6,
+            "completion_tokens": 4,
+            "turns": 2,
+        },
+        Usage(),
+        "部分回答",
+        interrupted=True,
+    )
+
+    assert turn_total == 123
+    assert state == {
+        "total_tokens": 133,
+        "prompt_tokens": 106,
+        "completion_tokens": 27,
+        "turns": 3,
+    }
+
+
+def test_settle_reply_usage_estimates_interrupted_answer():
+    from core.chat_service import settle_reply_usage
+    from core.usage import estimate_tokens, new_usage_state
+
+    answer = "已经生成的部分回答"
+    turn_total, state = settle_reply_usage(
+        new_usage_state(),
+        None,
+        answer,
+        interrupted=True,
+    )
+
+    assert turn_total == estimate_tokens(answer)
+    assert state == {
+        "total_tokens": turn_total,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "turns": 1,
+    }
+
+
+def test_settle_reply_usage_does_not_estimate_normal_reply():
+    from core.chat_service import settle_reply_usage
+    from core.usage import new_usage_state
+
+    turn_total, state = settle_reply_usage(
+        new_usage_state(),
+        None,
+        "正常结束的回答",
+    )
+
+    assert turn_total is None
+    assert state == {
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "turns": 1,
+    }
+
+
+def test_settle_reply_usage_does_not_estimate_empty_answer():
+    from core.chat_service import settle_reply_usage
+    from core.usage import new_usage_state
+
+    turn_total, state = settle_reply_usage(
+        new_usage_state(),
+        None,
+        "",
+        interrupted=True,
+    )
+
+    assert turn_total is None
+    assert state == {
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "turns": 1,
+    }
+
+
+def test_settle_reply_usage_keeps_zero_model_usage(monkeypatch):
+    from core import chat_service
+    from core.usage import new_usage_state
+
+    class ZeroUsage:
+        total_tokens = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+
+    def unexpected_estimate(text):
+        raise AssertionError("已有模型用量，不应该估算")
+
+    monkeypatch.setattr(
+        chat_service, "estimate_tokens", unexpected_estimate
+    )
+
+    turn_total, state = chat_service.settle_reply_usage(
+        new_usage_state(),
+        ZeroUsage(),
+        "部分回答",
+        interrupted=True,
+    )
+
+    assert turn_total == 0
+    assert state == {
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "turns": 1,
+    }
+
+
+def test_settle_reply_usage_does_not_modify_original_state():
+    from core.chat_service import settle_reply_usage
+
+    original = {
+        "total_tokens": 10,
+        "prompt_tokens": 6,
+        "completion_tokens": 4,
+        "turns": 2,
+    }
+    snapshot = original.copy()
+
+    _, updated = settle_reply_usage(
+        original,
+        None,
+        "部分回答",
+        interrupted=True,
+    )
+
+    assert original == snapshot
+    assert updated is not original
+    assert updated["turns"] == 3
