@@ -1,6 +1,7 @@
 
 from core import message_builder
 from core import dialogue_state
+from core.math_format import normalize_math_text
 from core.vision_client import image_to_data_url
 from core.usage import (
     estimate_tokens,
@@ -193,3 +194,12 @@ def settle_reply_usage(
     )
 
     return turn_total, new_usage_state
+
+
+def build_answer_history(history: list[dict], answer: str) -> list[dict] | None:
+    """为已生成的回答构建可保存的历史；空回答不构建历史。"""
+    if not answer:
+        return None
+
+    display = normalize_math_text(answer, auto_close=True)
+    return history + [{"role": "assistant", "content": display}]

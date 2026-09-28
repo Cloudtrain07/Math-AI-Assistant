@@ -513,7 +513,8 @@ def respond(
                     normalize_math_text(reasoning_text, auto_close=True),
                     new_image_state,
                 )
-    # 流式输出结束，由下面的逻辑继续处理报错
+    # 流式输出结束，接下来是处理回答
+    # 出现报错的回复情况
     except Exception as exc:
         turn_total, usage_state = chat_service.settle_reply_usage(
             usage_state,
@@ -537,9 +538,8 @@ def respond(
             log_access_event(
                 "回复失败", f"账号={username}", f"错误={exc.__class__.__name__}"
             )
-        if answer:
-            display = normalize_math_text(answer, auto_close=True)
-            partial_history = history + [{"role": "assistant", "content": display}]
+        partial_history = chat_service.build_answer_history(history, answer)
+        if partial_history is not None:
             save_history(partial_history, username=username)
             status_text = _friendly_error(exc) + "\n\n（已保留生成的部分内容）"
         else:
@@ -556,7 +556,7 @@ def respond(
             new_image_state,
         )
         return
-
+    # 没有正式生成回复的情况
     if not answer:
         turn_total, usage_state = chat_service.settle_reply_usage(
             usage_state,
@@ -590,10 +590,9 @@ def respond(
             new_image_state,
         )
         return
-
-    # 最终展示启用自动闭合：模型偶发漏写尾部 $$ 时补上，保证公式能渲染
-    display = normalize_math_text(answer, auto_close=True)
-    final_history = history + [{"role": "assistant", "content": display}]
+    # 正式生成回复的情况
+    final_history = chat_service.build_answer_history(history, answer)
+    assert final_history is not None  # 空回答已在上面的分支返回
     save_history(final_history, username=username)
     turn_total, usage_state = chat_service.settle_reply_usage(
         usage_state,
@@ -622,7 +621,6 @@ def respond(
         f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
     )
     reasoning_display = normalize_math_text(reasoning_text, auto_close=True)
-    # 输出最终答案
     yield (
         final_history,
         "",

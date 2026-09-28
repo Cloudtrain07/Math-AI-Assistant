@@ -497,3 +497,34 @@ def test_settle_reply_usage_does_not_modify_original_state():
     assert original == snapshot
     assert updated is not original
     assert updated["turns"] == 3
+
+
+def test_build_answer_history_adds_normal_reply_without_mutating_input():
+    from core.chat_service import build_answer_history
+
+    history = [{"role": "user", "content": "求解"}]
+    result = build_answer_history(history, "答案是 2")
+
+    assert result == [
+        {"role": "user", "content": "求解"},
+        {"role": "assistant", "content": "答案是 2"},
+    ]
+    assert result is not history
+    assert history == [{"role": "user", "content": "求解"}]
+
+
+def test_build_answer_history_closes_partial_formula():
+    from core.chat_service import build_answer_history
+
+    result = build_answer_history([], "结果为 $x^2+1")
+
+    assert result == [{"role": "assistant", "content": "结果为 $x^2+1$"}]
+
+
+def test_build_answer_history_skips_empty_reply():
+    from core.chat_service import build_answer_history
+
+    history = [{"role": "user", "content": "求解"}]
+
+    assert build_answer_history(history, "") is None
+    assert history == [{"role": "user", "content": "求解"}]

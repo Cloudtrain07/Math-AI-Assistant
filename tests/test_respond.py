@@ -78,8 +78,15 @@ def _wire_usage_to_tmp(monkeypatch, tmp_path):
 
 def test_respond_success_path(monkeypatch, tmp_path):
     fake_client = _FakeClient()
+    saved_histories = []
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    monkeypatch.setattr(
+        app_module,
+        "save_history",
+        lambda history, username=None: saved_histories.append(
+            ([dict(message) for message in history], username)
+        ),
+    )
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -106,6 +113,7 @@ def test_respond_success_path(monkeypatch, tmp_path):
     final_history, _, status_text, usage_text, usage_state, stage_state, _, _ = results[-1]
 
     assert final_history[-1]["content"] == "你好世界"
+    assert saved_histories == [(final_history, "user1")]
     assert usage_state == {"total_tokens": 123, "turns": 1}
     assert "123" in status_text
     assert "累计" in usage_text and "123" in usage_text
@@ -472,9 +480,14 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
             yield None, "正在分析题目", None, None
             yield None, None, EmptyAnswerUsage(), "length"
 
+    saved_histories = []
     monkeypatch.setattr(app_module, "client", EmptyAnswerClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    monkeypatch.setattr(
+        app_module,
+        "save_history",
+        lambda *a, **k: saved_histories.append((a, k)),
+    )
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "_log_empty_reply", lambda **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
@@ -502,6 +515,7 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
     final_history, _, status, _, state, _, _, _ = results[-1]
 
     assert final_history[-1]["content"] == "（未收到正式回答）"
+    assert saved_histories == []
     assert "没能生成正式回答" in status
     assert state["turns"] == 1
     assert state["prompt_tokens"] == 100
