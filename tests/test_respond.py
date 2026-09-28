@@ -4,6 +4,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
@@ -791,3 +793,79 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
     assert usage_module.get_daily_total(
         today, path=usage_path
     ) == 0
+
+
+@pytest.mark.parametrize("reports_usage", [True, False])
+def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
+    monkeypatch, tmp_path, reports_usage
+):
+    saved_histories = []
+    daily_usage_calls = []
+
+    class TruncatedClient:
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            yield "部分答案", None, None, None
+            yield None, None, _FakeUsage() if reports_usage else None, "length"
+
+    monkeypatch.setattr(app_module, "client", TruncatedClient())
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(
+        app_module,
+        "save_history",
+        lambda history, username=None: saved_histories.append(
+            ([dict(message) for message in history], username)
+        ),
+    )
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    def count_daily_usage(day, username, tokens):
+        daily_usage_calls.append(tokens)
+        return usage_module.add_daily_usage(
+            day, username, tokens, path=usage_path
+        )
+
+    monkeypatch.setattr(app_module, "add_daily_usage", count_daily_usage)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+
+    final_history, _, status, _, state, _, _, _ = results[-1]
+    assert final_history == [
+        {"role": "user", "content": "1+1=?"},
+        {"role": "assistant", "content": "部分答案"},
+    ]
+    assert saved_histories == [(final_history, "user1")]
+    assert "截断" in status and "继续" in status
+    if not reports_usage:
+        assert "0 tokens" not in status
+    assert state["turns"] == 1
+
+    today = __import__("datetime").date.today().isoformat()
+    expected_total = 123 if reports_usage else 0
+    assert state["total_tokens"] == expected_total
+    assert daily_usage_calls == ([123] if reports_usage else [])
+    assert usage_module.get_daily_used(
+        today, "user1", path=usage_path
+    ) == expected_total
+    assert usage_module.get_daily_total(today, path=usage_path) == expected_total
