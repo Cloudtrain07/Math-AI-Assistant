@@ -1375,3 +1375,46 @@ def test_respond_daily_recorded_but_global_refresh_fails(monkeypatch, tmp_path):
     # 日志区分两种失败
     assert any("全局统计刷新失败" in str(args) for args in logger.access_events)
     assert not any("每日用量记录失败" in str(args) for args in logger.access_events)
+
+
+def test_respond_no_client_preserves_startup_hint(monkeypatch):
+    import datetime
+
+    daily_store = CountingDailyUsageStore()
+    _logger, history_store = _patch_daily_env(
+        monkeypatch, daily_store, None
+    )
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(
+        app_module, "startup_hint", "测试：客户端未配置"
+    )
+
+    initial_state = usage_module.new_usage_state()
+    initial_state.update(total_tokens=10, turns=2)
+
+    (
+        final_history,
+        cleared_input,
+        status,
+        usage_text,
+        state,
+        stage,
+        reasoning,
+        image,
+    ) = _run_respond_once(usage_state=initial_state)
+
+    assert final_history == [
+        {"role": "user", "content": "1+1=?"},
+        {"role": "assistant", "content": "⚠️ 测试：客户端未配置"},
+    ]
+    assert cleared_input == status == usage_text == reasoning == ""
+    assert state == initial_state
+    assert stage["stage"] == "initial_hint"
+    assert image == {"path": None, "fresh": False}
+
+    assert history_store.save_attempts == 0
+    assert history_store.load("user1") == []
+    assert daily_store.add_usage_calls == []
+
+    today = datetime.date.today().isoformat()
+    assert daily_store.get_questions(today) == 1

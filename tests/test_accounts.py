@@ -101,3 +101,21 @@ def test_reset_password_rejects_empty(tmp_path):
     path = tmp_path / "accounts.json"
     ensure_accounts(1, path=path)
     assert not reset_password("user1", "   ", path=path)
+
+
+def test_default_account_path_is_isolated():
+    import core.accounts as accounts_module
+
+    real_data_dir = (
+        Path(accounts_module.__file__).resolve().parents[1] / "data"
+    )
+    account_file = accounts_module.ACCOUNTS_FILE.resolve()
+
+    # 必须先确认默认路径已隔离，再调用可能读写账号的函数。
+    assert not account_file.is_relative_to(real_data_dir.resolve())
+
+    accounts = accounts_module.ensure_accounts(1)
+
+    assert accounts
+    assert account_file.is_file()
+    assert accounts_module.load_accounts() == accounts

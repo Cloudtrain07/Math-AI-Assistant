@@ -4,7 +4,16 @@
 from core.chat_service import build_continue_message, prepare_api_messages,stream_reply
 import core.chat_service as chat_service
 from unittest.mock import Mock
-
+import pytest
+from conftest import (
+    CountingDailyUsageStore,
+    FailingDailyUsageStore,
+    FailingSaveStore,
+    MemoryEventLogger,
+    MemoryHistoryStore,
+)
+from core.usage_store import DailyUsageReadError
+from types import SimpleNamespace
 
 def test_uses_latest_user_message_and_removes_image_note():
     history = [
@@ -528,3 +537,667 @@ def test_build_answer_history_skips_empty_reply():
 
     assert build_answer_history(history, "") is None
     assert history == [{"role": "user", "content": "求解"}]
+
+
+@pytest.mark.parametrize(
+    "scenario, expected_daily, expected_global, expected_event",
+    [
+        ("recorded", 40, 40, None),
+        ("record_failed", None, None, "每日用量记录失败"),
+        ("stats_failed", 40, None, "全局统计刷新失败"),
+    ],
+)
+def test_record_daily_usage(
+    scenario, expected_daily, expected_global, expected_event
+):
+    class GlobalStatsFailStore(CountingDailyUsageStore):
+        def get_total(self, date):
+            raise DailyUsageReadError("模拟全局统计读取失败")
+
+    if scenario == "record_failed":
+        store = FailingDailyUsageStore()
+    elif scenario == "stats_failed":
+        store = GlobalStatsFailStore()
+    else:
+        store = CountingDailyUsageStore()
+
+    logger = MemoryEventLogger()
+    date = "2026-10-01"
+    username = "user1"
+
+    result = chat_service.record_daily_usage(
+        date=date,
+        username=username,
+        turn_total=40,
+        daily_usage_store=store,
+        event_logger=logger,
+    )
+
+    assert result == {
+        "daily_used": expected_daily,
+        "global_used": expected_global,
+        "status": scenario,
+    }
+    assert store.add_usage_calls == [(date, username, 40)]
+
+    stored_tokens = 0 if expected_daily is None else expected_daily
+    assert store.get_used(date, username) == stored_tokens
+
+    if expected_event is None:
+        assert logger.access_events == []
+    else:
+        assert len(logger.access_events) == 1
+        assert logger.access_events[0][0] == expected_event
+
+
+@pytest.mark.parametrize(
+    "store_factory, expected_save_status",
+    [
+        (MemoryHistoryStore, "saved"),
+        (FailingSaveStore, "failed"),
+        (MemoryHistoryStore, "stale"),
+    ],
+)
+@pytest.mark.parametrize("reports_usage", [True, False])
+def test_finish_chat_turn_normal_answer(
+    store_factory, expected_save_status, reports_usage
+):
+    history_store = store_factory()
+    daily_store = CountingDailyUsageStore()
+    logger = MemoryEventLogger()
+
+    username = "user1"
+    date = "2026-10-01"
+    history = [{"role": "user", "content": "1+1=?"}]
+    answer = "答案是 2"
+    initial_state = {"total_tokens": 10, "turns": 2}
+    usage = SimpleNamespace(total_tokens=40) if reports_usage else None
+
+    turn_token = history_store.start_turn(username)
+    if expected_save_status == "stale":
+        history_store.clear(username)
+
+    result = chat_service.finish_chat_turn(
+        history=history,
+        answer=answer,
+        usage=usage,
+        usage_state=initial_state,
+        username=username,
+        date=date,
+        turn_token=turn_token,
+        history_store=history_store,
+        daily_usage_store=daily_store,
+        event_logger=logger,
+    )
+
+    expected_history = history + [
+        {"role": "assistant", "content": answer}
+    ]
+    assert result["history"] == expected_history
+    assert result["save_status"] == expected_save_status
+    assert history_store.save_attempts == 1
+
+    if expected_save_status == "saved":
+        assert history_store.load(username) == expected_history
+    else:
+        assert history_store.load(username) == []
+
+    assert result["turn_total"] == (40 if reports_usage else None)
+    assert result["usage_state"] == {
+        "total_tokens": 50 if reports_usage else 10,
+        "turns": 3,
+    }
+    assert initial_state == {"total_tokens": 10, "turns": 2}
+
+    if reports_usage:
+        assert result["daily_usage"] == {
+            "daily_used": 40,
+            "global_used": 40,
+            "status": "recorded",
+        }
+        assert daily_store.add_usage_calls == [(date, username, 40)]
+        assert daily_store.get_used(date, username) == 40
+    else:
+        assert result["daily_usage"] is None
+        assert daily_store.add_usage_calls == []
+
+    assert logger.chat_events == [("回复", answer)]
+
+
+@pytest.mark.parametrize(
+    "scenario", ["recorded", "record_failed", "unknown"]
+)
+@pytest.mark.parametrize("truncated", [False, True])
+def test_finish_chat_turn_empty_answer(scenario, truncated):
+    history_store = MemoryHistoryStore()
+    daily_store = (
+        FailingDailyUsageStore()
+        if scenario == "record_failed"
+        else CountingDailyUsageStore()
+    )
+    logger = MemoryEventLogger()
+
+    username = "user1"
+    date = "2026-10-01"
+    history = [{"role": "user", "content": "1+1=?"}]
+    initial_state = {"total_tokens": 10, "turns": 2}
+    reports_usage = scenario != "unknown"
+    usage = SimpleNamespace(total_tokens=40) if reports_usage else None
+
+    result = chat_service.finish_chat_turn(
+        history=history,
+        answer="",
+        usage=usage,
+        usage_state=initial_state,
+        username=username,
+        date=date,
+        turn_token=history_store.start_turn(username),
+        history_store=history_store,
+        daily_usage_store=daily_store,
+        event_logger=logger,
+        truncated=truncated,
+    )
+
+    assert result["history"] == history
+    assert history == [{"role": "user", "content": "1+1=?"}]
+    assert result["save_status"] is None
+    assert history_store.save_attempts == 0
+    assert history_store.load(username) == []
+
+    expected_total = 40 if reports_usage else None
+    assert result["turn_total"] == expected_total
+    assert result["usage_state"] == {
+        "total_tokens": 50 if reports_usage else 10,
+        "turns": 3,
+    }
+    assert initial_state == {"total_tokens": 10, "turns": 2}
+
+    if reports_usage:
+        expected_daily = 40 if scenario == "recorded" else None
+        assert result["daily_usage"] == {
+            "daily_used": expected_daily,
+            "global_used": expected_daily,
+            "status": scenario,
+        }
+        assert daily_store.add_usage_calls == [(date, username, 40)]
+        assert daily_store.get_used(date, username) == (
+            40 if scenario == "recorded" else 0
+        )
+    else:
+        assert result["daily_usage"] is None
+        assert daily_store.add_usage_calls == []
+
+    assert logger.empty_replies == [{
+        "account": username,
+        "turn_total": expected_total,
+        "truncated": truncated,
+    }]
+    assert logger.chat_events == []
+    assert not any(
+        event[0] == "回复" for event in logger.access_events
+    )
+
+
+@pytest.mark.parametrize(
+    "answer, reports_usage, expected_total",
+    [
+        ("部分回答", False, 2),
+        ("部分回答", True, 40),
+        ("", False, None),
+        ("", True, 40),
+    ],
+)
+def test_finish_chat_turn_interrupted(
+    answer, reports_usage, expected_total
+):
+    history_store = MemoryHistoryStore()
+    daily_store = CountingDailyUsageStore()
+    logger = MemoryEventLogger()
+
+    username = "user1"
+    date = "2026-10-01"
+    history = [{"role": "user", "content": "1+1=?"}]
+    initial_state = {"total_tokens": 10, "turns": 2}
+    usage = SimpleNamespace(total_tokens=40) if reports_usage else None
+    error = RuntimeError("模拟流式中断")
+
+    result = chat_service.finish_chat_turn(
+        history=history,
+        answer=answer,
+        usage=usage,
+        usage_state=initial_state,
+        username=username,
+        date=date,
+        turn_token=history_store.start_turn(username),
+        history_store=history_store,
+        daily_usage_store=daily_store,
+        event_logger=logger,
+        error=error,
+    )
+
+    expected_history = history + (
+        [{"role": "assistant", "content": answer}] if answer else []
+    )
+    assert result["history"] == expected_history
+    assert result["error"] is error
+    assert result["save_status"] == ("saved" if answer else None)
+    assert history_store.save_attempts == (1 if answer else 0)
+    assert history_store.load(username) == (
+        expected_history if answer else []
+    )
+
+    assert result["turn_total"] == expected_total
+    assert result["usage_state"] == {
+        "total_tokens": 10 + (
+            expected_total if expected_total is not None else 0
+        ),
+        "turns": 3,
+    }
+    assert initial_state == {"total_tokens": 10, "turns": 2}
+
+    expected_calls = (
+        [(date, username, expected_total)]
+        if expected_total is not None
+        else []
+    )
+    assert daily_store.add_usage_calls == expected_calls
+
+    assert logger.errors == [
+        (error, {
+            "account": username,
+            "turn_total": expected_total,
+            "partial": bool(answer),
+        })
+    ]
+    assert logger.chat_events == []
+    assert logger.empty_replies == []
+
+    expected_event = (
+        "回复失败", f"账号={username}", "错误=RuntimeError"
+    )
+    if expected_total is not None:
+        expected_event += (
+            f"估算tokens={expected_total}",
+            f"本账号={expected_total}",
+        )
+    assert logger.access_events == [expected_event]
+
+
+@pytest.mark.parametrize(
+    "store_factory, expected_save_status",
+    [
+        (MemoryHistoryStore, "saved"),
+        (FailingSaveStore, "failed"),
+    ],
+)
+@pytest.mark.parametrize(
+    "scenario", ["normal", "truncated", "interrupted"]
+)
+def test_generate_reply_composes_stream_and_finalization(
+    store_factory, expected_save_status, scenario
+):
+    interrupted = scenario == "interrupted"
+    usage = SimpleNamespace(total_tokens=40)
+    error = RuntimeError("模拟流式中断")
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream_with_usage(
+            self, messages, thinking, reasoning_effort, model
+        ):
+            self.calls += 1
+            self.received = (
+                messages, thinking, reasoning_effort, model
+            )
+            yield "先求导", "分析题目", None, None
+            if interrupted:
+                raise error
+            finish_reason = (
+                "length" if scenario == "truncated" else "stop"
+            )
+            yield "再代入", None, usage, finish_reason
+
+    client = FakeClient()
+    compressor = Mock()
+    history_store = store_factory()
+    daily_store = CountingDailyUsageStore()
+    logger = MemoryEventLogger()
+
+    username = "user1"
+    date = "2026-10-01"
+    history = [{"role": "user", "content": "求函数的导数"}]
+    initial_state = {"total_tokens": 10, "turns": 2}
+
+    events = chat_service.generate_reply(
+        history=history,
+        usage_state=initial_state,
+        username=username,
+        date=date,
+        turn_token=history_store.start_turn(username),
+        level="高中",
+        mode="解答模式",
+        answer_style=None,
+        stage=None,
+        mode_changed=False,
+        thinking=True,
+        reasoning_effort="high",
+        model="test-model",
+        image_data_url=None,
+        max_history_messages=None,
+        active_client=client,
+        history_compressor=compressor,
+        history_store=history_store,
+        daily_usage_store=daily_store,
+        event_logger=logger,
+    )
+
+    # 创建生成器时还没有调用模型；读取时才开始执行。
+    assert client.calls == 0
+    first = next(events)
+    assert first == {
+        "type": "stream",
+        "reply": {
+            "answer": "先求导",
+            "reasoning_text": "分析题目",
+            "usage": None,
+            "truncated": False,
+        },
+    }
+    assert history_store.save_attempts == 0
+    assert daily_store.add_usage_calls == []
+
+    remaining = list(events)
+    assert [event["type"] for event in remaining] == (
+        ["final"] if interrupted else ["stream", "final"]
+    )
+    final = remaining[-1]
+    result = final["result"]
+
+    expected_answer = "先求导" if interrupted else "先求导再代入"
+    expected_total = 1 if interrupted else 40
+    expected_history = history + [
+        {"role": "assistant", "content": expected_answer}
+    ]
+
+    assert final["reply"] == {
+        "answer": expected_answer,
+        "reasoning_text": "分析题目",
+        "usage": None if interrupted else usage,
+        "truncated": scenario == "truncated",
+    }
+    assert result["history"] == expected_history
+    assert result["error"] is (error if interrupted else None)
+    assert result["save_status"] == expected_save_status
+    assert result["turn_total"] == expected_total
+    assert result["usage_state"] == {
+        "total_tokens": 10 + expected_total,
+        "turns": 3,
+    }
+    assert initial_state == {"total_tokens": 10, "turns": 2}
+
+    assert client.calls == 1
+    assert client.received[0][-1] == history[-1]
+    assert client.received[1:] == (True, "high", "test-model")
+    compressor.get_summary.assert_not_called()
+
+    assert history_store.save_attempts == 1
+    assert history_store.load(username) == (
+        expected_history if expected_save_status == "saved" else []
+    )
+    assert daily_store.add_usage_calls == [
+        (date, username, expected_total)
+    ]
+
+
+@pytest.mark.parametrize(
+    "scenario, expected_status, expected_questions, added_user",
+    [
+        ("normal", "ready", 1, True),
+        ("empty", "empty", 0, False),
+        ("too_long", "too_long", 0, False),
+        ("quota", "quota", 0, False),
+        ("quota_read_failed", "quota_read_failed", 0, False),
+        ("no_client", "no_client", 1, True),
+        ("image", "image_rejected", 1, True),
+    ],
+)
+def test_prepare_chat_turn_preserves_rejection_order(
+    scenario, expected_status, expected_questions, added_user
+):
+    class QuotaReadFailStore(CountingDailyUsageStore):
+        def get_used(self, date, account):
+            raise DailyUsageReadError("模拟额度读取失败")
+
+    daily_store = (
+        QuotaReadFailStore()
+        if scenario == "quota_read_failed"
+        else CountingDailyUsageStore()
+    )
+    history_store = MemoryHistoryStore()
+    history_store.start_turn = Mock(
+        wraps=history_store.start_turn
+    )
+    logger = MemoryEventLogger()
+    client = Mock(supports_vision=False)
+
+    username = "user1"
+    date = "2026-10-01"
+    if scenario == "quota":
+        daily_store.add_usage(date, username, 100)
+    initial_usage_calls = list(daily_store.add_usage_calls)
+
+    message = {
+        "empty": "   ",
+        "too_long": "123456",
+    }.get(scenario, "1+1=?")
+    original_stage = {
+        "stage": "full_solution",
+        "hints": 2,
+        "last_mode": "互动模式",
+    }
+    original_image = (
+        {"path": "unused.png", "fresh": True}
+        if scenario == "image"
+        else None
+    )
+    original_history = []
+
+    result = chat_service.prepare_chat_turn(
+        message=message,
+        history=original_history,
+        mode="互动模式",
+        stage_state=original_stage,
+        image_state=original_image,
+        username=username,
+        ip="127.0.0.1",
+        date=date,
+        active_client=None if scenario == "no_client" else client,
+        history_store=history_store,
+        daily_usage_store=daily_store,
+        event_logger=logger,
+        max_message_len=5,
+        daily_limit=100,
+        global_daily_limit=1000,
+        image_only_prompt="请解答图中的题目。",
+        image_note="[附图]",
+    )
+
+    assert result["status"] == expected_status
+    assert result["history"] == (
+        [{"role": "user", "content": message}] if added_user else []
+    )
+    assert result["stage_state"]["stage"] == (
+        "initial_hint" if added_user else "full_solution"
+    )
+    assert daily_store.get_questions(date) == expected_questions
+    assert daily_store.add_usage_calls == initial_usage_calls
+    assert history_store.save_attempts == 0
+    client.chat_stream_with_usage.assert_not_called()
+
+    if expected_status == "ready":
+        assert result["turn_token"] == 0
+        history_store.start_turn.assert_called_once_with(username)
+    else:
+        assert result["turn_token"] is None
+        history_store.start_turn.assert_not_called()
+
+    assert original_history == []
+    assert original_stage == {
+        "stage": "full_solution",
+        "hints": 2,
+        "last_mode": "互动模式",
+    }
+    if scenario == "image":
+        assert result["image_state"] == original_image
+        assert original_image == {
+            "path": "unused.png",
+            "fresh": True,
+        }
+
+
+@pytest.mark.parametrize(
+    "scenario", ["send", "continue", "empty", "cleared"]
+)
+def test_run_chat_turn_without_gradio(scenario):
+    usage = SimpleNamespace(total_tokens=40)
+
+    class FakeClient:
+        supports_vision = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream_with_usage(
+            self, messages, thinking, reasoning_effort, model
+        ):
+            self.calls += 1
+            self.received = (
+                messages, thinking, reasoning_effort, model
+            )
+            yield "测试", "分析", None, None
+            yield "回答", None, usage, "stop"
+
+    client = FakeClient()
+    compressor = Mock()
+    history_store = MemoryHistoryStore()
+    daily_store = CountingDailyUsageStore()
+    logger = MemoryEventLogger()
+
+    username = "user1"
+    date = "2026-10-01"
+    history = [
+        {"role": "user", "content": "1+1=?"},
+        {"role": "assistant", "content": "先计算"},
+    ]
+    initial_state = {"total_tokens": 10, "turns": 2}
+    image_state = (
+        None if scenario == "empty"
+        else {"path": "unused.png", "fresh": False}
+    )
+    force_continue = scenario == "continue"
+    message = (
+        chat_service.build_continue_message(history, "[附图]")
+        if force_continue
+        else "   " if scenario == "empty"
+        else "2+2=?"
+    )
+
+    events = chat_service.run_chat_turn(
+        message=message,
+        history=history,
+        usage_state=initial_state,
+        username=username,
+        ip="127.0.0.1",
+        date=date,
+        level="高中",
+        mode="互动模式",
+        stage_state={
+            "stage": "full_solution",
+            "hints": 2,
+            "last_mode": "互动模式",
+        },
+        image_state=image_state,
+        thinking=True,
+        model="test-model",
+        reasoning_effort="high",
+        answer_style=None,
+        active_client=client,
+        history_compressor=compressor,
+        history_store=history_store,
+        daily_usage_store=daily_store,
+        event_logger=logger,
+        max_message_len=2000,
+        max_history_messages=None,
+        daily_limit=1000,
+        global_daily_limit=3000,
+        image_only_prompt="请解答图中的题目。",
+        image_note="[附图]",
+        force_continue=force_continue,
+    )
+
+    first = next(events)
+    assert client.calls == 0
+    assert history_store.save_attempts == 0
+
+    if scenario == "empty":
+        assert first["type"] == "rejected"
+        assert first["turn"]["status"] == "empty"
+        assert first["turn"]["history"] == history
+        assert list(events) == []
+        assert daily_store.get_questions(date) == 0
+        assert daily_store.add_usage_calls == []
+        assert initial_state == {"total_tokens": 10, "turns": 2}
+        return
+
+    assert first["type"] == "ready"
+    prepared = first["turn"]
+    assert prepared["stage_state"]["stage"] == (
+        "full_solution" if force_continue else "initial_hint"
+    )
+    assert prepared["stage_state"]["hints"] == (
+        2 if force_continue else 0
+    )
+    assert prepared["image_state"] == (
+        image_state if force_continue
+        else {"path": None, "fresh": False}
+    )
+
+    if scenario == "cleared":
+        history_store.clear(username)
+
+    remaining = list(events)
+    assert [event["type"] for event in remaining] == [
+        "stream", "stream", "final"
+    ]
+    final = remaining[-1]
+    result = final["result"]
+    expected_history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": "测试回答"},
+    ]
+
+    assert final["reply"]["answer"] == "测试回答"
+    assert result["history"] == expected_history
+    assert result["error"] is None
+    assert result["save_status"] == (
+        "stale" if scenario == "cleared" else "saved"
+    )
+    assert result["usage_state"] == {
+        "total_tokens": 50,
+        "turns": 3,
+    }
+    assert initial_state == {"total_tokens": 10, "turns": 2}
+
+    assert client.calls == 1
+    assert client.received[0][-1] == prepared["history"][-1]
+    assert client.received[1:] == (True, "high", "test-model")
+    compressor.get_summary.assert_not_called()
+
+    assert history_store.save_attempts == 1
+    assert history_store.load(username) == (
+        [] if scenario == "cleared" else expected_history
+    )
+    assert daily_store.get_questions(date) == 1
+    assert daily_store.add_usage_calls == [(date, username, 40)]

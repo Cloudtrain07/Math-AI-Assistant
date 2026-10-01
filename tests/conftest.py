@@ -8,6 +8,12 @@
 
 import copy
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import pytest
+
+from core import accounts as accounts_module
 
 from core.storage import (
     filter_valid_messages,
@@ -20,6 +26,22 @@ from core.usage_store import (
     _RESERVED_KEYS,
     _TOTAL_KEY,
 )
+
+
+def pytest_configure(config):
+    """在收集测试前，把默认账号文件隔离到测试临时目录。"""
+    accounts_dir = TemporaryDirectory(prefix="maa-test-accounts-")
+    config.add_cleanup(accounts_dir.cleanup)
+
+    patch = pytest.MonkeyPatch()
+    config.add_cleanup(patch.undo)
+
+    patch.setattr(
+        accounts_module,
+        "ACCOUNTS_FILE",
+        Path(accounts_dir.name) / "accounts.json",
+    )
+    patch.setattr(accounts_module, "_memory_accounts", None)
 
 
 class MemoryHistoryStore:

@@ -43,7 +43,6 @@ from core.prompts import (
 from core.storage import HistoryReadError, get_history_store
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.usage import (
-    check_daily_quota,
     estimate_tokens,
     format_cumulative,
     new_usage_state,
@@ -142,52 +141,6 @@ _DAILY_STATS_FAILED_MSG = "⚠️ 每日用量已记录，但全局统计暂时�
 _QUOTA_CHECK_FAILED_MSG = "⚠️ 每日额度暂时无法检查，请稍后重试。"
 
 
-def _save_turn_history(username: str, turn_token: int, turn_history: list[dict]) -> tuple[bool, str]:
-    """保存本轮历史，返回 (是否成功保存, 需要追加到状态栏的提示)。
-
-    保存失败不重新调用模型、不自动重试；用量结算由调用方另行完成。
-    """
-    try:
-        saved = history_store.save(
-            turn_history, username=username, turn_token=turn_token
-        )
-    except Exception:
-        return False, _SAVE_FAILED_MSG
-    if saved:
-        return True, ""
-    return False, _SAVE_STALE_MSG
-
-
-def _record_daily_usage(
-    date: str, username: str, turn_total: int
-) -> tuple[int | None, int | None, str]:
-    """记录每日用量，返回 (账号当日累计, 全局当日累计, 失败提示)。
-
-    记录失败不重试；调用方仍完成回答保存与本会话结算，只在状态栏提示。
-    两种失败分开报告：用量写入失败时两者皆未知；写入成功而全局统计
-    刷新失败时，保留已写入的账号累计，只提示统计暂时不可用。
-    """
-    try:
-        daily_used = daily_usage_store.add_usage(date, username, turn_total)
-    except Exception as exc:
-        event_logger.log_access_event(
-            "每日用量记录失败",
-            f"账号={username}",
-            f"错误={exc.__class__.__name__}",
-        )
-        return None, None, _DAILY_FAILED_MSG
-    try:
-        global_used = daily_usage_store.get_total(date)
-    except Exception as exc:
-        event_logger.log_access_event(
-            "全局统计刷新失败",
-            f"账号={username}",
-            f"错误={exc.__class__.__name__}",
-        )
-        return daily_used, None, _DAILY_STATS_FAILED_MSG
-    return daily_used, global_used, ""
-
-
 def format_usage(usage) -> str:
     """把 API 返回的 token 用量格式化为一行提示（含输入/输出拆分）。"""
     if usage is None:
@@ -242,16 +195,6 @@ def _check_login(username: str, password: str) -> bool:
     return ok
 
 
-def _recognition_incomplete(text: str) -> bool:
-    """粗略判断识别文本是否在公式中途被截断（奇数个 $ 或结尾是公式残片）。"""
-    if not text:
-        return False
-    stripped = text.rstrip()
-    if stripped.endswith(("\\", "{", "}")):
-        return True
-    return stripped.count("$") % 2 == 1
-
-
 def on_image_upload(image: str | None, provider_id: str | None):
     """上传/粘贴题目图片：统一进入待发状态，由支持原生视觉的服务商直接处理。
 
@@ -288,406 +231,237 @@ def respond(
     force_continue: bool = False,
     attach_image: bool = True,
 ):
-    """聊天主流程：流式回复，累计会话用量，并按互动模式阶段引导。
-
-    发送时按所选服务商能力路由图片：支持原生视觉则直接附图；
-    纯文本服务商收到图片时返回提示。attach_image=False 表示本次只发送文字，
-    不携带待发图片。思考链仅当轮展示。
-    """
-
-    #承接以前的会话历史记录，并且排除只输入空格的情况
-    history = list(history or [])       #这是为了承接以前的历史记录，[]是为了防止history为None时报错
-    stage_state = dialogue_state.prepare_stage_state(mode, stage_state)
-    #图片状态
-    image_state = dict(image_state or _new_image_state())
-    image_state.setdefault("path", None)
-    image_state.setdefault("fresh", False)
-    has_pending_image = bool(image_state.get("path")) and not force_continue
-    input_result = chat_service.prepare_user_message(
-        message=message,
-        has_pending_image=has_pending_image,
-        max_message_len=MAX_MESSAGE_LEN,
-        image_only_prompt=_IMAGE_ONLY_PROMPT,
-    )
-    message = input_result["message"]
-
-    if input_result["error"] == "empty":
-        yield (
-            history,
-            "",
-            "💡 请先输入问题，或上传题目图片后直接发送。",
-            "",
-            usage_state,
-            stage_state,
-            "",
-            image_state,
-        )
-        return
-
+    """取得界面输入和依赖，将聊天 service 的事件映射为 Gradio 输出。"""
     username = request.username if request and request.username else "unknown"
     ip = (request.client.host if request and request.client else None) or "unknown"
-
-    if input_result["error"] == "too_long":
-        event_logger.log_access_event(
-            "过长拒绝",
-            f"账号={username}",
-            f"IP={ip}",
-            f"长度={len(message)}",
-        )
-        yield (
-            history,
-            "",
-            f"⚠️ 消息过长（最多 {MAX_MESSAGE_LEN:,} 字符），请精简后重试。",
-            "",
-            usage_state,
-            stage_state,
-            "",
-            image_state,
-        )
-        return
-
-    #日配额检查
-    today = datetime.date.today().isoformat()    #获取当前日期
-    try:
-        daily_used = daily_usage_store.get_used(today, username)   #获取当前账号今日使用量
-        global_used = daily_usage_store.get_total(today)   #获取当天全局用量
-    except DailyUsageReadError:
-        # 无法读取额度时明确提示并结束本次请求，不调用模型
-        event_logger.log_access_event("额度检查失败", f"账号={username}")
-        yield (
-            history,
-            "",
-            _QUOTA_CHECK_FAILED_MSG,
-            "",
-            usage_state,
-            stage_state,
-            "",
-            image_state,
-        )
-        return
-    quota_msg = check_daily_quota(
-        daily_used, global_used, DAILY_LIMIT, GLOBAL_DAILY_LIMIT
-    )
-    if quota_msg is not None:
-        event_logger.log_access_event(
-            "超额拒绝",
-            f"账号={username}",
-            f"本账号={daily_used}",
-            f"全局={global_used}",
-        )
-        yield (
-            history,
-            "",
-            quota_msg,
-            "",
-            usage_state,
-            stage_state,
-            "",
-            image_state,
-        )
-        return
-
-    # 根据用户新消息推进互动模式阶段（解答模式无阶段）
-    new_stage = dialogue_state.advance_stage(
-        mode,
-        message,
-        stage_state,
-        has_history=bool(history),
-        force_continue=force_continue,
-    )
-
-    user_content = normalize_math_text(message, auto_close=True)     #补全用户输入公式，并且改成新的变量
-    event_logger.log_chat_event("发送", user_content)
-    event_logger.log_access_event(
-        "提问", f"账号={username}", f"IP={ip}", f"长度={len(message)}"
-    )
-    try:
-        daily_usage_store.add_question(today)
-    except Exception:
-        # 提问次数记录失败不打断聊天，留下明确失败信息
-        event_logger.log_access_event("提问次数记录失败", f"账号={username}")
-    if _recognition_incomplete(message):
-        event_logger.log_chat_event("发送-原始疑似不完整", message)
-    history.append({"role": "user", "content": user_content})
-    # 根据界面选择的服务商使用对应客户端
+    today = datetime.date.today().isoformat()
     active_client = clients.get(provider_id) or client
-    if active_client is None:
-        yield (
-            history + [{"role": "assistant", "content": f"⚠️ {startup_hint}"}],
-            "",
-            "",
-            "",
-            usage_state,
-            new_stage,
-            "",
-            image_state,
-        )
-        return
 
-    # 决定本轮是否附图；Gradio 的输出仍由 respond 负责
-    image_result = chat_service.route_image_for_turn(
+    thinking_started = None
+
+    for event in chat_service.run_chat_turn(
         message=message,
         history=history,
+        usage_state=usage_state,
+        username=username,
+        ip=ip,
+        date=today,
+        level=level,
+        mode=mode,
+        stage_state=stage_state,
         image_state=image_state,
-        previous_stage=stage_state.get("stage"),
-        supports_vision=bool(getattr(active_client, "supports_vision", False)),
+        thinking=thinking,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        answer_style=answer_style,
+        active_client=active_client,
+        history_compressor=history_compressor,
+        history_store=history_store,
+        daily_usage_store=daily_usage_store,
+        event_logger=event_logger,
+        max_message_len=MAX_MESSAGE_LEN,
+        max_history_messages=(
+            settings.max_history_messages if settings is not None else None
+        ),
+        daily_limit=DAILY_LIMIT,
+        global_daily_limit=GLOBAL_DAILY_LIMIT,
+        image_only_prompt=_IMAGE_ONLY_PROMPT,
+        image_note=IMAGE_NOTE,
         force_continue=force_continue,
         attach_image=attach_image,
-        image_note=IMAGE_NOTE,
-    )
-    history = image_result["history"]
-    image_data_url = image_result["image_data_url"]
-    new_image_state = image_result["image_state"]
-    image_status = image_result["image_status"]
+    ):
+        event_type = event["type"]
+        turn = event["turn"]
+        history = turn["history"]
+        new_stage = turn["stage_state"]
+        new_image_state = turn["image_state"]
+        image_status = turn["image_status"]
 
-    if image_result["reject_message"] is not None:
-        yield (
-            history,
-            "",
-            image_result["reject_message"],
-            "",
-            usage_state,
-            new_stage,
-            "",
-            new_image_state,
-        )
-        return
-            
+        if event_type == "ready":
+            # 准备已经完成，接下来才进入上下文准备和模型调用。
+            thinking_started = time.monotonic()
+            continue
 
-    # 本轮保存标记：模型调用前取得；期间若发生清空或其他保存，标记失效则跳过保存
-    turn_token = history_store.start_turn(username)
+        if event_type == "rejected":
+            display_history = history
+            reason = turn["status"]
 
-    #正式开始流式调用大模型回答
-    answer = ""
-    reasoning_text = ""
-    usage = None
-    truncated = False    #是否被截断
-    thinking_started = time.monotonic()
-    try:
-        for state in chat_service.stream_reply(
-            active_client,
-            chat_service.prepare_api_messages(
-                username=username,
-                history=history,
-                level=level,
-                mode=mode,
-                answer_style=answer_style,
-                active_client=active_client,
-                history_compressor=history_compressor,
-                image_data_url=image_data_url,
-                stage=new_stage["stage"],
-                mode_changed=new_stage["mode_changed"],
-                max_history_messages=(
-                    settings.max_history_messages if settings is not None else None
-                ),
-            ),
-            thinking=thinking,
-            reasoning_effort=reasoning_effort,
-            model=model,
-        ):
-            answer = state["answer"]
-            reasoning_text = state["reasoning_text"]
-            usage = state["usage"]
-            truncated = state["truncated"]
+            if reason == "empty":
+                result_text = "💡 请先输入问题，或上传题目图片后直接发送。"
+            elif reason == "too_long":
+                result_text = (
+                    f"⚠️ 消息过长（最多 {MAX_MESSAGE_LEN:,} 字符），"
+                    "请精简后重试。"
+                )
+            elif reason == "quota_read_failed":
+                result_text = _QUOTA_CHECK_FAILED_MSG
+            elif reason == "no_client":
+                # 沿用原行为：启动提示显示在聊天区。
+                display_history = history + [
+                    {"role": "assistant", "content": f"⚠️ {startup_hint}"}
+                ]
+                result_text = ""
+            else:
+                # 超额和不支持图片的提示由 service 提供。
+                result_text = turn["reject_message"]
+
+            yield (
+                display_history,
+                "",
+                result_text,
+                "",
+                usage_state,
+                new_stage,
+                "",
+                new_image_state,
+            )
+            return
+
+        reply = event["reply"]
+        answer = reply["answer"]
+        reasoning_text = reply["reasoning_text"]
+        usage = reply["usage"]
+        truncated = reply["truncated"]
+
+        if event_type == "stream":
             if not answer:
-                # 思考阶段：状态栏显示已用时与估算思考 token，避免界面一片空白
                 tokens_part = (
                     f"，思考约 {estimate_tokens(reasoning_text)} tokens"
                     if reasoning_text
                     else ""
                 )
-                status_text = (
+                result_text = (
                     "⏳ 正在思考… "
                     f"已用时 {int(time.monotonic() - thinking_started)} 秒"
                     f"{tokens_part}"
                 )
-                yield (
-                    history,
-                    "",
-                    status_text,
-                    "",
-                    usage_state,
-                    new_stage,
-                    normalize_math_text(reasoning_text, auto_close=True),
-                    new_image_state,
-                )
+                display_history = history
             else:
-                display = normalize_math_text(answer)
-                yield (
-                    history + [{"role": "assistant", "content": display}],
-                    "",
-                    "",
-                    "",
-                    usage_state,
-                    new_stage,
-                    normalize_math_text(reasoning_text, auto_close=True),
-                    new_image_state,
-                )
-    # 流式输出结束，接下来是处理回答
-    # 出现报错的回复情况
-    except Exception as exc:
-        turn_total, usage_state = chat_service.settle_reply_usage(
-            usage_state,
-            usage,
-            answer,
-            interrupted=True,
-        )
-        event_logger.log_error(
-            exc, account=username, turn_total=turn_total, partial=bool(answer)
-        )
+                result_text = ""
+                display_history = history + [
+                    {
+                        "role": "assistant",
+                        "content": normalize_math_text(answer),
+                    }
+                ]
+
+            yield (
+                display_history,
+                "",
+                result_text,
+                "",
+                usage_state,
+                new_stage,
+                normalize_math_text(reasoning_text, auto_close=True),
+                new_image_state,
+            )
+            continue
+
+        # 最终事件：保存、结算和日志已经由 service 完成。
+        turn_result = event["result"]
+        final_history = turn_result["history"]
+        usage_state = turn_result["usage_state"]
+        turn_total = turn_result["turn_total"]
+        error = turn_result["error"]
+        save_status = turn_result["save_status"]
+
+        save_status_to_note = {
+            None: "",
+            "saved": "",
+            "failed": _SAVE_FAILED_MSG,
+            "stale": _SAVE_STALE_MSG,
+        }
+        save_note = save_status_to_note[save_status]
+
         daily_note = ""
-        if turn_total is not None:
-            daily_used, _global_used, daily_note = _record_daily_usage(
-                today, username, turn_total
-            )
-            if daily_used is not None:
-                event_logger.log_access_event(
-                    "回复失败",
-                    f"账号={username}",
-                    f"错误={exc.__class__.__name__}",
-                    f"估算tokens={turn_total}",
-                    f"本账号={daily_used}",
-                )
+        daily_used = None
+        global_used = None
+        daily_result = turn_result["daily_usage"]
+        if daily_result is not None:
+            daily_used = daily_result["daily_used"]
+            global_used = daily_result["global_used"]
+            daily_status_to_note = {
+                "recorded": "",
+                "record_failed": _DAILY_FAILED_MSG,
+                "stats_failed": _DAILY_STATS_FAILED_MSG,
+            }
+            daily_note = daily_status_to_note[daily_result["status"]]
+
+        usage_text = format_cumulative(usage_state)
+
+        if error is not None:
+            result_text = _friendly_error(error)
+            if answer:
+                if save_status == "saved":
+                    result_text += "\n\n（已保留生成的部分内容）"
+                else:
+                    result_text += (
+                        "\n\n（部分回答仅在当前页面显示，未写入历史）"
+                    )
+            if save_note:
+                result_text = f"{result_text}\n\n{save_note}"
+            if daily_note:
+                result_text = f"{result_text}\n\n{daily_note}"
+
+        elif not answer:
+            # 界面占位文字不进入 service 保存的历史。
+            final_history = final_history + [
+                {"role": "assistant", "content": "（未收到正式回答）"}
+            ]
+            if truncated:
+                hint = "模型的思考过程已用完本次输出额度，没能生成正式回答"
             else:
-                event_logger.log_access_event(
-                    "回复失败", f"账号={username}", f"错误={exc.__class__.__name__}"
-                )
-        else:
-            event_logger.log_access_event(
-                "回复失败", f"账号={username}", f"错误={exc.__class__.__name__}"
+                hint = "请求已完成，但模型没有生成正式回答"
+            if turn_total is not None:
+                hint += f"（本次约消耗 {turn_total} tokens）"
+            result_text = (
+                f"⚠️ {hint}。\n\n"
+                "建议：关闭「深度思考模式」、把 .env 中 DEEPSEEK_REASONING_EFFORT 调低，"
+                "或调大 MAX_OUTPUT_TOKENS 后重启。"
             )
-        partial_history = chat_service.build_answer_history(history, answer)
-        if partial_history is not None:
-            saved, save_note = _save_turn_history(username, turn_token, partial_history)
-            if saved:
-                status_text = _friendly_error(exc) + "\n\n（已保留生成的部分内容）"
-            else:
-                # 未保存成功：明确说明，部分回答仅保留在当前页面显示
-                status_text = (
-                    _friendly_error(exc)
-                    + "\n\n（部分回答仅在当前页面显示，未写入历史）"
-                )
+            if daily_note:
+                result_text = f"{result_text}\n\n{daily_note}"
+
         else:
-            save_note = ""
-            partial_history = history
-            status_text = _friendly_error(exc)
-        if save_note:
-            status_text = f"{status_text}\n\n{save_note}"
-        if daily_note:
-            status_text = f"{status_text}\n\n{daily_note}"
+            result_text = format_usage(usage)
+            if image_status:
+                result_text = (
+                    f"{image_status}\n\n{result_text}"
+                    if result_text
+                    else image_status
+                )
+            if truncated:
+                result_text += (
+                    "\n\n⚠️ 回答因长度限制被截断，"
+                    "可以回复「继续」让我接着写。"
+                )
+            if save_note:
+                result_text = f"{result_text}\n\n{save_note}"
+            if daily_note:
+                result_text = f"{result_text}\n\n{daily_note}"
+
+            if daily_used is not None and global_used is not None:
+                usage_text += (
+                    f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号），"
+                    f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
+                )
+            elif daily_used is not None:
+                usage_text += (
+                    f"\n\n🛡️ 今日已用 {daily_used:,} / "
+                    f"{DAILY_LIMIT:,}（本账号）"
+                )
+
         yield (
-            partial_history,
+            final_history,
             "",
-            status_text,
-            format_cumulative(usage_state),
+            result_text,
+            usage_text,
             usage_state,
             new_stage,
             normalize_math_text(reasoning_text, auto_close=True),
             new_image_state,
         )
         return
-    # 没有正式生成回复的情况
-    if not answer:
-        turn_total, usage_state = chat_service.settle_reply_usage(
-            usage_state,
-            usage,
-            answer,
-        )
-        daily_note = ""
-        if turn_total is not None:
-            _daily_used, _global_used, daily_note = _record_daily_usage(
-                today, username, turn_total
-            )
-        event_logger.log_empty_reply(
-            account=username, turn_total=turn_total, truncated=truncated
-        )
-        if truncated:
-            hint = "模型的思考过程已用完本次输出额度，没能生成正式回答"
-        else:
-            hint = "请求已完成，但模型没有生成正式回答"
-        if turn_total is not None:
-            hint += f"（本次约消耗 {turn_total} tokens）"
-        status_text = (
-            f"⚠️ {hint}。\n\n"
-            "建议：关闭「深度思考模式」、把 .env 中 DEEPSEEK_REASONING_EFFORT 调低，"
-            "或调大 MAX_OUTPUT_TOKENS 后重启。"
-        )
-        if daily_note:
-            status_text = f"{status_text}\n\n{daily_note}"
-        yield (
-            history + [{"role": "assistant", "content": "（未收到正式回答）"}],
-            "",
-            status_text,
-            format_cumulative(usage_state),
-            usage_state,
-            new_stage,
-            normalize_math_text(reasoning_text, auto_close=True),
-            new_image_state,
-        )
-        return
-    # 正式生成回复的情况
-    final_history = chat_service.build_answer_history(history, answer)
-    assert final_history is not None  # 空回答已在上面的分支返回
-    _saved, save_note = _save_turn_history(username, turn_token, final_history)
-    turn_total, usage_state = chat_service.settle_reply_usage(
-        usage_state,
-        usage,
-        answer,
-    )
-    daily_note = ""
-    daily_used = None
-    global_used = None
-    if turn_total is not None:
-        daily_used, global_used, daily_note = _record_daily_usage(
-            today, username, turn_total
-        )
-        if daily_used is not None:
-            if global_used is not None:
-                event_logger.log_access_event(
-                    "回复",
-                    f"账号={username}",
-                    f"tokens={turn_total}",
-                    f"本账号={daily_used}",
-                    f"全局={global_used}",
-                )
-            else:
-                # 全局统计暂时不可用，只记录已知的账号累计
-                event_logger.log_access_event(
-                    "回复",
-                    f"账号={username}",
-                    f"tokens={turn_total}",
-                    f"本账号={daily_used}",
-                )
-    event_logger.log_chat_event("回复", answer)
-    result_text = format_usage(usage)
-    if image_status:
-        result_text = f"{image_status}\n\n{result_text}" if result_text else image_status
-    if truncated:
-        result_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
-    if save_note:
-        result_text = f"{result_text}\n\n{save_note}"
-    if daily_note:
-        result_text = f"{result_text}\n\n{daily_note}"
-    usage_text = format_cumulative(usage_state)
-    if daily_used is not None and global_used is not None:
-        usage_text += (
-            f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号），"
-            f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
-        )
-    elif daily_used is not None:
-        # 每日记录失败不显示"今日已用"；记录成功但全局统计不可用时只显示账号累计
-        usage_text += f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号）"
-    reasoning_display = normalize_math_text(reasoning_text, auto_close=True)
-    yield (
-        final_history,
-        "",
-        result_text,
-        usage_text,
-        usage_state,
-        new_stage,
-        reasoning_display,
-        new_image_state,
-    )
 
 
 def continue_last_answer(
