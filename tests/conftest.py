@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""共享测试设施：与正式存储接口一致的内存假实现及失败注入变体。
+"""共享测试设施：与正式存储/日志接口一致的内存假实现及失败注入变体。
 
 - MemoryHistoryStore：消息过滤与公式归一化复用 core.storage 的公共规则；
-- MemoryDailyUsageStore：每日用量的统计规则与文件实现保持一致。
+- MemoryDailyUsageStore：每日用量的统计规则与文件实现保持一致；
+- MemoryEventLogger：日志对象只记录调用信息，不写任何文件。
 """
 
 import copy
@@ -184,3 +185,39 @@ class FailingDailyUsageStore(CountingDailyUsageStore):
         if self.fail:
             raise OSError("模拟每日用量写盘失败")
         return MemoryDailyUsageStore.add_usage(self, date, account, tokens)
+
+
+class MemoryEventLogger:
+    """内存版事件日志：接口与 FileEventLogger 一致，供测试替换文件实现。
+
+    记录聊天事件、访问事件、异常与空回答的调用信息供断言，不写文件。
+    """
+
+    def __init__(self) -> None:
+        self.chat_events: list[tuple[str, str]] = []
+        self.access_events: list[tuple[str, ...]] = []
+        self.errors: list[tuple[Exception, dict]] = []
+        self.empty_replies: list[dict] = []
+
+    def log_chat_event(self, kind: str, text: str) -> None:
+        self.chat_events.append((kind, text))
+
+    def log_access_event(self, *parts: str) -> None:
+        self.access_events.append(parts)
+
+    def log_error(
+        self, exc: Exception, *, account: str, turn_total: int | None, partial: bool
+    ) -> None:
+        self.errors.append(
+            (
+                exc,
+                {"account": account, "turn_total": turn_total, "partial": partial},
+            )
+        )
+
+    def log_empty_reply(
+        self, *, account: str, turn_total: int | None, truncated: bool
+    ) -> None:
+        self.empty_replies.append(
+            {"account": account, "turn_total": turn_total, "truncated": truncated}
+        )

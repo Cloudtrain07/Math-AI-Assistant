@@ -14,10 +14,12 @@ from conftest import (
     FailingDailyUsageStore,
     FailingSaveStore,
     MemoryDailyUsageStore,
+    MemoryEventLogger,
     MemoryHistoryStore,
     StaleSaveStore,
 )
 from core import usage as usage_module
+from core.logger import FileEventLogger
 
 
 class _FakeUsage:
@@ -64,6 +66,13 @@ def _use_memory_store(monkeypatch) -> MemoryHistoryStore:
     return store
 
 
+def _use_memory_logger(monkeypatch) -> MemoryEventLogger:
+    """用内存假日志对象替换文件日志，返回实例供断言。"""
+    logger = MemoryEventLogger()
+    monkeypatch.setattr(app_module, "event_logger", logger)
+    return logger
+
+
 def _stage0():
     return {"stage": "initial_hint", "hints": 0, "last_mode": "互动模式"}
 
@@ -79,8 +88,7 @@ def test_respond_success_path(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     store = _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     usage_store = _wire_usage_store(monkeypatch)
@@ -123,8 +131,7 @@ def test_respond_quota_rejected(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     # 本账号今日额度已用尽
@@ -164,8 +171,7 @@ def test_respond_overlong_message_rejected(monkeypatch):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 5)
 
     state0 = {"total_tokens": 0, "turns": 0}
@@ -199,8 +205,7 @@ def test_respond_escape_keyword_full_solution(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     _wire_usage_store(monkeypatch)
@@ -231,8 +236,7 @@ def test_respond_practice_keyword_practice_wait(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     _wire_usage_store(monkeypatch)
@@ -262,8 +266,7 @@ def test_respond_answer_mode_stage_none(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     _wire_usage_store(monkeypatch)
@@ -294,8 +297,7 @@ def test_respond_new_problem_resets_stage(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     _wire_usage_store(monkeypatch)
@@ -331,8 +333,7 @@ def test_respond_reasoning_panel_and_status(monkeypatch, tmp_path):
     fake_client = _ReasoningClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     _wire_usage_store(monkeypatch)
@@ -373,8 +374,7 @@ def test_continue_last_answer(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     _wire_usage_store(monkeypatch)
@@ -413,8 +413,7 @@ def test_continue_last_answer_keeps_stage(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
     _use_memory_store(monkeypatch)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     _wire_usage_store(monkeypatch)
@@ -478,9 +477,7 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
     store = _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "client", EmptyAnswerClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "_log_empty_reply", lambda **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     usage_store = _wire_usage_store(monkeypatch)
@@ -524,7 +521,7 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
     monkeypatch, tmp_path
 ):
     partial_answer = "已经生成的部分回答"
-    logged_errors = []
+    logger = _use_memory_logger(monkeypatch)
 
     class InterruptedClient:
         def __init__(self):
@@ -540,14 +537,8 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
     fake_client = InterruptedClient()
     store = _use_memory_store(monkeypatch)
 
-    def capture_error(exc, **details):
-        logged_errors.append((exc, details))
-
     monkeypatch.setattr(app_module, "client", fake_client)
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(app_module, "_log_error", capture_error)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
@@ -602,8 +593,8 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
 
     # 确认走了异常分支，没有重新调用模型。
     assert fake_client.calls == 1
-    assert len(logged_errors) == 1
-    exc, details = logged_errors[0]
+    assert len(logger.errors) == 1
+    exc, details = logger.errors[0]
     assert isinstance(exc, RuntimeError)
     assert details["partial"] is True
     assert details["turn_total"] == expected_tokens
@@ -637,9 +628,7 @@ def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
         "estimate_tokens",
         unexpected_estimate,
     )
-    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
@@ -685,7 +674,7 @@ def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
 
 # 没有输出正式回复，也没有返回usage就报错了
 def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
-    logged_errors = []
+    logger = _use_memory_logger(monkeypatch)
     store = _use_memory_store(monkeypatch)
 
     class FailedClient:
@@ -697,13 +686,6 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
 
     monkeypatch.setattr(app_module, "client", FailedClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(
-        app_module,
-        "_log_error",
-        lambda exc, **details: logged_errors.append((exc, details)),
-    )
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
@@ -746,8 +728,8 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
     assert state["prompt_tokens"] == 0
     assert state["completion_tokens"] == 0
 
-    assert len(logged_errors) == 1
-    exc, details = logged_errors[0]
+    assert len(logger.errors) == 1
+    exc, details = logger.errors[0]
     assert isinstance(exc, RuntimeError)
     assert details["partial"] is False
     assert details["turn_total"] is None
@@ -772,8 +754,7 @@ def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
 
     monkeypatch.setattr(app_module, "client", TruncatedClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     usage_store = _wire_usage_store(monkeypatch)
@@ -827,8 +808,7 @@ def test_respond_save_failure_still_shows_answer_and_settles_usage(
     store = FailingSaveStore()
     monkeypatch.setattr(app_module, "client", fake_client)
     monkeypatch.setattr(app_module, "history_store", store)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     usage_store = _wire_usage_store(monkeypatch)
@@ -870,6 +850,50 @@ def test_respond_save_failure_still_shows_answer_and_settles_usage(
     assert store.save([{"role": "user", "content": "探针"}], "user1", 0)
 
 
+def test_respond_log_write_failure_still_saves_and_settles(monkeypatch, tmp_path):
+    """日志写入失败（数据目录被文件占用）不影响回答保存、显示与用量结算。"""
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("占用数据目录位置的普通文件", encoding="utf-8")
+    monkeypatch.setattr(app_module, "event_logger", FileEventLogger(blocker))
+    fake_client = _FakeClient()
+    store = _use_memory_store(monkeypatch)
+    monkeypatch.setattr(app_module, "client", fake_client)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    usage_store = _wire_usage_store(monkeypatch)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    # 聊天照常完成：回答保存、显示，会话与每日用量正常结算
+    assert final_history[-1]["content"] == "你好世界"
+    assert store._messages["user1"] == final_history
+    assert fake_client.calls == 1
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_store.get_used(today, "user1") == 123
+    assert usage_store.get_total(today) == 123
+    # 日志写入一直失败，但未产生任何日志文件
+    assert not (blocker / "chat.log").exists()
+
+
 def test_respond_stale_save_shows_not_saved_and_settles_usage(
     monkeypatch, tmp_path
 ):
@@ -878,8 +902,7 @@ def test_respond_stale_save_shows_not_saved_and_settles_usage(
     store = StaleSaveStore()
     monkeypatch.setattr(app_module, "client", fake_client)
     monkeypatch.setattr(app_module, "history_store", store)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     usage_store = _wire_usage_store(monkeypatch)
@@ -936,9 +959,7 @@ def test_respond_stream_error_save_failure_still_shows_partial(
     monkeypatch.setattr(app_module, "client", fake_client)
     monkeypatch.setattr(app_module, "clients", {})
     monkeypatch.setattr(app_module, "history_store", store)
-    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
@@ -1005,9 +1026,7 @@ def test_respond_stream_error_stale_save_shows_not_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "client", fake_client)
     monkeypatch.setattr(app_module, "clients", {})
     monkeypatch.setattr(app_module, "history_store", store)
-    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
@@ -1064,8 +1083,7 @@ def test_respond_truncated_save_failure_shows_both_hints(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "clients", {})
     store = FailingSaveStore()
     monkeypatch.setattr(app_module, "history_store", store)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     usage_store = _wire_usage_store(monkeypatch)
@@ -1101,22 +1119,18 @@ def test_respond_truncated_save_failure_shows_both_hints(monkeypatch, tmp_path):
 
 
 def _patch_daily_env(monkeypatch, daily_store, client):
-    """为每日失败场景准备隔离环境，返回 (访问日志记录, 历史假存储)。
+    """为每日失败场景准备隔离环境，返回 (内存日志对象, 历史假存储)。
 
-    每日存储由调用方按场景给定；访问日志保留下来供断言失败留痕。
+    每日存储由调用方按场景给定；日志对象保留访问事件供断言失败留痕。
     """
     history_store = _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "client", client)
     monkeypatch.setattr(app_module, "daily_usage_store", daily_store)
-    logs = []
-    monkeypatch.setattr(
-        app_module, "log_access_event", lambda *a, **k: logs.append(a)
-    )
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    logger = _use_memory_logger(monkeypatch)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
-    return logs, history_store
+    return logger, history_store
 
 
 def _run_respond_once(
@@ -1157,7 +1171,7 @@ def test_respond_quota_read_failure_skips_model(monkeypatch, tmp_path):
     corrupt = tmp_path / "usage_daily.json"
     corrupt.write_text("{损坏", encoding="utf-8")
     fake_client = _FakeClient()
-    logs, _store = _patch_daily_env(
+    logger, _store = _patch_daily_env(
         monkeypatch, DailyUsageStore(corrupt), fake_client
     )
 
@@ -1170,7 +1184,7 @@ def test_respond_quota_read_failure_skips_model(monkeypatch, tmp_path):
     assert final_history == []
     assert usage_state == state0
     assert fake_client.calls == 0  # 不调用模型
-    assert any("额度检查失败" in str(args) for args in logs)
+    assert any("额度检查失败" in str(args) for args in logger.access_events)
     # 损坏文件不被覆盖
     assert corrupt.read_text(encoding="utf-8") == "{损坏"
 
@@ -1179,7 +1193,7 @@ def test_respond_daily_write_failure_still_completes(monkeypatch, tmp_path):
     """正常回答遇到每日写入失败：回答照常保存与显示，提示每日用量未记录成功。"""
     fake_client = _FakeClient()
     usage_store = FailingDailyUsageStore()
-    logs, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
+    logger, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
 
     final_history, _, status, usage_text, state, _, _, _ = _run_respond_once()
 
@@ -1211,7 +1225,7 @@ def test_respond_truncated_daily_write_failure_keeps_hints(
             yield None, None, _FakeUsage(), "length"
 
     usage_store = FailingDailyUsageStore()
-    logs, store = _patch_daily_env(monkeypatch, usage_store, TruncatedClient())
+    logger, store = _patch_daily_env(monkeypatch, usage_store, TruncatedClient())
 
     final_history, _, status, _, state, _, _, _ = _run_respond_once()
 
@@ -1244,8 +1258,7 @@ def test_respond_stream_error_daily_write_failure_still_finishes(
 
     fake_client = InterruptedClient()
     usage_store = FailingDailyUsageStore()
-    logs, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
-    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
+    logger, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
     expected_tokens = usage_module.estimate_tokens(partial_answer)
 
     final_history, _, status, _, state, _, _, _ = _run_respond_once()
@@ -1279,8 +1292,7 @@ def test_respond_empty_answer_daily_write_failure_still_finishes(
             yield None, None, EmptyAnswerUsage(), "length"
 
     usage_store = FailingDailyUsageStore()
-    logs, store = _patch_daily_env(monkeypatch, usage_store, EmptyAnswerClient())
-    monkeypatch.setattr(app_module, "_log_empty_reply", lambda **k: None)
+    logger, store = _patch_daily_env(monkeypatch, usage_store, EmptyAnswerClient())
 
     final_history, _, status, _, state, _, _, _ = _run_respond_once(thinking=True)
 
@@ -1307,7 +1319,7 @@ def test_respond_question_count_failure_does_not_break_chat(
             raise OSError("模拟提问次数写盘失败")
 
     usage_store = FailingQuestionStore()
-    logs, store = _patch_daily_env(monkeypatch, usage_store, _FakeClient())
+    logger, store = _patch_daily_env(monkeypatch, usage_store, _FakeClient())
 
     final_history, _, status, _, state, _, _, _ = _run_respond_once()
 
@@ -1317,7 +1329,7 @@ def test_respond_question_count_failure_does_not_break_chat(
     today = __import__("datetime").date.today().isoformat()
     assert usage_store.get_used(today, "user1") == 123
     assert usage_store.get_questions(today) == 0
-    assert any("提问次数记录失败" in str(args) for args in logs)
+    assert any("提问次数记录失败" in str(args) for args in logger.access_events)
 
 
 def test_respond_daily_recorded_but_global_refresh_fails(monkeypatch, tmp_path):
@@ -1339,7 +1351,7 @@ def test_respond_daily_recorded_but_global_refresh_fails(monkeypatch, tmp_path):
 
     fake_client = _FakeClient()
     usage_store = GlobalRefreshFailsStore()
-    logs, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
+    logger, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
 
     final_history, _, status, usage_text, state, _, _, _ = _run_respond_once()
 
@@ -1361,5 +1373,5 @@ def test_respond_daily_recorded_but_global_refresh_fails(monkeypatch, tmp_path):
     assert "今日已用 123 / 1,000,000（本账号）" in usage_text
     assert "全局" not in usage_text
     # 日志区分两种失败
-    assert any("全局统计刷新失败" in str(args) for args in logs)
-    assert not any("每日用量记录失败" in str(args) for args in logs)
+    assert any("全局统计刷新失败" in str(args) for args in logger.access_events)
+    assert not any("每日用量记录失败" in str(args) for args in logger.access_events)

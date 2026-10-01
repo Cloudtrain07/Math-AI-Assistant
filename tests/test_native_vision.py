@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
-from conftest import MemoryDailyUsageStore, MemoryHistoryStore
+from conftest import MemoryDailyUsageStore, MemoryEventLogger, MemoryHistoryStore
 from core.providers import _sanitize_provider, get_provider_supports_vision
 from core.message_builder import to_api_messages
 
@@ -64,8 +64,7 @@ def _stage_answer_mode():
 def _patch_common(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "history_store", MemoryHistoryStore())
     monkeypatch.setattr(app_module, "daily_usage_store", MemoryDailyUsageStore())
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
 
@@ -141,7 +140,7 @@ def test_to_api_messages_image_without_user_message_is_ignored():
 
 
 def test_on_image_upload_vision_provider_only_pends(monkeypatch):
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
     results = list(app_module.on_image_upload("/tmp/x.png", "glm"))
     textbox, status, image_out, image_state = results[-1]
     assert "图片已就绪" in status
@@ -150,7 +149,7 @@ def test_on_image_upload_vision_provider_only_pends(monkeypatch):
 
 
 def test_on_image_upload_text_provider_only_pends(monkeypatch):
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
     results = list(app_module.on_image_upload("/tmp/x.png", "deepseek"))
     textbox, status, image_out, image_state = results[-1]
     assert image_out == "/tmp/x.png"  # 与看图服务商行为一致：保留待发

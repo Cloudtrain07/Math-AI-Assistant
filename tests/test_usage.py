@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
-from conftest import MemoryDailyUsageStore
+from conftest import MemoryDailyUsageStore, MemoryEventLogger
 from core.usage import (
     check_daily_quota,
     estimate_tokens,
@@ -203,12 +203,9 @@ def _fake_request():
 
 def test_check_login_records_login_and_keeps_result(monkeypatch):
     store = MemoryDailyUsageStore()
-    logs = []
     monkeypatch.setattr(app_module, "daily_usage_store", store)
     monkeypatch.setattr(app_module, "check_login", lambda u, p: True)
-    monkeypatch.setattr(
-        app_module, "log_access_event", lambda *a, **k: logs.append(a)
-    )
+    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
 
     assert app_module._check_login("user1", "pw") is True
     assert store.get_logins(datetime.date.today().isoformat()) == 1
@@ -220,16 +217,14 @@ def test_check_login_failure_keeps_result_and_logs(monkeypatch):
             raise OSError("模拟登录次数写盘失败")
 
     store = FailingLoginStore()
-    logs = []
+    logger = MemoryEventLogger()
     monkeypatch.setattr(app_module, "daily_usage_store", store)
     monkeypatch.setattr(app_module, "check_login", lambda u, p: True)
-    monkeypatch.setattr(
-        app_module, "log_access_event", lambda *a, **k: logs.append(a)
-    )
+    monkeypatch.setattr(app_module, "event_logger", logger)
 
     # 登录次数记录失败不改变密码校验结果，并留下明确失败信息
     assert app_module._check_login("user1", "pw") is True
-    assert any("登录次数记录失败" in str(args) for args in logs)
+    assert any("登录次数记录失败" in str(args) for args in logger.access_events)
     assert store.get_logins(datetime.date.today().isoformat()) == 0
 
 

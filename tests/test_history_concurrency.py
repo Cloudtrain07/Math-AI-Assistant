@@ -11,7 +11,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
-from conftest import MemoryDailyUsageStore, MemoryHistoryStore
+from conftest import (
+    MemoryDailyUsageStore,
+    MemoryEventLogger,
+    MemoryHistoryStore,
+)
 from core import usage as usage_module
 
 
@@ -50,8 +54,7 @@ def _stage0():
 def _patch_respond_env(monkeypatch, tmp_path, store):
     monkeypatch.setattr(app_module, "client", _FakeClient())
     monkeypatch.setattr(app_module, "history_store", store)
-    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     return _wire_usage_store(monkeypatch)

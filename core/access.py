@@ -5,19 +5,14 @@ from __future__ import annotations
 import datetime
 import secrets
 import socket
-import threading
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 ACCESS_FILE = DATA_DIR / "当前访问密码.txt"
-ACCESS_LOG = DATA_DIR / "access.log"
 
 # 排除易混淆字符（0/O、1/I/l）
 _PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 DEFAULT_PASSWORD_LENGTH = 8
-DEFAULT_LOG_MAX_LINES = 1000
-
-_log_lock = threading.Lock()
 
 _OWNER_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
@@ -67,36 +62,6 @@ def save_access_info(
     ]
     target.write_text("\n".join(lines), encoding="utf-8")
     return target
-
-
-def trim_log_file(path: Path | str, max_lines: int = DEFAULT_LOG_MAX_LINES) -> None:
-    """日志超过 max_lines 行时只保留最后 max_lines 行（失败静默）。"""
-    try:
-        target = Path(path)
-        if not target.exists():
-            return
-        lines = target.read_text(encoding="utf-8").splitlines()
-        if len(lines) > max_lines:
-            target.write_text(
-                "\n".join(lines[-max_lines:]) + "\n", encoding="utf-8"
-            )
-    except Exception:
-        pass
-
-
-def log_access_event(*parts: str, target: Path | None = None) -> None:
-    """把一条访问事件追加写入 access.log，并只保留最近 1000 条（写失败静默）。"""
-    try:
-        path = Path(target) if target is not None else ACCESS_LOG
-        path.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] " + " ".join(str(p) for p in parts) + "\n"
-        with _log_lock:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line)
-            trim_log_file(path)
-    except Exception:
-        return
 
 
 def is_owner_host(ip: str | None) -> bool:

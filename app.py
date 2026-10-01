@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import threading
 import time
@@ -14,9 +13,7 @@ import gradio as gr
 from core.access import (
     get_lan_ip,
     is_owner_host,
-    log_access_event,
     save_access_info,
-    trim_log_file,
 )
 from core.accounts import (
     check_login,
@@ -29,6 +26,7 @@ from core.backup import daily_backup_loop, ensure_today_backup
 from core.compressor import HistoryCompressor
 from core.config import get_base_settings
 from core.llm_client import LLMClient, MaxWaitTimeout
+from core.logger import FileEventLogger
 from core.providers import (
     get_available_providers,
     get_default_provider,
@@ -58,8 +56,6 @@ APP_VERSION = "1.3.1"
 # 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
 ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
 accounts = ensure_accounts(ACCOUNT_COUNT)
-# 日志文件保留的最大行数（超过后自动裁剪）
-LOG_MAX_LINES = 2000
 
 # 移动端适配与整体排版（蓝白黑冷色调主题之外的少量微调）
 PAGE_CSS = """
@@ -107,7 +103,15 @@ GLOBAL_DAILY_LIMIT = (
 # 单条消息最大长度（字符），超长直接拒绝
 MAX_MESSAGE_LEN = settings.max_message_len if settings else 2000
 
-_log_lock = threading.Lock()
+# 共享日志对象：聊天/访问/错误日志统一经它写入与裁剪，测试可替换为内存实现
+event_logger = FileEventLogger(
+    DATA_DIR,
+    model=settings.model if settings is not None else None,
+    thinking=settings.thinking if settings is not None else None,
+    reasoning_effort=(
+        settings.reasoning_effort if settings is not None else None
+    ),
+)
 
 
 def _new_image_state() -> dict:
@@ -166,7 +170,7 @@ def _record_daily_usage(
     try:
         daily_used = daily_usage_store.add_usage(date, username, turn_total)
     except Exception as exc:
-        log_access_event(
+        event_logger.log_access_event(
             "每日用量记录失败",
             f"账号={username}",
             f"错误={exc.__class__.__name__}",
@@ -175,7 +179,7 @@ def _record_daily_usage(
     try:
         global_used = daily_usage_store.get_total(date)
     except Exception as exc:
-        log_access_event(
+        event_logger.log_access_event(
             "全局统计刷新失败",
             f"账号={username}",
             f"错误={exc.__class__.__name__}",
@@ -228,89 +232,14 @@ def _friendly_error(exc: Exception) -> str:
 def _check_login(username: str, password: str) -> bool:
     """校验登录并记录到访问日志（Gradio auth 回调）。"""
     ok = check_login(username, password)
-    log_access_event("登录", f"账号={username}", f"结果={'成功' if ok else '失败'}")
+    event_logger.log_access_event("登录", f"账号={username}", f"结果={'成功' if ok else '失败'}")
     if ok:
         try:
             daily_usage_store.add_login(datetime.date.today().isoformat())
         except Exception:
             # 登录次数记录失败不影响密码校验结果，留下失败信息即可
-            log_access_event("登录次数记录失败", f"账号={username}")
+            event_logger.log_access_event("登录次数记录失败", f"账号={username}")
     return ok
-
-
-def _log_event(kind: str, text: str) -> None:
-    """把事件与文本追加写入 data/chat.log，用于排查发送链路完整性。"""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        head = text[:40].replace("\n", "⏎")
-        tail = text[-40:].replace("\n", "⏎")
-        line = f"[{ts}] {kind} 长度={len(text)} 开头={head!r} 结尾={tail!r}\n"
-        with _log_lock:
-            with open(DATA_DIR / "chat.log", "a", encoding="utf-8") as f:
-                f.write(line)
-            trim_log_file(DATA_DIR / "chat.log", max_lines=LOG_MAX_LINES)
-    except Exception:
-        pass
-
-
-def _write_error_log(record: dict) -> None:
-    """把一条诊断记录追加写入 data/error.log（JSON 一行一条）。"""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with _log_lock:
-            with open(DATA_DIR / "error.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            trim_log_file(DATA_DIR / "error.log", max_lines=LOG_MAX_LINES)
-    except Exception:
-        pass
-
-
-def _base_error_record(account: str, turn_total: int | None) -> dict:
-    """公共字段：当前配置与账号信息。"""
-    return {
-        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "account": account,
-        "tokens": turn_total,
-        "model": settings.model if settings is not None else None,
-        "thinking": settings.thinking if settings is not None else None,
-        "reasoning_effort": (
-            settings.reasoning_effort if settings is not None else None
-        ),
-    }
-
-
-def _log_error(
-    exc: Exception, *, account: str, turn_total: int | None, partial: bool
-) -> None:
-    """把一次 API 异常的完整信息写入 data/error.log，便于定位根因。"""
-    record = _base_error_record(account, turn_total)
-    record.update(
-        {
-            "type": exc.__class__.__name__,
-            "message": str(exc)[:2000],
-            "partial_answer": partial,
-        }
-    )
-    _write_error_log(record)
-
-
-def _log_empty_reply(
-    *, account: str, turn_total: int | None, truncated: bool
-) -> None:
-    """记录"请求完成但没收到正式回答"的情况（常见于思考链耗尽输出额度）。"""
-    record = _base_error_record(account, turn_total)
-    record.update(
-        {
-            "type": "empty_reply",
-            "truncated": truncated,
-            "message": (
-                "请求完成但未收到正式回答（无异常抛出）；"
-                f"truncated={truncated}，可能为思考链已用尽 max_tokens 额度"
-            ),
-        }
-    )
-    _write_error_log(record)
 
 
 def _recognition_incomplete(text: str) -> bool:
@@ -331,7 +260,7 @@ def on_image_upload(image: str | None, provider_id: str | None):
     if not image:
         yield gr.skip(), "", gr.skip(), _new_image_state()    #输出重置UI的指令
         return  #退出函数
-    _log_event("图片就绪", str(image))
+    event_logger.log_chat_event("图片就绪", str(image))
     yield (
         gr.skip(),
         "🖼️ 图片已就绪：输入你的问题后点击发送。"
@@ -399,7 +328,7 @@ def respond(
     ip = (request.client.host if request and request.client else None) or "unknown"
 
     if input_result["error"] == "too_long":
-        log_access_event(
+        event_logger.log_access_event(
             "过长拒绝",
             f"账号={username}",
             f"IP={ip}",
@@ -424,7 +353,7 @@ def respond(
         global_used = daily_usage_store.get_total(today)   #获取当天全局用量
     except DailyUsageReadError:
         # 无法读取额度时明确提示并结束本次请求，不调用模型
-        log_access_event("额度检查失败", f"账号={username}")
+        event_logger.log_access_event("额度检查失败", f"账号={username}")
         yield (
             history,
             "",
@@ -440,7 +369,7 @@ def respond(
         daily_used, global_used, DAILY_LIMIT, GLOBAL_DAILY_LIMIT
     )
     if quota_msg is not None:
-        log_access_event(
+        event_logger.log_access_event(
             "超额拒绝",
             f"账号={username}",
             f"本账号={daily_used}",
@@ -468,17 +397,17 @@ def respond(
     )
 
     user_content = normalize_math_text(message, auto_close=True)     #补全用户输入公式，并且改成新的变量
-    _log_event("发送", user_content)
-    log_access_event(
+    event_logger.log_chat_event("发送", user_content)
+    event_logger.log_access_event(
         "提问", f"账号={username}", f"IP={ip}", f"长度={len(message)}"
     )
     try:
         daily_usage_store.add_question(today)
     except Exception:
         # 提问次数记录失败不打断聊天，留下明确失败信息
-        log_access_event("提问次数记录失败", f"账号={username}")
+        event_logger.log_access_event("提问次数记录失败", f"账号={username}")
     if _recognition_incomplete(message):
-        _log_event("发送-原始疑似不完整", message)
+        event_logger.log_chat_event("发送-原始疑似不完整", message)
     history.append({"role": "user", "content": user_content})
     # 根据界面选择的服务商使用对应客户端
     active_client = clients.get(provider_id) or client
@@ -603,7 +532,7 @@ def respond(
             answer,
             interrupted=True,
         )
-        _log_error(
+        event_logger.log_error(
             exc, account=username, turn_total=turn_total, partial=bool(answer)
         )
         daily_note = ""
@@ -612,7 +541,7 @@ def respond(
                 today, username, turn_total
             )
             if daily_used is not None:
-                log_access_event(
+                event_logger.log_access_event(
                     "回复失败",
                     f"账号={username}",
                     f"错误={exc.__class__.__name__}",
@@ -620,11 +549,11 @@ def respond(
                     f"本账号={daily_used}",
                 )
             else:
-                log_access_event(
+                event_logger.log_access_event(
                     "回复失败", f"账号={username}", f"错误={exc.__class__.__name__}"
                 )
         else:
-            log_access_event(
+            event_logger.log_access_event(
                 "回复失败", f"账号={username}", f"错误={exc.__class__.__name__}"
             )
         partial_history = chat_service.build_answer_history(history, answer)
@@ -669,7 +598,7 @@ def respond(
             _daily_used, _global_used, daily_note = _record_daily_usage(
                 today, username, turn_total
             )
-        _log_empty_reply(
+        event_logger.log_empty_reply(
             account=username, turn_total=turn_total, truncated=truncated
         )
         if truncated:
@@ -714,7 +643,7 @@ def respond(
         )
         if daily_used is not None:
             if global_used is not None:
-                log_access_event(
+                event_logger.log_access_event(
                     "回复",
                     f"账号={username}",
                     f"tokens={turn_total}",
@@ -723,13 +652,13 @@ def respond(
                 )
             else:
                 # 全局统计暂时不可用，只记录已知的账号累计
-                log_access_event(
+                event_logger.log_access_event(
                     "回复",
                     f"账号={username}",
                     f"tokens={turn_total}",
                     f"本账号={daily_used}",
                 )
-    _log_event("回复", answer)
+    event_logger.log_chat_event("回复", answer)
     result_text = format_usage(usage)
     if image_status:
         result_text = f"{image_status}\n\n{result_text}" if result_text else image_status
@@ -886,7 +815,7 @@ def reset_account_password(
     global accounts
     if reset_password(account_name, new_password):
         accounts = load_accounts()
-        log_access_event("重置密码", f"账号={account_name}")
+        event_logger.log_access_event("重置密码", f"账号={account_name}")
         return f"✅ 已重置账号 {account_name} 的密码。"
     return "⚠️ 账号不存在，请刷新页面后重试。"
 
