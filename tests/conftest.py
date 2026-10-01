@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""共享测试设施：与 HistoryStore 接口一致的内存假存储及失败注入变体。
+"""共享测试设施：与正式存储接口一致的内存假实现及失败注入变体。
 
-消息过滤与公式归一化复用 core.storage 的公共规则，保证与文件存储读出结果一致。
+- MemoryHistoryStore：消息过滤与公式归一化复用 core.storage 的公共规则；
+- MemoryDailyUsageStore：每日用量的统计规则与文件实现保持一致。
 """
 
 import copy
@@ -11,6 +12,12 @@ from core.storage import (
     filter_valid_messages,
     normalize_loaded_messages,
     safe_account_name,
+)
+from core.usage_store import (
+    _LOGINS_KEY,
+    _QUESTIONS_KEY,
+    _RESERVED_KEYS,
+    _TOTAL_KEY,
 )
 
 
@@ -84,3 +91,96 @@ class FailingClearStore(MemoryHistoryStore):
     def clear(self, username):
         self.clear_calls += 1
         raise OSError("模拟清空写盘失败")
+
+
+class MemoryDailyUsageStore:
+    """内存版每日用量存储：接口与 DailyUsageStore 一致，供测试替换文件实现。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+
+    def _day(self, date: str) -> dict:
+        day = self._data.get(date)
+        return day if isinstance(day, dict) else {}
+
+    # ---- 读取 ----
+
+    def get_used(self, date: str, account: str) -> int:
+        with self._lock:
+            return int(self._day(date).get(account, 0) or 0)
+
+    def get_total(self, date: str) -> int:
+        with self._lock:
+            day = self._day(date)
+        if _TOTAL_KEY in day:
+            return int(day[_TOTAL_KEY] or 0)
+        return sum(
+            int(value or 0)
+            for key, value in day.items()
+            if key not in _RESERVED_KEYS
+        )
+
+    def get_account_usage(self, date: str) -> dict[str, int]:
+        with self._lock:
+            day = self._day(date)
+        return {
+            key: int(value or 0)
+            for key, value in day.items()
+            if key not in _RESERVED_KEYS
+        }
+
+    def get_logins(self, date: str) -> int:
+        with self._lock:
+            return int(self._day(date).get(_LOGINS_KEY, 0) or 0)
+
+    def get_questions(self, date: str) -> int:
+        with self._lock:
+            return int(self._day(date).get(_QUESTIONS_KEY, 0) or 0)
+
+    # ---- 记录（累加语义，与文件实现一致） ----
+
+    def add_usage(self, date: str, account: str, tokens: int) -> int:
+        with self._lock:
+            day = self._data.setdefault(date, {})
+            day[account] = int(day.get(account, 0) or 0) + int(tokens)
+            day[_TOTAL_KEY] = int(day.get(_TOTAL_KEY, 0) or 0) + int(tokens)
+            return int(day[account])
+
+    def add_login(self, date: str) -> int:
+        with self._lock:
+            day = self._data.setdefault(date, {})
+            day[_LOGINS_KEY] = int(day.get(_LOGINS_KEY, 0) or 0) + 1
+            return int(day[_LOGINS_KEY])
+
+    def add_question(self, date: str) -> int:
+        with self._lock:
+            day = self._data.setdefault(date, {})
+            day[_QUESTIONS_KEY] = int(day.get(_QUESTIONS_KEY, 0) or 0) + 1
+            return int(day[_QUESTIONS_KEY])
+
+
+class CountingDailyUsageStore(MemoryDailyUsageStore):
+    """记录 add_usage 调用的假存储，用于断言每日只尝试记录一次。"""
+
+    def __init__(self):
+        super().__init__()
+        self.add_usage_calls: list[tuple[str, str, int]] = []
+
+    def add_usage(self, date, account, tokens):
+        self.add_usage_calls.append((date, account, tokens))
+        return super().add_usage(date, account, tokens)
+
+
+class FailingDailyUsageStore(CountingDailyUsageStore):
+    """add_usage 可控失败的假存储：fail 为 True 时抛写盘异常。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fail = True
+
+    def add_usage(self, date, account, tokens):
+        self.add_usage_calls.append((date, account, tokens))
+        if self.fail:
+            raise OSError("模拟每日用量写盘失败")
+        return MemoryDailyUsageStore.add_usage(self, date, account, tokens)

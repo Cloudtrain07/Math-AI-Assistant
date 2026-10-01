@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gradio as gr
 
 import app as app_module
-from conftest import FailingClearStore, MemoryHistoryStore
+from conftest import FailingClearStore, MemoryDailyUsageStore, MemoryHistoryStore
 
 
 def _fake_request():
@@ -20,12 +20,9 @@ def _fake_request():
 def _patch_env(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "client", None)
     monkeypatch.setattr(app_module, "history_store", MemoryHistoryStore())
+    monkeypatch.setattr(app_module, "daily_usage_store", MemoryDailyUsageStore())
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
-    monkeypatch.setattr(app_module, "add_daily_question", lambda d: None)
-    monkeypatch.setattr(app_module, "add_daily_usage", lambda d, u, t: 0)
-    monkeypatch.setattr(app_module, "get_daily_used", lambda d, u: 0)
-    monkeypatch.setattr(app_module, "get_daily_total", lambda d: 0)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
 

@@ -1,21 +1,9 @@
-"""会话内 token 用量累计与每日限额：纯函数，便于界面调用与单元测试。"""
+"""会话内 token 用量累计、估算与每日额度判断：纯函数，便于界面调用与单元测试。
+
+每日用量的文件读写集中在 core/usage_store.DailyUsageStore。
+"""
 
 from __future__ import annotations
-
-import json
-import os
-import threading
-from pathlib import Path
-
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DAILY_USAGE_FILE = DATA_DIR / "usage_daily.json"
-
-_daily_lock = threading.Lock()
-
-_TOTAL_KEY = "__total__"
-_LOGINS_KEY = "__logins__"
-_QUESTIONS_KEY = "__questions__"
-_RESERVED_KEYS = (_TOTAL_KEY, _LOGINS_KEY, _QUESTIONS_KEY)
 
 
 def new_usage_state() -> dict:
@@ -82,117 +70,6 @@ def format_cumulative(state: dict) -> str:
         f"📊 本会话累计 {total} tokens"
         f"（输入 {int(prompt):,} + 输出 {int(completion):,}，共 {turns} 轮）"
     )
-
-
-def _read_daily(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_daily(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def get_daily_used(date: str, ip: str, path: Path | None = None) -> int:
-    """读取指定日期、账号的已用 token 数（v1.2 起按账号记录）。"""
-    path = path or DAILY_USAGE_FILE
-    with _daily_lock:
-        data = _read_daily(path)
-    return int(data.get(date, {}).get(ip, 0) or 0)
-
-
-def add_daily_usage(date: str, ip: str, tokens: int, path: Path | None = None) -> int:
-    """累加指定日期、账号的 token 用量，并同步累加全局总量，返回该账号当日累计值。"""
-    path = path or DAILY_USAGE_FILE
-    with _daily_lock:
-        data = _read_daily(path)
-        day = data.get(date)
-        if not isinstance(day, dict):
-            day = {}
-            data[date] = day
-        day[ip] = int(day.get(ip, 0) or 0) + int(tokens)
-        day[_TOTAL_KEY] = int(day.get(_TOTAL_KEY, 0) or 0) + int(tokens)
-        _write_daily(path, data)
-        return int(day[ip])
-
-
-def get_daily_total(date: str, path: Path | None = None) -> int:
-    """读取指定日期的全局已用 token；旧数据无 __total__ 时回退为各账号求和。"""
-    path = path or DAILY_USAGE_FILE
-    with _daily_lock:
-        data = _read_daily(path)
-        day = data.get(date)
-        if not isinstance(day, dict):
-            return 0
-    if _TOTAL_KEY in day:
-        return int(day[_TOTAL_KEY] or 0)
-    return sum(
-        int(value or 0)
-        for key, value in day.items()
-        if key not in _RESERVED_KEYS
-    )
-
-
-def get_daily_ip_usage(date: str, path: Path | None = None) -> dict:
-    """读取指定日期各账号的用量（排除保留键）。"""
-    path = path or DAILY_USAGE_FILE
-    with _daily_lock:
-        data = _read_daily(path)
-        day = data.get(date)
-        if not isinstance(day, dict):
-            return {}
-    return {
-        ip: int(tokens or 0)
-        for ip, tokens in day.items()
-        if ip not in _RESERVED_KEYS
-    }
-
-
-def _bump_daily_counter(
-    date: str, key: str, amount: int, path: Path | None = None
-) -> int:
-    path = path or DAILY_USAGE_FILE
-    with _daily_lock:
-        data = _read_daily(path)
-        day = data.get(date)
-        if not isinstance(day, dict):
-            day = {}
-            data[date] = day
-        day[key] = int(day.get(key, 0) or 0) + int(amount)
-        _write_daily(path, data)
-        return int(day[key])
-
-
-def add_daily_login(date: str, path: Path | None = None) -> int:
-    """记录一次成功登录，返回当日登录次数。"""
-    return _bump_daily_counter(date, _LOGINS_KEY, 1, path)
-
-
-def get_daily_logins(date: str, path: Path | None = None) -> int:
-    path = path or DAILY_USAGE_FILE
-    with _daily_lock:
-        data = _read_daily(path)
-        day = data.get(date)
-    return int(day.get(_LOGINS_KEY, 0) or 0) if isinstance(day, dict) else 0
-
-
-def add_daily_question(date: str, path: Path | None = None) -> int:
-    """记录一次提问，返回当日提问次数。"""
-    return _bump_daily_counter(date, _QUESTIONS_KEY, 1, path)
-
-
-def get_daily_questions(date: str, path: Path | None = None) -> int:
-    path = path or DAILY_USAGE_FILE
-    with _daily_lock:
-        data = _read_daily(path)
-        day = data.get(date)
-    return int(day.get(_QUESTIONS_KEY, 0) or 0) if isinstance(day, dict) else 0
 
 
 def is_over_limit(used: int, limit: int) -> bool:

@@ -45,19 +45,12 @@ from core.prompts import (
 from core.storage import HistoryReadError, get_history_store
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.usage import (
-    add_daily_login,
-    add_daily_question,
-    add_daily_usage,
     check_daily_quota,
     estimate_tokens,
     format_cumulative,
-    get_daily_used,
-    get_daily_ip_usage,
-    get_daily_logins,
-    get_daily_questions,
-    get_daily_total,
     new_usage_state,
 )
+from core.usage_store import DailyUsageReadError, DailyUsageStore
 from core import dialogue_state
 from core import chat_service 
 
@@ -103,6 +96,8 @@ else:
 history_compressor = HistoryCompressor()
 # 会话历史存储：整个应用共用同一实例，同一账号的历史文件共用锁与保存计数
 history_store = get_history_store(DATA_DIR)
+# 每日用量存储：整个应用共用同一实例（读-改-写在存储模块内的单进程锁中完成）
+daily_usage_store = DailyUsageStore(DATA_DIR / "usage_daily.json")
 # 每日每账号 token 上限（成本护栏）
 DAILY_LIMIT = settings.daily_token_limit if settings is not None else 1_000_000
 # 全局每日 token 总上限（成本护栏第二道保险）
@@ -137,6 +132,10 @@ _CLEAR_FAILED_MSG = "⚠️ 清空未成功，请稍后重试。"
 _RESTORE_FAILED_MSG = (
     "⚠️ 上次聊天记录读取失败（{detail}），本次以空历史开始；原文件未修改。"
 )
+# 每日用量失败提示：只追加说明，不掩盖原有的模型异常、截断或历史保存提示
+_DAILY_FAILED_MSG = "⚠️ 每日用量未记录成功。"
+_DAILY_STATS_FAILED_MSG = "⚠️ 每日用量已记录，但全局统计暂时无法刷新。"
+_QUOTA_CHECK_FAILED_MSG = "⚠️ 每日额度暂时无法检查，请稍后重试。"
 
 
 def _save_turn_history(username: str, turn_token: int, turn_history: list[dict]) -> tuple[bool, str]:
@@ -153,6 +152,36 @@ def _save_turn_history(username: str, turn_token: int, turn_history: list[dict])
     if saved:
         return True, ""
     return False, _SAVE_STALE_MSG
+
+
+def _record_daily_usage(
+    date: str, username: str, turn_total: int
+) -> tuple[int | None, int | None, str]:
+    """记录每日用量，返回 (账号当日累计, 全局当日累计, 失败提示)。
+
+    记录失败不重试；调用方仍完成回答保存与本会话结算，只在状态栏提示。
+    两种失败分开报告：用量写入失败时两者皆未知；写入成功而全局统计
+    刷新失败时，保留已写入的账号累计，只提示统计暂时不可用。
+    """
+    try:
+        daily_used = daily_usage_store.add_usage(date, username, turn_total)
+    except Exception as exc:
+        log_access_event(
+            "每日用量记录失败",
+            f"账号={username}",
+            f"错误={exc.__class__.__name__}",
+        )
+        return None, None, _DAILY_FAILED_MSG
+    try:
+        global_used = daily_usage_store.get_total(date)
+    except Exception as exc:
+        log_access_event(
+            "全局统计刷新失败",
+            f"账号={username}",
+            f"错误={exc.__class__.__name__}",
+        )
+        return daily_used, None, _DAILY_STATS_FAILED_MSG
+    return daily_used, global_used, ""
 
 
 def format_usage(usage) -> str:
@@ -201,7 +230,11 @@ def _check_login(username: str, password: str) -> bool:
     ok = check_login(username, password)
     log_access_event("登录", f"账号={username}", f"结果={'成功' if ok else '失败'}")
     if ok:
-        add_daily_login(datetime.date.today().isoformat())
+        try:
+            daily_usage_store.add_login(datetime.date.today().isoformat())
+        except Exception:
+            # 登录次数记录失败不影响密码校验结果，留下失败信息即可
+            log_access_event("登录次数记录失败", f"账号={username}")
     return ok
 
 
@@ -386,8 +419,23 @@ def respond(
 
     #日配额检查
     today = datetime.date.today().isoformat()    #获取当前日期
-    daily_used = get_daily_used(today, username)       #获取当前账号今日使用量
-    global_used = get_daily_total(today)        #获取当天全局用量
+    try:
+        daily_used = daily_usage_store.get_used(today, username)   #获取当前账号今日使用量
+        global_used = daily_usage_store.get_total(today)   #获取当天全局用量
+    except DailyUsageReadError:
+        # 无法读取额度时明确提示并结束本次请求，不调用模型
+        log_access_event("额度检查失败", f"账号={username}")
+        yield (
+            history,
+            "",
+            _QUOTA_CHECK_FAILED_MSG,
+            "",
+            usage_state,
+            stage_state,
+            "",
+            image_state,
+        )
+        return
     quota_msg = check_daily_quota(
         daily_used, global_used, DAILY_LIMIT, GLOBAL_DAILY_LIMIT
     )
@@ -424,7 +472,11 @@ def respond(
     log_access_event(
         "提问", f"账号={username}", f"IP={ip}", f"长度={len(message)}"
     )
-    add_daily_question(today)
+    try:
+        daily_usage_store.add_question(today)
+    except Exception:
+        # 提问次数记录失败不打断聊天，留下明确失败信息
+        log_access_event("提问次数记录失败", f"账号={username}")
     if _recognition_incomplete(message):
         _log_event("发送-原始疑似不完整", message)
     history.append({"role": "user", "content": user_content})
@@ -554,15 +606,23 @@ def respond(
         _log_error(
             exc, account=username, turn_total=turn_total, partial=bool(answer)
         )
+        daily_note = ""
         if turn_total is not None:
-            daily_used = add_daily_usage(today, username, turn_total)
-            log_access_event(
-                "回复失败",
-                f"账号={username}",
-                f"错误={exc.__class__.__name__}",
-                f"估算tokens={turn_total}",
-                f"本账号={daily_used}",
+            daily_used, _global_used, daily_note = _record_daily_usage(
+                today, username, turn_total
             )
+            if daily_used is not None:
+                log_access_event(
+                    "回复失败",
+                    f"账号={username}",
+                    f"错误={exc.__class__.__name__}",
+                    f"估算tokens={turn_total}",
+                    f"本账号={daily_used}",
+                )
+            else:
+                log_access_event(
+                    "回复失败", f"账号={username}", f"错误={exc.__class__.__name__}"
+                )
         else:
             log_access_event(
                 "回复失败", f"账号={username}", f"错误={exc.__class__.__name__}"
@@ -584,6 +644,8 @@ def respond(
             status_text = _friendly_error(exc)
         if save_note:
             status_text = f"{status_text}\n\n{save_note}"
+        if daily_note:
+            status_text = f"{status_text}\n\n{daily_note}"
         yield (
             partial_history,
             "",
@@ -602,8 +664,11 @@ def respond(
             usage,
             answer,
         )
+        daily_note = ""
         if turn_total is not None:
-            daily_used = add_daily_usage(today, username, turn_total)
+            _daily_used, _global_used, daily_note = _record_daily_usage(
+                today, username, turn_total
+            )
         _log_empty_reply(
             account=username, turn_total=turn_total, truncated=truncated
         )
@@ -618,6 +683,8 @@ def respond(
             "建议：关闭「深度思考模式」、把 .env 中 DEEPSEEK_REASONING_EFFORT 调低，"
             "或调大 MAX_OUTPUT_TOKENS 后重启。"
         )
+        if daily_note:
+            status_text = f"{status_text}\n\n{daily_note}"
         yield (
             history + [{"role": "assistant", "content": "（未收到正式回答）"}],
             "",
@@ -638,16 +705,30 @@ def respond(
         usage,
         answer,
     )
+    daily_note = ""
+    daily_used = None
+    global_used = None
     if turn_total is not None:
-        daily_used = add_daily_usage(today, username, turn_total)
-        global_used = get_daily_total(today)
-        log_access_event(
-            "回复",
-            f"账号={username}",
-            f"tokens={turn_total}",
-            f"本账号={daily_used}",
-            f"全局={global_used}",
+        daily_used, global_used, daily_note = _record_daily_usage(
+            today, username, turn_total
         )
+        if daily_used is not None:
+            if global_used is not None:
+                log_access_event(
+                    "回复",
+                    f"账号={username}",
+                    f"tokens={turn_total}",
+                    f"本账号={daily_used}",
+                    f"全局={global_used}",
+                )
+            else:
+                # 全局统计暂时不可用，只记录已知的账号累计
+                log_access_event(
+                    "回复",
+                    f"账号={username}",
+                    f"tokens={turn_total}",
+                    f"本账号={daily_used}",
+                )
     _log_event("回复", answer)
     result_text = format_usage(usage)
     if image_status:
@@ -656,11 +737,17 @@ def respond(
         result_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
     if save_note:
         result_text = f"{result_text}\n\n{save_note}"
+    if daily_note:
+        result_text = f"{result_text}\n\n{daily_note}"
     usage_text = format_cumulative(usage_state)
-    usage_text += (
-        f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号），"
-        f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
-    )
+    if daily_used is not None and global_used is not None:
+        usage_text += (
+            f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号），"
+            f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
+        )
+    elif daily_used is not None:
+        # 每日记录失败不显示"今日已用"；记录成功但全局统计不可用时只显示账号累计
+        usage_text += f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号）"
     reasoning_display = normalize_math_text(reasoning_text, auto_close=True)
     yield (
         final_history,
@@ -758,10 +845,14 @@ def render_usage_panel(request: gr.Request) -> str:
     if not is_owner_host(ip):
         return "🔒 （仅主人可见）"
     today = datetime.date.today().isoformat()
-    global_used = get_daily_total(today)
-    per_account = get_daily_ip_usage(today)
-    logins = get_daily_logins(today)
-    questions = get_daily_questions(today)
+    try:
+        global_used = daily_usage_store.get_total(today)
+        per_account = daily_usage_store.get_account_usage(today)
+        logins = daily_usage_store.get_logins(today)
+        questions = daily_usage_store.get_questions(today)
+    except DailyUsageReadError:
+        # 读取失败明确提示，不显示零用量的正常面板
+        return "⚠️ 用量面板读取失败，暂时无法显示今日用量。"
     lines = [
         f"**主人用量面板（{today}）**",
         f"- 全局已用：{global_used:,} / {GLOBAL_DAILY_LIMIT:,} tokens",

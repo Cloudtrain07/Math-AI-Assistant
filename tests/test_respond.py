@@ -9,7 +9,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
-from conftest import FailingSaveStore, MemoryHistoryStore, StaleSaveStore
+from conftest import (
+    CountingDailyUsageStore,
+    FailingDailyUsageStore,
+    FailingSaveStore,
+    MemoryDailyUsageStore,
+    MemoryHistoryStore,
+    StaleSaveStore,
+)
 from core import usage as usage_module
 
 
@@ -61,29 +68,11 @@ def _stage0():
     return {"stage": "initial_hint", "hints": 0, "last_mode": "互动模式"}
 
 
-def _wire_usage_to_tmp(monkeypatch, tmp_path):
-    p = tmp_path / "u.json"
-    monkeypatch.setattr(
-        app_module,
-        "get_daily_used",
-        lambda d, ip: usage_module.get_daily_used(d, ip, path=p),
-    )
-    monkeypatch.setattr(
-        app_module,
-        "get_daily_total",
-        lambda d: usage_module.get_daily_total(d, path=p),
-    )
-    monkeypatch.setattr(
-        app_module,
-        "add_daily_usage",
-        lambda d, ip, t: usage_module.add_daily_usage(d, ip, t, path=p),
-    )
-    monkeypatch.setattr(
-        app_module,
-        "add_daily_question",
-        lambda d: usage_module.add_daily_question(d, path=p),
-    )
-    return p
+def _wire_usage_store(monkeypatch) -> CountingDailyUsageStore:
+    """用内存每日用量存储替换文件实现，返回实例供断言（含 add_usage 调用记录）。"""
+    store = CountingDailyUsageStore()
+    monkeypatch.setattr(app_module, "daily_usage_store", store)
+    return store
 
 
 def test_respond_success_path(monkeypatch, tmp_path):
@@ -94,7 +83,7 @@ def test_respond_success_path(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    p = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -126,8 +115,8 @@ def test_respond_success_path(monkeypatch, tmp_path):
     assert stage_state["stage"] == "initial_hint"
     assert fake_client.calls == 1
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(today, "user1", path=p) == 123
-    assert usage_module.get_daily_total(today, path=p) == 123
+    assert usage_store.get_used(today, "user1") == 123
+    assert usage_store.get_total(today) == 123
 
 
 def test_respond_quota_rejected(monkeypatch, tmp_path):
@@ -138,10 +127,11 @@ def test_respond_quota_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    monkeypatch.setattr(
-        app_module, "get_daily_used", lambda d, ip: 1_000_000
+    # 本账号今日额度已用尽
+    quota_store = _wire_usage_store(monkeypatch)
+    quota_store.add_usage(
+        __import__("datetime").date.today().isoformat(), "user1", 1_000_000
     )
-    monkeypatch.setattr(app_module, "get_daily_total", lambda d: 0)
 
     state0 = {"total_tokens": 0, "turns": 0}
     results = list(
@@ -213,7 +203,7 @@ def test_respond_escape_keyword_full_solution(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    _wire_usage_to_tmp(monkeypatch, tmp_path)
+    _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -245,7 +235,7 @@ def test_respond_practice_keyword_practice_wait(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    _wire_usage_to_tmp(monkeypatch, tmp_path)
+    _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -276,7 +266,7 @@ def test_respond_answer_mode_stage_none(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    _wire_usage_to_tmp(monkeypatch, tmp_path)
+    _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -308,7 +298,7 @@ def test_respond_new_problem_resets_stage(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    _wire_usage_to_tmp(monkeypatch, tmp_path)
+    _wire_usage_store(monkeypatch)
 
     history = [
         {"role": "user", "content": "上一题"},
@@ -345,7 +335,7 @@ def test_respond_reasoning_panel_and_status(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    _wire_usage_to_tmp(monkeypatch, tmp_path)
+    _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -387,7 +377,7 @@ def test_continue_last_answer(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    _wire_usage_to_tmp(monkeypatch, tmp_path)
+    _wire_usage_store(monkeypatch)
 
     history = [
         {"role": "user", "content": "求导"},
@@ -427,7 +417,7 @@ def test_continue_last_answer_keeps_stage(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    _wire_usage_to_tmp(monkeypatch, tmp_path)
+    _wire_usage_store(monkeypatch)
 
     history = [
         {"role": "user", "content": "出道题"},
@@ -493,7 +483,7 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -525,8 +515,8 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
     assert state["total_tokens"] == 123
 
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
-    assert usage_module.get_daily_total(today, path=usage_path) == 123
+    assert usage_store.get_used(today, "user1") == 123
+    assert usage_store.get_total(today) == 123
 
 
 # 没有返回usage，但是输出部分回复
@@ -561,7 +551,7 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -602,11 +592,11 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
     # 账号和全局每日用量都只增加一次。
     today = __import__("datetime").date.today().isoformat()
     assert (
-        usage_module.get_daily_used(today, "user1", path=usage_path)
+        usage_store.get_used(today, "user1")
         == expected_tokens
     )
     assert (
-        usage_module.get_daily_total(today, path=usage_path)
+        usage_store.get_total(today)
         == expected_tokens
     )
 
@@ -653,7 +643,7 @@ def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -689,17 +679,12 @@ def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
     assert state["completion_tokens"] == 23
 
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(
-        today, "user1", path=usage_path
-    ) == 123
-    assert usage_module.get_daily_total(
-        today, path=usage_path
-    ) == 123
+    assert usage_store.get_used(today, "user1") == 123
+    assert usage_store.get_total(today) == 123
 
 
 # 没有输出正式回复，也没有返回usage就报错了
 def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
-    daily_usage_calls = []
     logged_errors = []
     store = _use_memory_store(monkeypatch)
 
@@ -722,14 +707,7 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
-
-    # 这个场景不应该增加每日 token 用量。
-    monkeypatch.setattr(
-        app_module,
-        "add_daily_usage",
-        lambda *a, **k: daily_usage_calls.append((a, k)),
-    )
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -757,7 +735,8 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
     # 没有正式回答：没有任何保存尝试
     assert store._messages.get("user1") is None
     assert store.save_attempts == 0
-    assert daily_usage_calls == []
+    # 这个场景没有每日用量记录
+    assert usage_store.add_usage_calls == []
     assert status
     assert "已保留生成的部分内容" not in status
     assert reasoning == "正在分析题目"
@@ -774,19 +753,14 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
     assert details["turn_total"] is None
 
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(
-        today, "user1", path=usage_path
-    ) == 0
-    assert usage_module.get_daily_total(
-        today, path=usage_path
-    ) == 0
+    assert usage_store.get_used(today, "user1") == 0
+    assert usage_store.get_total(today) == 0
 
 
 @pytest.mark.parametrize("reports_usage", [True, False])
 def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
     monkeypatch, tmp_path, reports_usage
 ):
-    daily_usage_calls = []
     store = _use_memory_store(monkeypatch)
 
     class TruncatedClient:
@@ -802,15 +776,7 @@ def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
-
-    def count_daily_usage(day, username, tokens):
-        daily_usage_calls.append(tokens)
-        return usage_module.add_daily_usage(
-            day, username, tokens, path=usage_path
-        )
-
-    monkeypatch.setattr(app_module, "add_daily_usage", count_daily_usage)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -845,11 +811,12 @@ def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
     today = __import__("datetime").date.today().isoformat()
     expected_total = 123 if reports_usage else 0
     assert state["total_tokens"] == expected_total
-    assert daily_usage_calls == ([123] if reports_usage else [])
-    assert usage_module.get_daily_used(
-        today, "user1", path=usage_path
-    ) == expected_total
-    assert usage_module.get_daily_total(today, path=usage_path) == expected_total
+    # 每日只尝试记录一次
+    assert usage_store.add_usage_calls == (
+        [(today, "user1", 123)] if reports_usage else []
+    )
+    assert usage_store.get_used(today, "user1") == expected_total
+    assert usage_store.get_total(today) == expected_total
 
 
 def test_respond_save_failure_still_shows_answer_and_settles_usage(
@@ -864,7 +831,7 @@ def test_respond_save_failure_still_shows_answer_and_settles_usage(
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -895,8 +862,8 @@ def test_respond_save_failure_still_shows_answer_and_settles_usage(
     assert state["turns"] == 1
     assert state["total_tokens"] == 123
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
-    assert usage_module.get_daily_total(today, path=usage_path) == 123
+    assert usage_store.get_used(today, "user1") == 123
+    assert usage_store.get_total(today) == 123
 
     # 保存失败不增加次数：同一标记仍可成功保存
     store.fail = False
@@ -915,7 +882,7 @@ def test_respond_stale_save_shows_not_saved_and_settles_usage(
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -943,8 +910,8 @@ def test_respond_stale_save_shows_not_saved_and_settles_usage(
     assert state["turns"] == 1
     assert state["total_tokens"] == 123
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
-    assert usage_module.get_daily_total(today, path=usage_path) == 123
+    assert usage_store.get_used(today, "user1") == 123
+    assert usage_store.get_total(today) == 123
 
 
 def test_respond_stream_error_save_failure_still_shows_partial(
@@ -975,7 +942,7 @@ def test_respond_stream_error_save_failure_still_shows_partial(
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -1010,11 +977,11 @@ def test_respond_stream_error_save_failure_still_shows_partial(
     assert state["total_tokens"] == expected_tokens
     today = __import__("datetime").date.today().isoformat()
     assert (
-        usage_module.get_daily_used(today, "user1", path=usage_path)
+        usage_store.get_used(today, "user1")
         == expected_tokens
     )
     assert (
-        usage_module.get_daily_total(today, path=usage_path) == expected_tokens
+        usage_store.get_total(today) == expected_tokens
     )
 
 
@@ -1044,7 +1011,7 @@ def test_respond_stream_error_stale_save_shows_not_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -1078,14 +1045,13 @@ def test_respond_stream_error_stale_save_shows_not_saved(monkeypatch, tmp_path):
     assert state["total_tokens"] == expected_tokens
     today = __import__("datetime").date.today().isoformat()
     assert (
-        usage_module.get_daily_used(today, "user1", path=usage_path)
+        usage_store.get_used(today, "user1")
         == expected_tokens
     )
 
 
 def test_respond_truncated_save_failure_shows_both_hints(monkeypatch, tmp_path):
     """截断回答保存失败：截断提示与保存失败提示同时出现，用量结算一次。"""
-    daily_usage_calls = []
 
     class TruncatedClient:
         def chat_stream_with_usage(
@@ -1102,15 +1068,7 @@ def test_respond_truncated_save_failure_shows_both_hints(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
     monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
-
-    def count_daily_usage(day, username, tokens):
-        daily_usage_calls.append(tokens)
-        return usage_module.add_daily_usage(
-            day, username, tokens, path=usage_path
-        )
-
-    monkeypatch.setattr(app_module, "add_daily_usage", count_daily_usage)
+    usage_store = _wire_usage_store(monkeypatch)
 
     results = list(
         app_module.respond(
@@ -1136,6 +1094,272 @@ def test_respond_truncated_save_failure_shows_both_hints(monkeypatch, tmp_path):
     assert "历史保存失败，刷新后可能丢失" in status
     assert store.save_attempts == 1
     assert state["turns"] == 1
-    assert daily_usage_calls == [123]
     today = __import__("datetime").date.today().isoformat()
-    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
+    # 每日照常记录一次
+    assert usage_store.add_usage_calls == [(today, "user1", 123)]
+    assert usage_store.get_used(today, "user1") == 123
+
+
+def _patch_daily_env(monkeypatch, daily_store, client):
+    """为每日失败场景准备隔离环境，返回 (访问日志记录, 历史假存储)。
+
+    每日存储由调用方按场景给定；访问日志保留下来供断言失败留痕。
+    """
+    history_store = _use_memory_store(monkeypatch)
+    monkeypatch.setattr(app_module, "client", client)
+    monkeypatch.setattr(app_module, "daily_usage_store", daily_store)
+    logs = []
+    monkeypatch.setattr(
+        app_module, "log_access_event", lambda *a, **k: logs.append(a)
+    )
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
+    return logs, history_store
+
+
+def _run_respond_once(
+    message: str = "1+1=?",
+    history: list[dict] | None = None,
+    thinking: bool = False,
+    usage_state: dict | None = None,
+):
+    """用固定的默认参数驱动一轮 respond，返回最终一次 yield 的八元组。"""
+    results = list(
+        app_module.respond(
+            message,
+            history if history is not None else [],
+            "高中",
+            "互动模式",
+            thinking,
+            "测试模型",
+            "high",
+            None,
+            (
+                usage_state
+                if usage_state is not None
+                else usage_module.new_usage_state()
+            ),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    return results[-1]
+
+
+def test_respond_quota_read_failure_skips_model(monkeypatch, tmp_path):
+    """聊天开始时无法读取额度：明确提示并结束请求，不调用模型。"""
+    from core.usage_store import DailyUsageStore
+
+    corrupt = tmp_path / "usage_daily.json"
+    corrupt.write_text("{损坏", encoding="utf-8")
+    fake_client = _FakeClient()
+    logs, _store = _patch_daily_env(
+        monkeypatch, DailyUsageStore(corrupt), fake_client
+    )
+
+    state0 = {"total_tokens": 0, "turns": 0}
+    final_history, _, status, _, usage_state, stage_state, _, _ = (
+        _run_respond_once(usage_state=state0)
+    )
+
+    assert "每日额度暂时无法检查" in status
+    assert final_history == []
+    assert usage_state == state0
+    assert fake_client.calls == 0  # 不调用模型
+    assert any("额度检查失败" in str(args) for args in logs)
+    # 损坏文件不被覆盖
+    assert corrupt.read_text(encoding="utf-8") == "{损坏"
+
+
+def test_respond_daily_write_failure_still_completes(monkeypatch, tmp_path):
+    """正常回答遇到每日写入失败：回答照常保存与显示，提示每日用量未记录成功。"""
+    fake_client = _FakeClient()
+    usage_store = FailingDailyUsageStore()
+    logs, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
+
+    final_history, _, status, usage_text, state, _, _, _ = _run_respond_once()
+
+    # 回答仍保存并显示，会话结算照常完成，不重新调用模型
+    assert final_history[-1]["content"] == "你好世界"
+    assert store._messages["user1"] == final_history
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    assert fake_client.calls == 1
+    # 只尝试记录一次，未成功
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_store.add_usage_calls == [(today, "user1", 123)]
+    assert usage_store.get_used(today, "user1") == 0
+    # 明确提示，且不显示"今日已用"的假结果
+    assert "每日用量未记录成功" in status
+    assert "今日已用" not in usage_text
+
+
+def test_respond_truncated_daily_write_failure_keeps_hints(
+    monkeypatch, tmp_path
+):
+    """截断回答遇到每日写入失败：截断提示不被覆盖，同时提示每日未记录。"""
+
+    class TruncatedClient:
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            yield "部分答案", None, None, None
+            yield None, None, _FakeUsage(), "length"
+
+    usage_store = FailingDailyUsageStore()
+    logs, store = _patch_daily_env(monkeypatch, usage_store, TruncatedClient())
+
+    final_history, _, status, _, state, _, _, _ = _run_respond_once()
+
+    assert final_history[-1]["content"] == "部分答案"
+    # 截断提示与每日失败提示同时出现，互不掩盖
+    assert "截断" in status and "继续" in status
+    assert "每日用量未记录成功" in status
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_store.add_usage_calls == [(today, "user1", 123)]
+
+
+def test_respond_stream_error_daily_write_failure_still_finishes(
+    monkeypatch, tmp_path
+):
+    """异常部分回答遇到每日写入失败：按估算结算一次并完整结束，不重试。"""
+    partial_answer = "已经生成的部分回答"
+
+    class InterruptedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            self.calls += 1
+            yield partial_answer, None, None, None
+            raise RuntimeError("模拟流式中断")
+
+    fake_client = InterruptedClient()
+    usage_store = FailingDailyUsageStore()
+    logs, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
+    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
+    expected_tokens = usage_module.estimate_tokens(partial_answer)
+
+    final_history, _, status, _, state, _, _, _ = _run_respond_once()
+
+    # 部分回答仍保存并显示，原模型异常提示保留
+    assert final_history[-1]["content"] == partial_answer
+    assert store._messages["user1"] == final_history
+    assert "已保留生成的部分内容" in status
+    assert "每日用量未记录成功" in status
+    assert fake_client.calls == 1
+    # 只尝试记录一次；会话按估算结算一次
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_store.add_usage_calls == [(today, "user1", expected_tokens)]
+    assert state["turns"] == 1
+    assert state["total_tokens"] == expected_tokens
+
+
+def test_respond_empty_answer_daily_write_failure_still_finishes(
+    monkeypatch, tmp_path
+):
+    """空回答遇到每日写入失败：临时提示不保存，仍提示每日未记录。"""
+
+    class EmptyAnswerUsage:
+        total_tokens = 123
+
+    class EmptyAnswerClient:
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            yield None, "正在分析题目", None, None
+            yield None, None, EmptyAnswerUsage(), "length"
+
+    usage_store = FailingDailyUsageStore()
+    logs, store = _patch_daily_env(monkeypatch, usage_store, EmptyAnswerClient())
+    monkeypatch.setattr(app_module, "_log_empty_reply", lambda **k: None)
+
+    final_history, _, status, _, state, _, _, _ = _run_respond_once(thinking=True)
+
+    # 空回答的临时提示不保存为助手回答
+    assert final_history[-1]["content"] == "（未收到正式回答）"
+    assert store._messages.get("user1") is None
+    assert store.save_attempts == 0
+    assert "没能生成正式回答" in status
+    assert "每日用量未记录成功" in status
+    # 用量仍结算一次，每日只尝试记录一次
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_store.add_usage_calls == [(today, "user1", 123)]
+
+
+def test_respond_question_count_failure_does_not_break_chat(
+    monkeypatch, tmp_path
+):
+    """提问次数记录失败不打断聊天，留下明确失败信息。"""
+
+    class FailingQuestionStore(CountingDailyUsageStore):
+        def add_question(self, date):
+            raise OSError("模拟提问次数写盘失败")
+
+    usage_store = FailingQuestionStore()
+    logs, store = _patch_daily_env(monkeypatch, usage_store, _FakeClient())
+
+    final_history, _, status, _, state, _, _, _ = _run_respond_once()
+
+    # 聊天照常完成：回答显示、历史保存、每日用量正常记录
+    assert final_history[-1]["content"] == "你好世界"
+    assert store._messages["user1"] == final_history
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_store.get_used(today, "user1") == 123
+    assert usage_store.get_questions(today) == 0
+    assert any("提问次数记录失败" in str(args) for args in logs)
+
+
+def test_respond_daily_recorded_but_global_refresh_fails(monkeypatch, tmp_path):
+    """写入成功、全局统计刷新失败：保留已记录用量，提示统计暂不可用。"""
+    from core.usage_store import DailyUsageReadError
+
+    class GlobalRefreshFailsStore(CountingDailyUsageStore):
+        """第一次 get_total（开始时的额度检查）正常，之后的统计读取失败。"""
+
+        def __init__(self):
+            super().__init__()
+            self.total_reads = 0
+
+        def get_total(self, date):
+            self.total_reads += 1
+            if self.total_reads > 1:
+                raise DailyUsageReadError("模拟全局统计读取失败")
+            return super().get_total(date)
+
+    fake_client = _FakeClient()
+    usage_store = GlobalRefreshFailsStore()
+    logs, store = _patch_daily_env(monkeypatch, usage_store, fake_client)
+
+    final_history, _, status, usage_text, state, _, _, _ = _run_respond_once()
+
+    # 回答仍保存和显示，不重新调用模型
+    assert final_history[-1]["content"] == "你好世界"
+    assert store._messages["user1"] == final_history
+    assert fake_client.calls == 1
+    # 实际用量只记入一次，并保留已写入结果
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_store.add_usage_calls == [(today, "user1", 123)]
+    assert usage_store.get_used(today, "user1") == 123
+    # 会话只结算一次
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    # 提示统计刷新失败，不出现"每日用量未记录成功"
+    assert "每日用量已记录，但全局统计暂时无法刷新" in status
+    assert "每日用量未记录成功" not in status
+    # 全局统计不可用：只显示账号累计，不格式化 None、不输出完整正常统计行
+    assert "今日已用 123 / 1,000,000（本账号）" in usage_text
+    assert "全局" not in usage_text
+    # 日志区分两种失败
+    assert any("全局统计刷新失败" in str(args) for args in logs)
+    assert not any("每日用量记录失败" in str(args) for args in logs)

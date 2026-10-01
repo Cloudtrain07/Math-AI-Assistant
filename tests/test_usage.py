@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
-"""会话内 token 累计逻辑测试。"""
+"""会话内 token 累计逻辑测试 + 每日用量在应用接入点的失败处理测试。
 
+每日用量存储本身的测试见 test_usage_store.py。
+"""
+
+import datetime
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.usage import get_usage_total, get_usage_part
+import app as app_module
+from conftest import MemoryDailyUsageStore
 from core.usage import (
-    add_daily_login,
-    add_daily_question,
-    add_daily_usage,
     check_daily_quota,
     estimate_tokens,
     format_cumulative,
-    get_daily_ip_usage,
-    get_daily_logins,
-    get_daily_questions,
-    get_daily_total,
-    get_daily_used,
+    get_usage_part,
+    get_usage_total,
     is_over_limit,
     new_usage_state,
     record_usage,
@@ -95,79 +96,15 @@ def test_format_cumulative_fallback_without_split():
     assert "输入" not in text
 
 
-def test_daily_usage_accumulates(tmp_path):
-    path = tmp_path / "usage_daily.json"
-    add_daily_usage("2026-08-05", "1.2.3.4", 100, path=path)
-    add_daily_usage("2026-08-05", "1.2.3.4", 250, path=path)
-    add_daily_usage("2026-08-05", "5.6.7.8", 50, path=path)
-    assert get_daily_used("2026-08-05", "1.2.3.4", path=path) == 350
-    assert get_daily_used("2026-08-05", "5.6.7.8", path=path) == 50
-
-
-def test_daily_usage_resets_on_new_date(tmp_path):
-    path = tmp_path / "usage_daily.json"
-    add_daily_usage("2026-08-05", "1.2.3.4", 100, path=path)
-    assert get_daily_used("2026-08-06", "1.2.3.4", path=path) == 0
-
-
 def test_is_over_limit_boundary():
     assert not is_over_limit(999_999, 1_000_000)
     assert is_over_limit(1_000_000, 1_000_000)
     assert is_over_limit(1_000_001, 1_000_000)
 
 
-def test_daily_concurrent_add_no_loss(tmp_path):
-    import threading
-
-    path = tmp_path / "usage_daily.json"
-
-    def worker():
-        for _ in range(50):
-            add_daily_usage("2026-08-05", "9.9.9.9", 1, path=path)
-
-    threads = [threading.Thread(target=worker) for _ in range(4)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert get_daily_used("2026-08-05", "9.9.9.9", path=path) == 200
-
-
-def test_add_daily_usage_updates_global_total(tmp_path):
-    path = tmp_path / "u.json"
-    add_daily_usage("2026-08-05", "1.1.1.1", 100, path=path)
-    add_daily_usage("2026-08-05", "2.2.2.2", 250, path=path)
-    assert get_daily_total("2026-08-05", path=path) == 350
-
-
-def test_get_daily_total_backward_compat(tmp_path):
-    path = tmp_path / "u.json"
-    path.write_text(
-        '{"2026-08-05": {"1.1.1.1": 100, "2.2.2.2": 200}}',
-        encoding="utf-8",
-    )
-    assert get_daily_total("2026-08-05", path=path) == 300
-
-
 def test_global_limit_boundary():
     assert not is_over_limit(2_999_999, 3_000_000)
     assert is_over_limit(3_000_000, 3_000_000)
-
-
-def test_daily_logins_and_questions(tmp_path):
-    path = tmp_path / "u.json"
-    add_daily_login("2026-08-05", path=path)
-    add_daily_login("2026-08-05", path=path)
-    add_daily_question("2026-08-05", path=path)
-    assert get_daily_logins("2026-08-05", path=path) == 2
-    assert get_daily_questions("2026-08-05", path=path) == 1
-
-
-def test_get_daily_ip_usage_excludes_reserved(tmp_path):
-    path = tmp_path / "u.json"
-    add_daily_usage("2026-08-05", "1.1.1.1", 100, path=path)
-    add_daily_login("2026-08-05", path=path)
-    assert get_daily_ip_usage("2026-08-05", path=path) == {"1.1.1.1": 100}
 
 
 def test_estimate_tokens():
@@ -185,13 +122,6 @@ def test_check_daily_quota_rejected_on_limit():
     assert msg is not None and "额度已用尽" in msg
     msg2 = check_daily_quota(100, 3_000_000, 1_000_000, 3_000_000)
     assert msg2 is not None and "额度已用尽" in msg2
-
-
-def test_atomic_write_no_tmp_left(tmp_path):
-    path = tmp_path / "u.json"
-    add_daily_usage("2026-08-05", "1.1.1.1", 5, path=path)
-    assert path.exists()
-    assert not (tmp_path / "u.json.tmp").exists()
 
 
 def test_get_usage_total_without_usage_returns_none():
@@ -221,8 +151,6 @@ def test_get_usage_total_missing_or_none_returns_zero():
 
 
 def test_get_usage_total_invalid_value_keeps_raising():
-    import pytest
-
     class Usage:
         total_tokens = "不是数字"
 
@@ -263,3 +191,90 @@ def test_get_usage_part_zero_is_preserved():
         prompt_tokens = 0
 
     assert get_usage_part(Usage(), "prompt_tokens") == 0
+
+
+# ---------- 应用接入点：登录次数与用量面板 ----------
+
+
+def _fake_request():
+    client = type("Client", (), {"host": "127.0.0.1"})()
+    return type("Request", (), {"client": client, "username": "user1"})()
+
+
+def test_check_login_records_login_and_keeps_result(monkeypatch):
+    store = MemoryDailyUsageStore()
+    logs = []
+    monkeypatch.setattr(app_module, "daily_usage_store", store)
+    monkeypatch.setattr(app_module, "check_login", lambda u, p: True)
+    monkeypatch.setattr(
+        app_module, "log_access_event", lambda *a, **k: logs.append(a)
+    )
+
+    assert app_module._check_login("user1", "pw") is True
+    assert store.get_logins(datetime.date.today().isoformat()) == 1
+
+
+def test_check_login_failure_keeps_result_and_logs(monkeypatch):
+    class FailingLoginStore(MemoryDailyUsageStore):
+        def add_login(self, date):
+            raise OSError("模拟登录次数写盘失败")
+
+    store = FailingLoginStore()
+    logs = []
+    monkeypatch.setattr(app_module, "daily_usage_store", store)
+    monkeypatch.setattr(app_module, "check_login", lambda u, p: True)
+    monkeypatch.setattr(
+        app_module, "log_access_event", lambda *a, **k: logs.append(a)
+    )
+
+    # 登录次数记录失败不改变密码校验结果，并留下明确失败信息
+    assert app_module._check_login("user1", "pw") is True
+    assert any("登录次数记录失败" in str(args) for args in logs)
+    assert store.get_logins(datetime.date.today().isoformat()) == 0
+
+
+def test_render_usage_panel_reads_today_usage(monkeypatch):
+    store = MemoryDailyUsageStore()
+    today = datetime.date.today().isoformat()
+    store.add_usage(today, "user1", 123)
+    monkeypatch.setattr(app_module, "daily_usage_store", store)
+    # 注入固定账号清单，不依赖真实 data/accounts.json
+    monkeypatch.setattr(
+        app_module,
+        "accounts",
+        [
+            {
+                "username": "user1",
+                "display_name": "测试一号",
+                "enabled": True,
+                "password": "x",
+            }
+        ],
+    )
+    monkeypatch.setattr(app_module, "is_owner_host", lambda ip: True)
+
+    panel = app_module.render_usage_panel(_fake_request())
+    assert "全局已用：123" in panel
+    assert "user1（测试一号）" in panel
+    assert "123 tokens" in panel
+
+
+def test_render_usage_panel_read_failure_shows_error(monkeypatch, tmp_path):
+    """面板读取失败显示失败提示，不显示零用量的正常面板。"""
+    from core.usage_store import DailyUsageStore
+
+    path = tmp_path / "usage_daily.json"
+    path.write_text("{损坏", encoding="utf-8")
+    monkeypatch.setattr(app_module, "daily_usage_store", DailyUsageStore(path))
+    monkeypatch.setattr(app_module, "is_owner_host", lambda ip: True)
+
+    panel = app_module.render_usage_panel(_fake_request())
+    assert "读取失败" in panel
+    assert "主人用量面板" not in panel
+    assert "各账号用量" not in panel
+
+
+def test_render_usage_panel_hidden_for_non_owner(monkeypatch):
+    monkeypatch.setattr(app_module, "daily_usage_store", MemoryDailyUsageStore())
+    monkeypatch.setattr(app_module, "is_owner_host", lambda ip: False)
+    assert app_module.render_usage_panel(_fake_request()) == "🔒 （仅主人可见）"
