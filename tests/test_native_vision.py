@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
+from conftest import MemoryHistoryStore
 from core.providers import _sanitize_provider, get_provider_supports_vision
 from core.message_builder import to_api_messages
 
@@ -61,7 +62,7 @@ def _stage_answer_mode():
 
 
 def _patch_common(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "history_store", MemoryHistoryStore())
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -142,8 +143,8 @@ def test_to_api_messages_image_without_user_message_is_ignored():
 # ---------- on_image_upload：图片只进入待发区 ----------
 
 
-def test_on_image_upload_vision_provider_only_pends():
-
+def test_on_image_upload_vision_provider_only_pends(monkeypatch):
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     results = list(app_module.on_image_upload("/tmp/x.png", "glm"))
     textbox, status, image_out, image_state = results[-1]
     assert "图片已就绪" in status
@@ -151,8 +152,8 @@ def test_on_image_upload_vision_provider_only_pends():
     assert image_state == {"path": "/tmp/x.png", "fresh": True}
 
 
-def test_on_image_upload_text_provider_only_pends():
-
+def test_on_image_upload_text_provider_only_pends(monkeypatch):
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     results = list(app_module.on_image_upload("/tmp/x.png", "deepseek"))
     textbox, status, image_out, image_state = results[-1]
     assert image_out == "/tmp/x.png"  # 与看图服务商行为一致：保留待发

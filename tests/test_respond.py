@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
+from conftest import FailingSaveStore, MemoryHistoryStore, StaleSaveStore
 from core import usage as usage_module
 
 
@@ -49,6 +50,13 @@ def _fake_request():
     return type("Request", (), {"client": client, "username": "user1"})()
 
 
+def _use_memory_store(monkeypatch) -> MemoryHistoryStore:
+    """用内存假存储替换文件存储，返回实例供断言。"""
+    store = MemoryHistoryStore()
+    monkeypatch.setattr(app_module, "history_store", store)
+    return store
+
+
 def _stage0():
     return {"stage": "initial_hint", "hints": 0, "last_mode": "互动模式"}
 
@@ -80,15 +88,8 @@ def _wire_usage_to_tmp(monkeypatch, tmp_path):
 
 def test_respond_success_path(monkeypatch, tmp_path):
     fake_client = _FakeClient()
-    saved_histories = []
+    store = _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(
-        app_module,
-        "save_history",
-        lambda history, username=None: saved_histories.append(
-            ([dict(message) for message in history], username)
-        ),
-    )
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -115,7 +116,9 @@ def test_respond_success_path(monkeypatch, tmp_path):
     final_history, _, status_text, usage_text, usage_state, stage_state, _, _ = results[-1]
 
     assert final_history[-1]["content"] == "你好世界"
-    assert saved_histories == [(final_history, "user1")]
+    assert store._messages["user1"] == final_history
+    # 本轮只尝试保存一次
+    assert store.save_attempts == 1
     assert usage_state == {"total_tokens": 123, "turns": 1}
     assert "123" in status_text
     assert "累计" in usage_text and "123" in usage_text
@@ -130,7 +133,7 @@ def test_respond_success_path(monkeypatch, tmp_path):
 def test_respond_quota_rejected(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -170,7 +173,7 @@ def test_respond_quota_rejected(monkeypatch, tmp_path):
 def test_respond_overlong_message_rejected(monkeypatch):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 5)
@@ -205,7 +208,7 @@ def test_respond_overlong_message_rejected(monkeypatch):
 def test_respond_escape_keyword_full_solution(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -237,7 +240,7 @@ def test_respond_escape_keyword_full_solution(monkeypatch, tmp_path):
 def test_respond_practice_keyword_practice_wait(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -268,7 +271,7 @@ def test_respond_practice_keyword_practice_wait(monkeypatch, tmp_path):
 def test_respond_answer_mode_stage_none(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -300,7 +303,7 @@ def test_respond_answer_mode_stage_none(monkeypatch, tmp_path):
 def test_respond_new_problem_resets_stage(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -337,7 +340,7 @@ def test_respond_new_problem_resets_stage(monkeypatch, tmp_path):
 def test_respond_reasoning_panel_and_status(monkeypatch, tmp_path):
     fake_client = _ReasoningClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -379,7 +382,7 @@ def test_respond_reasoning_panel_and_status(monkeypatch, tmp_path):
 def test_continue_last_answer(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -419,7 +422,7 @@ def test_continue_last_answer(monkeypatch, tmp_path):
 def test_continue_last_answer_keeps_stage(monkeypatch, tmp_path):
     fake_client = _FakeClient()
     monkeypatch.setattr(app_module, "client", fake_client)
-    monkeypatch.setattr(app_module, "save_history", lambda *a, **k: None)
+    _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -482,14 +485,9 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
             yield None, "正在分析题目", None, None
             yield None, None, EmptyAnswerUsage(), "length"
 
-    saved_histories = []
+    store = _use_memory_store(monkeypatch)
     monkeypatch.setattr(app_module, "client", EmptyAnswerClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(
-        app_module,
-        "save_history",
-        lambda *a, **k: saved_histories.append((a, k)),
-    )
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "_log_empty_reply", lambda **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
@@ -517,7 +515,9 @@ def test_respond_empty_answer_still_records_usage(monkeypatch, tmp_path):
     final_history, _, status, _, state, _, _, _ = results[-1]
 
     assert final_history[-1]["content"] == "（未收到正式回答）"
-    assert saved_histories == []
+    # 空回复不保存为助手回答，也没有任何保存尝试
+    assert store._messages.get("user1") is None
+    assert store.save_attempts == 0
     assert "没能生成正式回答" in status
     assert state["turns"] == 1
     assert state["prompt_tokens"] == 100
@@ -534,7 +534,6 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
     monkeypatch, tmp_path
 ):
     partial_answer = "已经生成的部分回答"
-    saved_histories = []
     logged_errors = []
 
     class InterruptedClient:
@@ -549,18 +548,13 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
             raise RuntimeError("模拟流式中断")
 
     fake_client = InterruptedClient()
-
-    def capture_history(history, username=None):
-        saved_histories.append(
-            ([dict(message) for message in history], username)
-        )
+    store = _use_memory_store(monkeypatch)
 
     def capture_error(exc, **details):
         logged_errors.append((exc, details))
 
     monkeypatch.setattr(app_module, "client", fake_client)
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(app_module, "save_history", capture_history)
     monkeypatch.setattr(app_module, "_log_error", capture_error)
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
@@ -595,7 +589,8 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
         {"role": "user", "content": "1+1=?"},
         {"role": "assistant", "content": partial_answer},
     ]
-    assert saved_histories == [(final_history, "user1")]
+    assert store._messages["user1"] == final_history
+    assert store.save_attempts == 1
     assert "已保留生成的部分内容" in status
 
     # 没收到模型用量时，只估算部分回答的总用量。
@@ -627,7 +622,7 @@ def test_respond_stream_error_keeps_partial_and_estimates_usage(
 # 成功返回usage,随后流式中断
 def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
     partial_answer = "已经生成的部分回答"
-    saved_histories = []
+    store = _use_memory_store(monkeypatch)
 
     class ReceivedUsage:
         total_tokens = 123
@@ -642,17 +637,11 @@ def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
             yield None, None, ReceivedUsage(), None
             raise RuntimeError("收到用量后模拟中断")
 
-    def capture_history(history, username=None):
-        saved_histories.append(
-            ([dict(message) for message in history], username)
-        )
-
     def unexpected_estimate(text):
         raise AssertionError("已有模型用量，不应该再估算")
 
     monkeypatch.setattr(app_module, "client", InterruptedClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(app_module, "save_history", capture_history)
     monkeypatch.setattr(
         app_module.chat_service,
         "estimate_tokens",
@@ -690,7 +679,8 @@ def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
         "role": "assistant",
         "content": partial_answer,
     }
-    assert saved_histories == [(final_history, "user1")]
+    assert store._messages["user1"] == final_history
+    assert store.save_attempts == 1
     assert "已保留生成的部分内容" in status
 
     assert state["turns"] == 1
@@ -709,9 +699,9 @@ def test_respond_stream_error_uses_received_usage(monkeypatch, tmp_path):
 
 # 没有输出正式回复，也没有返回usage就报错了
 def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
-    saved_histories = []
     daily_usage_calls = []
     logged_errors = []
+    store = _use_memory_store(monkeypatch)
 
     class FailedClient:
         def chat_stream_with_usage(
@@ -722,11 +712,6 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
 
     monkeypatch.setattr(app_module, "client", FailedClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(
-        app_module,
-        "save_history",
-        lambda *a, **k: saved_histories.append((a, k)),
-    )
     monkeypatch.setattr(
         app_module,
         "_log_error",
@@ -769,7 +754,9 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
     assert final_history == [
         {"role": "user", "content": "1+1=?"},
     ]
-    assert saved_histories == []
+    # 没有正式回答：没有任何保存尝试
+    assert store._messages.get("user1") is None
+    assert store.save_attempts == 0
     assert daily_usage_calls == []
     assert status
     assert "已保留生成的部分内容" not in status
@@ -799,8 +786,8 @@ def test_respond_stream_error_without_answer_or_usage(monkeypatch, tmp_path):
 def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
     monkeypatch, tmp_path, reports_usage
 ):
-    saved_histories = []
     daily_usage_calls = []
+    store = _use_memory_store(monkeypatch)
 
     class TruncatedClient:
         def chat_stream_with_usage(
@@ -811,13 +798,6 @@ def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
 
     monkeypatch.setattr(app_module, "client", TruncatedClient())
     monkeypatch.setattr(app_module, "clients", {})
-    monkeypatch.setattr(
-        app_module,
-        "save_history",
-        lambda history, username=None: saved_histories.append(
-            ([dict(message) for message in history], username)
-        ),
-    )
     monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
     monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
@@ -855,7 +835,8 @@ def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
         {"role": "user", "content": "1+1=?"},
         {"role": "assistant", "content": "部分答案"},
     ]
-    assert saved_histories == [(final_history, "user1")]
+    assert store._messages["user1"] == final_history
+    assert store.save_attempts == 1
     assert "截断" in status and "继续" in status
     if not reports_usage:
         assert "0 tokens" not in status
@@ -869,3 +850,292 @@ def test_respond_truncated_answer_is_saved_and_shows_continue_hint(
         today, "user1", path=usage_path
     ) == expected_total
     assert usage_module.get_daily_total(today, path=usage_path) == expected_total
+
+
+def test_respond_save_failure_still_shows_answer_and_settles_usage(
+    monkeypatch, tmp_path
+):
+    """正常回答保存失败：回答仍显示，用量结算一次，不重试模型。"""
+    fake_client = _FakeClient()
+    store = FailingSaveStore()
+    monkeypatch.setattr(app_module, "client", fake_client)
+    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    assert final_history[-1]["content"] == "你好世界"
+    assert "历史保存失败，刷新后可能丢失" in status
+    assert "已保存" not in status
+    assert fake_client.calls == 1  # 不重新调用模型、不自动重试
+    assert store.save_attempts == 1  # 只尝试保存一次
+
+    # 用量仍结算一次：会话与每日用量都正常累计
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
+    assert usage_module.get_daily_total(today, path=usage_path) == 123
+
+    # 保存失败不增加次数：同一标记仍可成功保存
+    store.fail = False
+    assert store.save([{"role": "user", "content": "探针"}], "user1", 0)
+
+
+def test_respond_stale_save_shows_not_saved_and_settles_usage(
+    monkeypatch, tmp_path
+):
+    """保存标记过期：跳过保存但回答仍显示、用量仍结算一次。"""
+    fake_client = _FakeClient()
+    store = StaleSaveStore()
+    monkeypatch.setattr(app_module, "client", fake_client)
+    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    assert final_history[-1]["content"] == "你好世界"
+    assert "另一个操作已更新历史，本次回答未保存" in status
+    assert fake_client.calls == 1
+    assert store.save_attempts == 1
+    assert state["turns"] == 1
+    assert state["total_tokens"] == 123
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123
+    assert usage_module.get_daily_total(today, path=usage_path) == 123
+
+
+def test_respond_stream_error_save_failure_still_shows_partial(
+    monkeypatch, tmp_path
+):
+    """异常前的部分回答保存失败：部分内容仍显示，用量按估算结算一次。"""
+    partial_answer = "已经生成的部分回答"
+
+    class InterruptedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            self.calls += 1
+            yield partial_answer, None, None, None
+            raise RuntimeError("模拟流式中断")
+
+    fake_client = InterruptedClient()
+    store = FailingSaveStore()
+    monkeypatch.setattr(app_module, "client", fake_client)
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    assert final_history[-1]["content"] == partial_answer
+    # 保存失败时不再出现"已保留"的成功说明，明确未写入历史
+    assert "已保留生成的部分内容" not in status
+    assert "未写入历史" in status
+    # 原模型异常提示不被掩盖，同时给出保存失败提示
+    assert "历史保存失败，刷新后可能丢失" in status
+    assert fake_client.calls == 1  # 不重新调用模型
+    assert store.save_attempts == 1  # 只尝试保存一次
+
+    expected_tokens = usage_module.estimate_tokens(partial_answer)
+    assert state["turns"] == 1
+    assert state["total_tokens"] == expected_tokens
+    today = __import__("datetime").date.today().isoformat()
+    assert (
+        usage_module.get_daily_used(today, "user1", path=usage_path)
+        == expected_tokens
+    )
+    assert (
+        usage_module.get_daily_total(today, path=usage_path) == expected_tokens
+    )
+
+
+def test_respond_stream_error_stale_save_shows_not_saved(monkeypatch, tmp_path):
+    """异常部分回答遇到保存冲突：不出现保存成功说明，用量按估算结算一次。"""
+    partial_answer = "已经生成的部分回答"
+
+    class InterruptedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            self.calls += 1
+            yield partial_answer, None, None, None
+            raise RuntimeError("模拟流式中断")
+
+    fake_client = InterruptedClient()
+    store = StaleSaveStore()
+    monkeypatch.setattr(app_module, "client", fake_client)
+    monkeypatch.setattr(app_module, "clients", {})
+    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_module, "_log_error", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    monkeypatch.setattr(app_module, "MAX_MESSAGE_LEN", 2000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    assert final_history[-1]["content"] == partial_answer  # 回答仍显示
+    # 冲突时不出现保存成功说明，明确未写入历史
+    assert "已保留生成的部分内容" not in status
+    assert "未写入历史" in status
+    assert "另一个操作已更新历史，本次回答未保存" in status
+    assert fake_client.calls == 1  # 不重新调用模型
+    assert store.save_attempts == 1  # 只尝试保存一次
+
+    expected_tokens = usage_module.estimate_tokens(partial_answer)
+    assert state["turns"] == 1
+    assert state["total_tokens"] == expected_tokens
+    today = __import__("datetime").date.today().isoformat()
+    assert (
+        usage_module.get_daily_used(today, "user1", path=usage_path)
+        == expected_tokens
+    )
+
+
+def test_respond_truncated_save_failure_shows_both_hints(monkeypatch, tmp_path):
+    """截断回答保存失败：截断提示与保存失败提示同时出现，用量结算一次。"""
+    daily_usage_calls = []
+
+    class TruncatedClient:
+        def chat_stream_with_usage(
+            self, messages, thinking=None, reasoning_effort=None, model=None
+        ):
+            yield "部分答案", None, None, None
+            yield None, None, _FakeUsage(), "length"
+
+    monkeypatch.setattr(app_module, "client", TruncatedClient())
+    monkeypatch.setattr(app_module, "clients", {})
+    store = FailingSaveStore()
+    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_module, "_log_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "log_access_event", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
+    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+    usage_path = _wire_usage_to_tmp(monkeypatch, tmp_path)
+
+    def count_daily_usage(day, username, tokens):
+        daily_usage_calls.append(tokens)
+        return usage_module.add_daily_usage(
+            day, username, tokens, path=usage_path
+        )
+
+    monkeypatch.setattr(app_module, "add_daily_usage", count_daily_usage)
+
+    results = list(
+        app_module.respond(
+            "1+1=?",
+            [],
+            "高中",
+            "互动模式",
+            False,
+            "测试模型",
+            "high",
+            None,
+            usage_module.new_usage_state(),
+            _stage0(),
+            None,
+            None,
+            _fake_request(),
+        )
+    )
+    final_history, _, status, _, state, _, _, _ = results[-1]
+
+    assert final_history[-1]["content"] == "部分答案"
+    assert "截断" in status and "继续" in status
+    assert "历史保存失败，刷新后可能丢失" in status
+    assert store.save_attempts == 1
+    assert state["turns"] == 1
+    assert daily_usage_calls == [123]
+    today = __import__("datetime").date.today().isoformat()
+    assert usage_module.get_daily_used(today, "user1", path=usage_path) == 123

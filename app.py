@@ -42,7 +42,7 @@ from core.prompts import (
     MODE_ANSWER,
     MODE_INTERACTIVE,
 )
-from core.storage import load_history, save_history
+from core.storage import HistoryReadError, get_history_store
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.usage import (
     add_daily_login,
@@ -101,6 +101,8 @@ else:
     pass
 # 上下文压缩器（按账号增量维护长会话摘要）
 history_compressor = HistoryCompressor()
+# 会话历史存储：整个应用共用同一实例，同一账号的历史文件共用锁与保存计数
+history_store = get_history_store(DATA_DIR)
 # 每日每账号 token 上限（成本护栏）
 DAILY_LIMIT = settings.daily_token_limit if settings is not None else 1_000_000
 # 全局每日 token 总上限（成本护栏第二道保险）
@@ -127,6 +129,30 @@ def _new_image_state() -> dict:
 IMAGE_NOTE = "📷（已附题目图片）"
 # 只传图不打字时自动使用的提问语
 _IMAGE_ONLY_PROMPT = "请解答图中的题目。"
+
+# 历史保存/清空结果提示：只追加说明，不掩盖原有的模型异常或截断提示
+_SAVE_FAILED_MSG = "⚠️ 历史保存失败，刷新后可能丢失。"
+_SAVE_STALE_MSG = "ℹ️ 另一个操作已更新历史，本次回答未保存。"
+_CLEAR_FAILED_MSG = "⚠️ 清空未成功，请稍后重试。"
+_RESTORE_FAILED_MSG = (
+    "⚠️ 上次聊天记录读取失败（{detail}），本次以空历史开始；原文件未修改。"
+)
+
+
+def _save_turn_history(username: str, turn_token: int, turn_history: list[dict]) -> tuple[bool, str]:
+    """保存本轮历史，返回 (是否成功保存, 需要追加到状态栏的提示)。
+
+    保存失败不重新调用模型、不自动重试；用量结算由调用方另行完成。
+    """
+    try:
+        saved = history_store.save(
+            turn_history, username=username, turn_token=turn_token
+        )
+    except Exception:
+        return False, _SAVE_FAILED_MSG
+    if saved:
+        return True, ""
+    return False, _SAVE_STALE_MSG
 
 
 def format_usage(usage) -> str:
@@ -447,6 +473,9 @@ def respond(
         return
             
 
+    # 本轮保存标记：模型调用前取得；期间若发生清空或其他保存，标记失效则跳过保存
+    turn_token = history_store.start_turn(username)
+
     #正式开始流式调用大模型回答
     answer = ""
     reasoning_text = ""
@@ -540,11 +569,21 @@ def respond(
             )
         partial_history = chat_service.build_answer_history(history, answer)
         if partial_history is not None:
-            save_history(partial_history, username=username)
-            status_text = _friendly_error(exc) + "\n\n（已保留生成的部分内容）"
+            saved, save_note = _save_turn_history(username, turn_token, partial_history)
+            if saved:
+                status_text = _friendly_error(exc) + "\n\n（已保留生成的部分内容）"
+            else:
+                # 未保存成功：明确说明，部分回答仅保留在当前页面显示
+                status_text = (
+                    _friendly_error(exc)
+                    + "\n\n（部分回答仅在当前页面显示，未写入历史）"
+                )
         else:
+            save_note = ""
             partial_history = history
             status_text = _friendly_error(exc)
+        if save_note:
+            status_text = f"{status_text}\n\n{save_note}"
         yield (
             partial_history,
             "",
@@ -593,7 +632,7 @@ def respond(
     # 正式生成回复的情况
     final_history = chat_service.build_answer_history(history, answer)
     assert final_history is not None  # 空回答已在上面的分支返回
-    save_history(final_history, username=username)
+    _saved, save_note = _save_turn_history(username, turn_token, final_history)
     turn_total, usage_state = chat_service.settle_reply_usage(
         usage_state,
         usage,
@@ -615,6 +654,8 @@ def respond(
         result_text = f"{image_status}\n\n{result_text}" if result_text else image_status
     if truncated:
         result_text += "\n\n⚠️ 回答因长度限制被截断，可以回复「继续」让我接着写。"
+    if save_note:
+        result_text = f"{result_text}\n\n{save_note}"
     usage_text = format_cumulative(usage_state)
     usage_text += (
         f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号），"
@@ -682,9 +723,22 @@ def continue_last_answer(
 
 
 def clear_conversation(request: gr.Request):
-    """开启新对话：清空当前账号的聊天记录、用量与阶段状态并持久化。"""
+    """开启新对话：清空当前账号的聊天记录并持久化；成功后才重置摘要与界面状态。"""
     username = request.username if request and request.username else "unknown"
-    save_history([], username=username)
+    try:
+        history_store.clear(username)
+    except Exception:
+        # 清空失败：保留当前界面状态与摘要，等待用户重试；每日累计用量不受影响
+        return (
+            gr.update(),
+            gr.update(),
+            _CLEAR_FAILED_MSG,
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
     history_compressor.reset(username)
     return (
         gr.update(value=[]),
@@ -746,10 +800,13 @@ def reset_account_password(
     return "⚠️ 账号不存在，请刷新页面后重试。"
 
 
-def restore_history(request: gr.Request) -> list[dict]:
-    """登录后加载当前账号上次的聊天记录（页面加载时触发）。"""
+def restore_history(request: gr.Request) -> tuple[list[dict], str]:
+    """登录后加载当前账号上次的聊天记录；读取失败时明确提示，不伪装成空历史。"""
     username = request.username if request and request.username else "unknown"
-    return load_history(username)
+    try:
+        return history_store.load(username), ""
+    except HistoryReadError as exc:
+        return [], _RESTORE_FAILED_MSG.format(detail=exc)
 
 
 def restore_level(request: gr.Request) -> str:
@@ -1114,7 +1171,7 @@ with gr.Blocks(
             clear_btn,
         ],
     )
-    demo.load(restore_history, outputs=[chatbot], show_progress="hidden")
+    demo.load(restore_history, outputs=[chatbot, result_status], show_progress="hidden")
     demo.load(restore_level, outputs=[level_radio], show_progress="hidden")
 
 

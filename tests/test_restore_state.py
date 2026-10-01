@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
+from core.storage import HistoryStore
 
 
 def _fake_request():
@@ -15,26 +16,52 @@ def _fake_request():
 
 
 def test_restore_history(monkeypatch, tmp_path):
-    import core.storage as storage
-
-    monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
-    storage.save_history(
+    store = HistoryStore(tmp_path)
+    monkeypatch.setattr(app_module, "history_store", store)
+    store.save(
         [
             {"role": "user", "content": "旧题"},
             {"role": "assistant", "content": "旧解"},
         ],
-        username="user1",
+        "user1",
+        store.start_turn("user1"),
     )
-    history = app_module.restore_history(_fake_request())
+    history, message = app_module.restore_history(_fake_request())
     assert [m["content"] for m in history] == ["旧题", "旧解"]
+    assert message == ""
 
 
 def test_restore_history_unknown_account(monkeypatch, tmp_path):
-    import core.storage as storage
-
-    monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "history_store", HistoryStore(tmp_path))
     request = type("R", (), {"client": None, "username": None})()
-    assert app_module.restore_history(request) == []
+    history, message = app_module.restore_history(request)
+    assert history == []
+    assert message == ""
+
+
+def test_restore_history_read_failure_shows_notice(monkeypatch, tmp_path):
+    """文件损坏时明确报告读取失败，不能伪装成成功读取了空历史。"""
+    store = HistoryStore(tmp_path)
+    monkeypatch.setattr(app_module, "history_store", store)
+    history_dir = tmp_path / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    (history_dir / "user1.json").write_text("{损坏", encoding="utf-8")
+
+    history, message = app_module.restore_history(_fake_request())
+    assert history == []
+    assert "读取失败" in message
+
+    # 读取失败后，后续保存被阻止（不覆盖损坏文件）
+    import pytest
+    from core.storage import HistoryReadError
+
+    with pytest.raises(HistoryReadError):
+        store.save(
+            [{"role": "user", "content": "新"}],
+            "user1",
+            store.start_turn("user1"),
+        )
+    assert (history_dir / "user1.json").read_text(encoding="utf-8") == "{损坏"
 
 
 def test_restore_level_from_account(monkeypatch, tmp_path):
