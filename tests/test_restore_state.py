@@ -15,9 +15,9 @@ def _fake_request():
     return type("Request", (), {"client": client, "username": "user1"})()
 
 
-def test_restore_history(monkeypatch, tmp_path):
+def test_restore_history(monkeypatch, tmp_path, app_runtime):
     store = HistoryStore(tmp_path)
-    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_runtime, "history_store", store)
     store.save(
         [
             {"role": "user", "content": "旧题"},
@@ -26,28 +26,28 @@ def test_restore_history(monkeypatch, tmp_path):
         "user1",
         store.start_turn("user1"),
     )
-    history, message = app_module.restore_history(_fake_request())
+    history, message = app_module.restore_history(app_runtime, _fake_request())
     assert [m["content"] for m in history] == ["旧题", "旧解"]
     assert message == ""
 
 
-def test_restore_history_unknown_account(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module, "history_store", HistoryStore(tmp_path))
+def test_restore_history_unknown_account(monkeypatch, tmp_path, app_runtime):
+    monkeypatch.setattr(app_runtime, "history_store", HistoryStore(tmp_path))
     request = type("R", (), {"client": None, "username": None})()
-    history, message = app_module.restore_history(request)
+    history, message = app_module.restore_history(app_runtime, request)
     assert history == []
     assert message == ""
 
 
-def test_restore_history_read_failure_shows_notice(monkeypatch, tmp_path):
+def test_restore_history_read_failure_shows_notice(monkeypatch, tmp_path, app_runtime):
     """文件损坏时明确报告读取失败，不能伪装成成功读取了空历史。"""
     store = HistoryStore(tmp_path)
-    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_runtime, "history_store", store)
     history_dir = tmp_path / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
     (history_dir / "user1.json").write_text("{损坏", encoding="utf-8")
 
-    history, message = app_module.restore_history(_fake_request())
+    history, message = app_module.restore_history(app_runtime, _fake_request())
     assert history == []
     assert "读取失败" in message
 
@@ -64,11 +64,13 @@ def test_restore_history_read_failure_shows_notice(monkeypatch, tmp_path):
     assert (history_dir / "user1.json").read_text(encoding="utf-8") == "{损坏"
 
 
-def test_restore_level_from_account(monkeypatch, tmp_path):
+def test_restore_level_from_account(monkeypatch, tmp_path, app_runtime):
     import core.accounts as accounts_mod
 
     path = tmp_path / "accounts.json"
     monkeypatch.setattr(accounts_mod, "ACCOUNTS_FILE", path)
+    # restore_level 读取的是 runtime.accounts_path（组装时确定），必须一并替换
+    monkeypatch.setattr(app_runtime, "accounts_path", path)
     accounts_mod._write_accounts(
         [
             {
@@ -80,9 +82,9 @@ def test_restore_level_from_account(monkeypatch, tmp_path):
         ],
         path,
     )
-    assert app_module.restore_level(_fake_request()) == "大学"
+    assert app_module.restore_level(app_runtime, _fake_request()) == "大学"
 
 
-def test_restore_level_fallback():
+def test_restore_level_fallback(app_runtime):
     request = type("R", (), {"client": None, "username": None})()
-    assert app_module.restore_level(request) == "高中"
+    assert app_module.restore_level(app_runtime, request) == "高中"

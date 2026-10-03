@@ -119,3 +119,22 @@ def test_default_account_path_is_isolated():
     assert accounts
     assert account_file.is_file()
     assert accounts_module.load_accounts() == accounts
+
+
+def test_check_login_non_ascii_password(tmp_path):
+    """中文等非 ASCII 密码按精确匹配校验：正确可登录，错误正常拒绝。"""
+    path = tmp_path / "accounts.json"
+    accounts = [
+        {
+            "username": "user1",
+            "password": "中文密码123",
+            "display_name": "user1",
+            "level": "高中",
+            "enabled": True,
+        }
+    ]
+    _write_accounts(accounts, path)
+    assert check_login("user1", "中文密码123", path=path)
+    assert not check_login("user1", "中文密码124", path=path)
+    assert not check_login("user1", "中文密码", path=path)
+    assert not check_login("user1", "", path=path)

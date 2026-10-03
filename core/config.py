@@ -7,7 +7,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
+ENV_FILE = BASE_DIR / ".env"
+
+
+def load_env_file(path: str | Path | None = None) -> None:
+    """显式加载 .env；不覆盖已存在的系统环境变量，测试可在收集前替换 ENV_FILE。"""
+    load_dotenv(Path(path) if path is not None else ENV_FILE)
 
 
 @dataclass(frozen=True)

@@ -14,30 +14,32 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROVIDERS_FILE = BASE_DIR / "config" / "providers.json"
 
-# 内置默认服务商；config/providers.json 存在时会覆盖/合并
-DEFAULT_PROVIDERS: list[dict] = [
-    {
-        "id": "deepseek",
-        "name": "DeepSeek",
-        "base_url": os.getenv(
-            "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
-        ).strip(),
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
-        "default_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip(),
-        "thinking_param": "deepseek",
-    },
-    {
-        "id": "openai",
-        "name": "OpenAI",
-        "base_url": "https://api.openai.com/v1",
-        "api_key_env": "OPENAI_API_KEY",
-        "models": ["gpt-4o", "gpt-4o-mini"],
-        "default_model": "gpt-4o-mini",
-        "thinking_param": "openai",
-        "supports_vision": True,
-    },
-]
+# 内置默认服务商；环境相关值在调用 default_providers() 时读取，
+# 导入本模块不读取环境变量（.env 由 core.config.load_env_file 显式加载）
+def default_providers() -> list[dict]:
+    return [
+        {
+            "id": "deepseek",
+            "name": "DeepSeek",
+            "base_url": os.getenv(
+                "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
+            ).strip(),
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+            "default_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip(),
+            "thinking_param": "deepseek",
+        },
+        {
+            "id": "openai",
+            "name": "OpenAI",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "models": ["gpt-4o", "gpt-4o-mini"],
+            "default_model": "gpt-4o-mini",
+            "thinking_param": "openai",
+            "supports_vision": True,
+        },
+    ]
 
 # 允许的字段，避免脏配置
 _ALLOWED_FIELDS = {
@@ -81,10 +83,11 @@ def _sanitize_provider(item: object) -> dict | None:
     }
 
 
-def _read_custom_providers() -> list[dict]:
+def _read_custom_providers(providers_file: Path | None = None) -> list[dict]:
+    file = Path(providers_file) if providers_file is not None else PROVIDERS_FILE
     try:
         # 使用 utf-8-sig 自动去掉 Windows 记事本可能保存的 BOM
-        data = json.loads(PROVIDERS_FILE.read_text(encoding="utf-8-sig"))
+        data = json.loads(file.read_text(encoding="utf-8-sig"))
     except Exception:
         return []
     if not isinstance(data, list):
@@ -97,12 +100,14 @@ def _read_custom_providers() -> list[dict]:
     return result
 
 
-def load_providers() -> list[dict]:
-    """返回当前可配置的全部服务商；优先读取 config/providers.json。"""
-    custom = _read_custom_providers()
+def load_providers(providers_file: Path | None = None) -> list[dict]:
+    """返回当前可配置的全部服务商；优先读取 providers_file（默认 config/providers.json）。"""
+    custom = _read_custom_providers(providers_file)
     if custom:
         return custom
-    return [_sanitize_provider(p) for p in DEFAULT_PROVIDERS if _sanitize_provider(p)]
+    return [
+        _sanitize_provider(p) for p in default_providers() if _sanitize_provider(p)
+    ]
 
 
 def get_provider(provider_id: str | None, providers: list[dict] | None = None) -> dict | None:

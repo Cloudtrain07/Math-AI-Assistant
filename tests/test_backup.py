@@ -2,6 +2,7 @@
 """每日自动备份模块测试。"""
 
 import sys
+import threading
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
@@ -72,3 +73,21 @@ def test_backup_empty_data_dir_ok(monkeypatch, tmp_path):
     monkeypatch.setattr(backup_mod, "DATA_DIR", tmp_path / "data")
     path = backup_mod.backup_data()
     assert path is not None and path.exists()
+
+
+def test_daily_backup_loop_stops_on_signal(tmp_path, monkeypatch):
+    """停止信号置位后，等待中的备份循环不必等满间隔即可退出。
+
+    join 设 5 秒上限：若停止机制失效（等满 60 秒间隔），线程仍存活、测试失败。
+    """
+    monkeypatch.setattr(backup_mod, "DATA_DIR", tmp_path / "data")
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=backup_mod.daily_backup_loop,
+        kwargs={"interval_seconds": 60, "stop_event": stop_event},
+        daemon=True,
+    )
+    thread.start()
+    stop_event.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()

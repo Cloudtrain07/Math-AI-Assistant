@@ -19,10 +19,10 @@ from conftest import (
 from core import usage as usage_module
 
 
-def _wire_usage_store(monkeypatch) -> MemoryDailyUsageStore:
+def _wire_usage_store(monkeypatch, app_runtime) -> MemoryDailyUsageStore:
     """用内存每日用量存储替换文件实现，返回实例供断言。"""
     store = MemoryDailyUsageStore()
-    monkeypatch.setattr(app_module, "daily_usage_store", store)
+    monkeypatch.setattr(app_runtime, "daily_usage_store", store)
     return store
 
 
@@ -51,23 +51,24 @@ def _stage0():
     return {"stage": "initial_hint", "hints": 0, "last_mode": "互动模式"}
 
 
-def _patch_respond_env(monkeypatch, tmp_path, store):
-    monkeypatch.setattr(app_module, "client", _FakeClient())
-    monkeypatch.setattr(app_module, "history_store", store)
-    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
-    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
-    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
-    return _wire_usage_store(monkeypatch)
+def _patch_respond_env(monkeypatch, tmp_path, store, app_runtime):
+    monkeypatch.setattr(app_runtime, "client", _FakeClient())
+    monkeypatch.setattr(app_runtime, "history_store", store)
+    monkeypatch.setattr(app_runtime, "event_logger", MemoryEventLogger())
+    monkeypatch.setattr(app_runtime, "daily_limit", 1_000_000)
+    monkeypatch.setattr(app_runtime, "global_daily_limit", 3_000_000)
+    return _wire_usage_store(monkeypatch, app_runtime)
 
 
 def test_clear_during_generation_blocks_writeback_and_settles_usage(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, app_runtime
 ):
     """respond 生成期间清空成功：旧回答不能写回，用量仍结算一次。"""
     store = MemoryHistoryStore()
-    usage_store = _patch_respond_env(monkeypatch, tmp_path, store)
+    usage_store = _patch_respond_env(monkeypatch, tmp_path, store, app_runtime)
 
     stream = app_module.respond(
+        app_runtime,
         "1+1=?",
         [],
         "高中",
@@ -83,7 +84,7 @@ def test_clear_during_generation_blocks_writeback_and_settles_usage(
         _fake_request(),
     )
     next(stream)  # 模型已开始生成（保存标记已取得）
-    app_module.history_store.clear("user1")  # 生成期间清空成功
+    app_runtime.history_store.clear("user1")  # 生成期间清空成功
     final = list(stream)[-1]
 
     final_history, _, status, _, state, _, _, _ = final
@@ -103,14 +104,15 @@ def test_clear_during_generation_blocks_writeback_and_settles_usage(
 
 
 def test_two_turns_same_account_second_overwrites_after_first_saved(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, app_runtime
 ):
     """同一账号先后开始的两轮：第一轮保存完成后，第二轮正常覆盖。"""
     store = MemoryHistoryStore()
-    _patch_respond_env(monkeypatch, tmp_path, store)
+    _patch_respond_env(monkeypatch, tmp_path, store, app_runtime)
 
     first = list(
         app_module.respond(
+            app_runtime,
             "1+1=?",
             [],
             "高中",
@@ -131,6 +133,7 @@ def test_two_turns_same_account_second_overwrites_after_first_saved(
 
     second = list(
         app_module.respond(
+            app_runtime,
             "再来一题",
             store._messages["user1"],
             "高中",

@@ -14,6 +14,9 @@ from tempfile import TemporaryDirectory
 import pytest
 
 from core import accounts as accounts_module
+from core import config as config_module
+from core import providers as providers_module
+from core import runtime as runtime_module
 
 from core.storage import (
     filter_valid_messages,
@@ -29,9 +32,16 @@ from core.usage_store import (
 
 
 def pytest_configure(config):
-    """在收集测试前，把默认账号文件隔离到测试临时目录。"""
+    """在收集测试前，把配置、账号与数据路径统一改到临时目录。
+
+    build_runtime 在调用时才解析这些路径常量，因此测试经 app_runtime fixture
+    显式组装运行对象时全部落在隔离路径上：不读取真实 .env / providers.json，
+    不写正式 data。
+    """
     accounts_dir = TemporaryDirectory(prefix="maa-test-accounts-")
     config.add_cleanup(accounts_dir.cleanup)
+    data_dir = TemporaryDirectory(prefix="maa-test-data-")
+    config.add_cleanup(data_dir.cleanup)
 
     patch = pytest.MonkeyPatch()
     config.add_cleanup(patch.undo)
@@ -42,6 +52,24 @@ def pytest_configure(config):
         Path(accounts_dir.name) / "accounts.json",
     )
     patch.setattr(accounts_module, "_memory_accounts", None)
+    # 指向不存在的临时路径：.env 与自定义服务商都不加载
+    patch.setattr(config_module, "ENV_FILE", Path(data_dir.name) / "missing.env")
+    patch.setattr(
+        providers_module, "PROVIDERS_FILE", Path(data_dir.name) / "providers.json"
+    )
+    patch.setattr(runtime_module, "DEFAULT_DATA_DIR", Path(data_dir.name))
+    # 兜底：防止系统环境变量里的真实 Key 进入测试进程
+    patch.setenv("DEEPSEEK_API_KEY", "")
+    patch.setenv("OPENAI_API_KEY", "")
+
+
+@pytest.fixture
+def app_runtime():
+    """为单个测试构建独立的 AppRuntime：app 导入不再自带模块级运行对象。
+
+    路径已由 pytest_configure 隔离；测试按需把单个字段替换为内存假实现。
+    """
+    return runtime_module.build_runtime()
 
 
 class MemoryHistoryStore:

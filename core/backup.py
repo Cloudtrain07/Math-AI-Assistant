@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import re
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -80,11 +81,22 @@ def ensure_today_backup() -> Path | None:
     return backup_data(backup_path_for())
 
 
-def daily_backup_loop(interval_seconds: int = 3600) -> None:
-    """后台守护线程：每小时检查一次日期，跨天自动备份并清理旧备份。"""
+def daily_backup_loop(
+    interval_seconds: int = 3600,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """后台守护线程：每小时检查一次日期，跨天自动备份并清理旧备份。
+
+    stop_event 仅用于收到退出信号时及时结束等待并返回；
+    正在进行的备份不会被信号打断，等待中的循环则立即退出。
+    """
     last_date = datetime.date.today()
     while True:
-        time.sleep(interval_seconds)
+        if stop_event is not None:
+            if stop_event.wait(interval_seconds):
+                return
+        else:
+            time.sleep(interval_seconds)
         today = datetime.date.today()
         if today != last_date:
             last_date = today

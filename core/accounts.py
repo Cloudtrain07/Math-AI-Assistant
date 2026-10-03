@@ -126,7 +126,12 @@ def check_login(username: str, password: str, path: Path | None = None) -> bool:
     account = get_account(username, path)
     if account is None or not account.get("enabled", True):
         return False
-    return secrets.compare_digest(account["password"], password or "")
+    # compare_digest 不支持非 ASCII 字符串，改按 UTF-8 字节比较，
+    # 字节相等与字符串精确相等语义一致，中文密码可正常校验
+    return secrets.compare_digest(
+        account["password"].encode("utf-8"),
+        (password or "").encode("utf-8"),
+    )
 
 
 def reset_password(

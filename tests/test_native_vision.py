@@ -61,12 +61,12 @@ def _stage_answer_mode():
     return {"stage": None, "hints": 0, "last_mode": "解答模式"}
 
 
-def _patch_common(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module, "history_store", MemoryHistoryStore())
-    monkeypatch.setattr(app_module, "daily_usage_store", MemoryDailyUsageStore())
-    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
-    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
-    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+def _patch_common(monkeypatch, tmp_path, app_runtime):
+    monkeypatch.setattr(app_runtime, "history_store", MemoryHistoryStore())
+    monkeypatch.setattr(app_runtime, "daily_usage_store", MemoryDailyUsageStore())
+    monkeypatch.setattr(app_runtime, "event_logger", MemoryEventLogger())
+    monkeypatch.setattr(app_runtime, "daily_limit", 1_000_000)
+    monkeypatch.setattr(app_runtime, "global_daily_limit", 3_000_000)
 
 
 def _tiny_png(tmp_path):
@@ -139,18 +139,18 @@ def test_to_api_messages_image_without_user_message_is_ignored():
 # ---------- on_image_upload：图片只进入待发区 ----------
 
 
-def test_on_image_upload_vision_provider_only_pends(monkeypatch):
-    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
-    results = list(app_module.on_image_upload("/tmp/x.png", "glm"))
+def test_on_image_upload_vision_provider_only_pends(monkeypatch, app_runtime):
+    monkeypatch.setattr(app_runtime, "event_logger", MemoryEventLogger())
+    results = list(app_module.on_image_upload(app_runtime, "/tmp/x.png", "glm"))
     textbox, status, image_out, image_state = results[-1]
     assert "图片已就绪" in status
     assert image_out == "/tmp/x.png"  # 图片保留显示
     assert image_state == {"path": "/tmp/x.png", "fresh": True}
 
 
-def test_on_image_upload_text_provider_only_pends(monkeypatch):
-    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
-    results = list(app_module.on_image_upload("/tmp/x.png", "deepseek"))
+def test_on_image_upload_text_provider_only_pends(monkeypatch, app_runtime):
+    monkeypatch.setattr(app_runtime, "event_logger", MemoryEventLogger())
+    results = list(app_module.on_image_upload(app_runtime, "/tmp/x.png", "deepseek"))
     textbox, status, image_out, image_state = results[-1]
     assert image_out == "/tmp/x.png"  # 与看图服务商行为一致：保留待发
     assert image_state == {"path": "/tmp/x.png", "fresh": True}
@@ -160,14 +160,15 @@ def test_on_image_upload_text_provider_only_pends(monkeypatch):
 # ---------- respond：看图服务商直传路径 ----------
 
 
-def test_respond_attaches_image_for_vision_model(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
+def test_respond_attaches_image_for_vision_model(monkeypatch, tmp_path, app_runtime):
+    _patch_common(monkeypatch, tmp_path, app_runtime)
     fake = _VisionClient()
-    monkeypatch.setattr(app_module, "client", fake)
+    monkeypatch.setattr(app_runtime, "client", fake)
     png = _tiny_png(tmp_path)
 
     results = list(
         app_module.respond(
+            app_runtime,
             "这道题怎么做",
             [],
             "高中",
@@ -203,10 +204,10 @@ def test_respond_attaches_image_for_vision_model(monkeypatch, tmp_path):
     assert usage_state["completion_tokens"] == 23
 
 
-def test_respond_clears_stale_image_on_new_problem(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
+def test_respond_clears_stale_image_on_new_problem(monkeypatch, tmp_path, app_runtime):
+    _patch_common(monkeypatch, tmp_path, app_runtime)
     fake = _VisionClient()
-    monkeypatch.setattr(app_module, "client", fake)
+    monkeypatch.setattr(app_runtime, "client", fake)
     png = _tiny_png(tmp_path)
     history = [
         {"role": "user", "content": "上一题"},
@@ -215,6 +216,7 @@ def test_respond_clears_stale_image_on_new_problem(monkeypatch, tmp_path):
 
     results = list(
         app_module.respond(
+            app_runtime,
             "求解方程 x²-5x+6=0",
             history,
             "高中",
@@ -237,14 +239,15 @@ def test_respond_clears_stale_image_on_new_problem(monkeypatch, tmp_path):
     assert isinstance(fake.seen_messages[-1]["content"], str)
 
 
-def test_respond_force_continue_never_attaches_image(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
+def test_respond_force_continue_never_attaches_image(monkeypatch, tmp_path, app_runtime):
+    _patch_common(monkeypatch, tmp_path, app_runtime)
     fake = _VisionClient()
-    monkeypatch.setattr(app_module, "client", fake)
+    monkeypatch.setattr(app_runtime, "client", fake)
     png = _tiny_png(tmp_path)
 
     results = list(
         app_module.respond(
+            app_runtime,
             "原题\n（请继续完成上一条回答）",
             [],
             "高中",
@@ -268,14 +271,15 @@ def test_respond_force_continue_never_attaches_image(monkeypatch, tmp_path):
     assert image_state == {"path": png, "fresh": False}
 
 
-def test_respond_empty_message_with_image_auto_prompt(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
+def test_respond_empty_message_with_image_auto_prompt(monkeypatch, tmp_path, app_runtime):
+    _patch_common(monkeypatch, tmp_path, app_runtime)
     fake = _VisionClient()
-    monkeypatch.setattr(app_module, "client", fake)
+    monkeypatch.setattr(app_runtime, "client", fake)
     png = _tiny_png(tmp_path)
 
     results = list(
         app_module.respond(
+            app_runtime,
             "",
             [],
             "高中",
@@ -300,15 +304,16 @@ def test_respond_empty_message_with_image_auto_prompt(monkeypatch, tmp_path):
     assert last_history[0]["content"].startswith(app_module._IMAGE_ONLY_PROMPT)
 
 
-def test_respond_attach_image_false_passthrough(monkeypatch, tmp_path):
+def test_respond_attach_image_false_passthrough(monkeypatch, tmp_path, app_runtime):
     """只发送文字时不携带待发图片，待发状态原样透传。"""
-    _patch_common(monkeypatch, tmp_path)
+    _patch_common(monkeypatch, tmp_path, app_runtime)
     fake = _VisionClient()
-    monkeypatch.setattr(app_module, "client", fake)
+    monkeypatch.setattr(app_runtime, "client", fake)
     png = _tiny_png(tmp_path)
 
     results = list(
         app_module.respond(
+            app_runtime,
             "这是一条只发送文字的消息",
             [],
             "高中",
@@ -334,14 +339,15 @@ def test_respond_attach_image_false_passthrough(monkeypatch, tmp_path):
 # ---------- respond：纯文本模型拒绝图片 ----------
 
 
-def test_respond_text_client_rejects_image_and_keeps_pending(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
+def test_respond_text_client_rejects_image_and_keeps_pending(monkeypatch, tmp_path, app_runtime):
+    _patch_common(monkeypatch, tmp_path, app_runtime)
     fake = _TextClient()
-    monkeypatch.setattr(app_module, "client", fake)
+    monkeypatch.setattr(app_runtime, "client", fake)
     png = _tiny_png(tmp_path)
 
     results = list(
         app_module.respond(
+            app_runtime,
             "这道题怎么做",
             [],
             "高中",
@@ -366,13 +372,14 @@ def test_respond_text_client_rejects_image_and_keeps_pending(monkeypatch, tmp_pa
     assert fake.calls == 0
 
 
-def test_respond_empty_message_without_image_rejected(monkeypatch, tmp_path):
-    _patch_common(monkeypatch, tmp_path)
+def test_respond_empty_message_without_image_rejected(monkeypatch, tmp_path, app_runtime):
+    _patch_common(monkeypatch, tmp_path, app_runtime)
     fake = _TextClient()
-    monkeypatch.setattr(app_module, "client", fake)
+    monkeypatch.setattr(app_runtime, "client", fake)
 
     results = list(
         app_module.respond(
+            app_runtime,
             "  ",
             [],
             "高中",

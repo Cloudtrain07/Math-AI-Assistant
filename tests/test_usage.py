@@ -201,41 +201,41 @@ def _fake_request():
     return type("Request", (), {"client": client, "username": "user1"})()
 
 
-def test_check_login_records_login_and_keeps_result(monkeypatch):
+def test_check_login_records_login_and_keeps_result(monkeypatch, app_runtime):
     store = MemoryDailyUsageStore()
-    monkeypatch.setattr(app_module, "daily_usage_store", store)
-    monkeypatch.setattr(app_module, "check_login", lambda u, p: True)
-    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
+    monkeypatch.setattr(app_runtime, "daily_usage_store", store)
+    monkeypatch.setattr(app_module, "check_login", lambda u, p, path=None: True)
+    monkeypatch.setattr(app_runtime, "event_logger", MemoryEventLogger())
 
-    assert app_module._check_login("user1", "pw") is True
+    assert app_module._check_login(app_runtime, "user1", "pw") is True
     assert store.get_logins(datetime.date.today().isoformat()) == 1
 
 
-def test_check_login_failure_keeps_result_and_logs(monkeypatch):
+def test_check_login_failure_keeps_result_and_logs(monkeypatch, app_runtime):
     class FailingLoginStore(MemoryDailyUsageStore):
         def add_login(self, date):
             raise OSError("模拟登录次数写盘失败")
 
     store = FailingLoginStore()
     logger = MemoryEventLogger()
-    monkeypatch.setattr(app_module, "daily_usage_store", store)
-    monkeypatch.setattr(app_module, "check_login", lambda u, p: True)
-    monkeypatch.setattr(app_module, "event_logger", logger)
+    monkeypatch.setattr(app_runtime, "daily_usage_store", store)
+    monkeypatch.setattr(app_module, "check_login", lambda u, p, path=None: True)
+    monkeypatch.setattr(app_runtime, "event_logger", logger)
 
     # 登录次数记录失败不改变密码校验结果，并留下明确失败信息
-    assert app_module._check_login("user1", "pw") is True
+    assert app_module._check_login(app_runtime, "user1", "pw") is True
     assert any("登录次数记录失败" in str(args) for args in logger.access_events)
     assert store.get_logins(datetime.date.today().isoformat()) == 0
 
 
-def test_render_usage_panel_reads_today_usage(monkeypatch):
+def test_render_usage_panel_reads_today_usage(monkeypatch, app_runtime):
     store = MemoryDailyUsageStore()
     today = datetime.date.today().isoformat()
     store.add_usage(today, "user1", 123)
-    monkeypatch.setattr(app_module, "daily_usage_store", store)
+    monkeypatch.setattr(app_runtime, "daily_usage_store", store)
     # 注入固定账号清单，不依赖真实 data/accounts.json
     monkeypatch.setattr(
-        app_module,
+        app_runtime,
         "accounts",
         [
             {
@@ -248,28 +248,28 @@ def test_render_usage_panel_reads_today_usage(monkeypatch):
     )
     monkeypatch.setattr(app_module, "is_owner_host", lambda ip: True)
 
-    panel = app_module.render_usage_panel(_fake_request())
+    panel = app_module.render_usage_panel(app_runtime, _fake_request())
     assert "全局已用：123" in panel
     assert "user1（测试一号）" in panel
     assert "123 tokens" in panel
 
 
-def test_render_usage_panel_read_failure_shows_error(monkeypatch, tmp_path):
+def test_render_usage_panel_read_failure_shows_error(monkeypatch, tmp_path, app_runtime):
     """面板读取失败显示失败提示，不显示零用量的正常面板。"""
     from core.usage_store import DailyUsageStore
 
     path = tmp_path / "usage_daily.json"
     path.write_text("{损坏", encoding="utf-8")
-    monkeypatch.setattr(app_module, "daily_usage_store", DailyUsageStore(path))
+    monkeypatch.setattr(app_runtime, "daily_usage_store", DailyUsageStore(path))
     monkeypatch.setattr(app_module, "is_owner_host", lambda ip: True)
 
-    panel = app_module.render_usage_panel(_fake_request())
+    panel = app_module.render_usage_panel(app_runtime, _fake_request())
     assert "读取失败" in panel
     assert "主人用量面板" not in panel
     assert "各账号用量" not in panel
 
 
-def test_render_usage_panel_hidden_for_non_owner(monkeypatch):
-    monkeypatch.setattr(app_module, "daily_usage_store", MemoryDailyUsageStore())
+def test_render_usage_panel_hidden_for_non_owner(monkeypatch, app_runtime):
+    monkeypatch.setattr(app_runtime, "daily_usage_store", MemoryDailyUsageStore())
     monkeypatch.setattr(app_module, "is_owner_host", lambda ip: False)
-    assert app_module.render_usage_panel(_fake_request()) == "🔒 （仅主人可见）"
+    assert app_module.render_usage_panel(app_runtime, _fake_request()) == "🔒 （仅主人可见）"

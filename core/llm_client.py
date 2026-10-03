@@ -110,6 +110,9 @@ class LLMClient:
                     raise MaxWaitTimeout(
                         f"等待超过 {int(max_wait)} 秒，已自动停止（可重新发送）"
                     )
+                # usage 读取必须在 choices 判断之外：DeepSeek 末尾的用量分片
+                # choices 为空但携带 usage，放进判断内会把用量静默丢弃
+                chunk_usage = getattr(chunk, "usage", None)
                 if chunk.choices:
                     if chunk.choices[0].finish_reason:
                         finish_reason = chunk.choices[0].finish_reason
@@ -118,7 +121,6 @@ class LLMClient:
                         yield None, delta.reasoning_content, None, None
                     elif delta.content:
                         yield delta.content, None, None, None
-                    chunk_usage = getattr(chunk, "usage", None)
                 chunk_finish_reason = (
                     chunk.choices[0].finish_reason if chunk.choices else None
                 )

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import datetime
+import functools
+import inspect
 import os
 import threading
 import time
-from pathlib import Path
 
 import gradio as gr
 
@@ -17,44 +18,35 @@ from core.access import (
 )
 from core.accounts import (
     check_login,
-    ensure_accounts,
     get_account,
     load_accounts,
     reset_password,
 )
 from core.backup import daily_backup_loop, ensure_today_backup
-from core.compressor import HistoryCompressor
-from core.config import get_base_settings
-from core.llm_client import LLMClient, MaxWaitTimeout
-from core.logger import FileEventLogger
+from core.llm_client import MaxWaitTimeout
 from core.providers import (
-    get_available_providers,
-    get_default_provider,
     get_provider,
     get_provider_models,
     get_provider_supports_thinking,
-    load_providers,
 )
 from core.math_format import normalize_math_text
 from core.prompts import (
     MODE_ANSWER,
     MODE_INTERACTIVE,
 )
-from core.storage import HistoryReadError, get_history_store
+from core.runtime import AppRuntime, build_runtime
+from core.storage import HistoryReadError
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.usage import (
     estimate_tokens,
     format_cumulative,
     new_usage_state,
 )
-from core.usage_store import DailyUsageReadError, DailyUsageStore
+from core.usage_store import DailyUsageReadError
 from core import dialogue_state
-from core import chat_service 
+from core import chat_service
 
 APP_VERSION = "1.3.1"
-# 多账号：首次启动按 ACCOUNT_COUNT（默认 5）生成账号，之后以 data/accounts.json 为准
-ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "5") or "5")
-accounts = ensure_accounts(ACCOUNT_COUNT)
 
 # 移动端适配与整体排版（蓝白黑冷色调主题之外的少量微调）
 PAGE_CSS = """
@@ -65,53 +57,6 @@ PAGE_CSS = """
   .katex-display, .katex { overflow-x: auto; overflow-y: hidden; }
 }
 """
-
-# app.py 位于项目根目录，data 目录就在同级
-DATA_DIR = Path(__file__).resolve().parent / "data"
-
-try:
-    settings = get_base_settings()
-    all_providers = load_providers()
-    available_providers = get_available_providers(all_providers)
-    clients = {p["id"]: LLMClient(p, settings) for p in available_providers}
-    default_provider = get_default_provider(all_providers)
-    client = clients.get(default_provider["id"]) if default_provider else None
-    ui_providers = available_providers or all_providers
-    startup_hint = ("未找到可用的 API Key（DeepSeek / OpenAI），请检查 .env 后重启。" if not client else "")
-    # 客户端已在上方按服务商构建
-except ValueError as exc:
-    # 未配置 API Key 时应用仍可启动，界面给出提示，方便先看效果
-    settings = None
-    client = None
-    ui_providers = []
-    startup_hint = str(exc)
-else:
-    pass
-# 上下文压缩器（按账号增量维护长会话摘要）
-history_compressor = HistoryCompressor()
-# 会话历史存储：整个应用共用同一实例，同一账号的历史文件共用锁与保存计数
-history_store = get_history_store(DATA_DIR)
-# 每日用量存储：整个应用共用同一实例（读-改-写在存储模块内的单进程锁中完成）
-daily_usage_store = DailyUsageStore(DATA_DIR / "usage_daily.json")
-# 每日每账号 token 上限（成本护栏）
-DAILY_LIMIT = settings.daily_token_limit if settings is not None else 1_000_000
-# 全局每日 token 总上限（成本护栏第二道保险）
-GLOBAL_DAILY_LIMIT = (
-    settings.global_daily_token_limit if settings is not None else 3_000_000
-)
-# 单条消息最大长度（字符），超长直接拒绝
-MAX_MESSAGE_LEN = settings.max_message_len if settings else 2000
-
-# 共享日志对象：聊天/访问/错误日志统一经它写入与裁剪，测试可替换为内存实现
-event_logger = FileEventLogger(
-    DATA_DIR,
-    model=settings.model if settings is not None else None,
-    thinking=settings.thinking if settings is not None else None,
-    reasoning_effort=(
-        settings.reasoning_effort if settings is not None else None
-    ),
-)
-
 
 def _new_image_state() -> dict:
     """待发图片状态：path 为上传的临时文件路径，fresh 表示本回合刚上传。
@@ -182,20 +127,22 @@ def _friendly_error(exc: Exception) -> str:
     return f"⚠️ {hint}（{name}: {text}）"
 
 
-def _check_login(username: str, password: str) -> bool:
+def _check_login(runtime, username: str, password: str) -> bool:
     """校验登录并记录到访问日志（Gradio auth 回调）。"""
-    ok = check_login(username, password)
-    event_logger.log_access_event("登录", f"账号={username}", f"结果={'成功' if ok else '失败'}")
+    ok = check_login(username, password, path=runtime.accounts_path)
+    runtime.event_logger.log_access_event(
+        "登录", f"账号={username}", f"结果={'成功' if ok else '失败'}"
+    )
     if ok:
         try:
-            daily_usage_store.add_login(datetime.date.today().isoformat())
+            runtime.daily_usage_store.add_login(datetime.date.today().isoformat())
         except Exception:
             # 登录次数记录失败不影响密码校验结果，留下失败信息即可
-            event_logger.log_access_event("登录次数记录失败", f"账号={username}")
+            runtime.event_logger.log_access_event("登录次数记录失败", f"账号={username}")
     return ok
 
 
-def on_image_upload(image: str | None, provider_id: str | None):
+def on_image_upload(runtime, image: str | None, provider_id: str | None):
     """上传/粘贴题目图片：统一进入待发状态，由支持原生视觉的服务商直接处理。
 
     outputs：[textbox, result_status, image_input, image_state]
@@ -203,7 +150,7 @@ def on_image_upload(image: str | None, provider_id: str | None):
     if not image:
         yield gr.skip(), "", gr.skip(), _new_image_state()    #输出重置UI的指令
         return  #退出函数
-    event_logger.log_chat_event("图片就绪", str(image))
+    runtime.event_logger.log_chat_event("图片就绪", str(image))
     yield (
         gr.skip(),
         "🖼️ 图片已就绪：输入你的问题后点击发送。"
@@ -215,6 +162,7 @@ def on_image_upload(image: str | None, provider_id: str | None):
 
 
 def respond(
+    runtime,
     message: str,
     history: list[dict],
     level: str,
@@ -235,7 +183,7 @@ def respond(
     username = request.username if request and request.username else "unknown"
     ip = (request.client.host if request and request.client else None) or "unknown"
     today = datetime.date.today().isoformat()
-    active_client = clients.get(provider_id) or client
+    active_client = runtime.clients.get(provider_id) or runtime.client
 
     thinking_started = None
 
@@ -255,16 +203,18 @@ def respond(
         reasoning_effort=reasoning_effort,
         answer_style=answer_style,
         active_client=active_client,
-        history_compressor=history_compressor,
-        history_store=history_store,
-        daily_usage_store=daily_usage_store,
-        event_logger=event_logger,
-        max_message_len=MAX_MESSAGE_LEN,
+        history_compressor=runtime.history_compressor,
+        history_store=runtime.history_store,
+        daily_usage_store=runtime.daily_usage_store,
+        event_logger=runtime.event_logger,
+        max_message_len=runtime.max_message_len,
         max_history_messages=(
-            settings.max_history_messages if settings is not None else None
+            runtime.settings.max_history_messages
+            if runtime.settings is not None
+            else None
         ),
-        daily_limit=DAILY_LIMIT,
-        global_daily_limit=GLOBAL_DAILY_LIMIT,
+        daily_limit=runtime.daily_limit,
+        global_daily_limit=runtime.global_daily_limit,
         image_only_prompt=_IMAGE_ONLY_PROMPT,
         image_note=IMAGE_NOTE,
         force_continue=force_continue,
@@ -290,7 +240,7 @@ def respond(
                 result_text = "💡 请先输入问题，或上传题目图片后直接发送。"
             elif reason == "too_long":
                 result_text = (
-                    f"⚠️ 消息过长（最多 {MAX_MESSAGE_LEN:,} 字符），"
+                    f"⚠️ 消息过长（最多 {runtime.max_message_len:,} 字符），"
                     "请精简后重试。"
                 )
             elif reason == "quota_read_failed":
@@ -298,7 +248,7 @@ def respond(
             elif reason == "no_client":
                 # 沿用原行为：启动提示显示在聊天区。
                 display_history = history + [
-                    {"role": "assistant", "content": f"⚠️ {startup_hint}"}
+                    {"role": "assistant", "content": f"⚠️ {runtime.startup_hint}"}
                 ]
                 result_text = ""
             else:
@@ -442,13 +392,13 @@ def respond(
 
             if daily_used is not None and global_used is not None:
                 usage_text += (
-                    f"\n\n🛡️ 今日已用 {daily_used:,} / {DAILY_LIMIT:,}（本账号），"
-                    f"全局 {global_used:,} / {GLOBAL_DAILY_LIMIT:,}"
+                    f"\n\n🛡️ 今日已用 {daily_used:,} / {runtime.daily_limit:,}（本账号），"
+                    f"全局 {global_used:,} / {runtime.global_daily_limit:,}"
                 )
             elif daily_used is not None:
                 usage_text += (
                     f"\n\n🛡️ 今日已用 {daily_used:,} / "
-                    f"{DAILY_LIMIT:,}（本账号）"
+                    f"{runtime.daily_limit:,}（本账号）"
                 )
 
         yield (
@@ -465,6 +415,7 @@ def respond(
 
 
 def continue_last_answer(
+    runtime,
     history: list[dict],
     level: str,
     mode: str,
@@ -495,6 +446,7 @@ def continue_last_answer(
         )
         return
     yield from respond(
+        runtime,
         message,
         history,
         level,
@@ -512,11 +464,11 @@ def continue_last_answer(
     )
 
 
-def clear_conversation(request: gr.Request):
+def clear_conversation(runtime, request: gr.Request):
     """开启新对话：清空当前账号的聊天记录并持久化；成功后才重置摘要与界面状态。"""
     username = request.username if request and request.username else "unknown"
     try:
-        history_store.clear(username)
+        runtime.history_store.clear(username)
     except Exception:
         # 清空失败：保留当前界面状态与摘要，等待用户重试；每日累计用量不受影响
         return (
@@ -529,7 +481,7 @@ def clear_conversation(request: gr.Request):
             gr.update(),
             gr.update(),
         )
-    history_compressor.reset(username)
+    runtime.history_compressor.reset(username)
     return (
         gr.update(value=[]),
         "",
@@ -542,28 +494,28 @@ def clear_conversation(request: gr.Request):
     )
 
 
-def render_usage_panel(request: gr.Request) -> str:
+def render_usage_panel(runtime, request: gr.Request) -> str:
     """主人用量面板：仅本机（localhost）可见，展示今日全局/每账号用量与次数。"""
     ip = (request.client.host if request and request.client else None) or "unknown"
     if not is_owner_host(ip):
         return "🔒 （仅主人可见）"
     today = datetime.date.today().isoformat()
     try:
-        global_used = daily_usage_store.get_total(today)
-        per_account = daily_usage_store.get_account_usage(today)
-        logins = daily_usage_store.get_logins(today)
-        questions = daily_usage_store.get_questions(today)
+        global_used = runtime.daily_usage_store.get_total(today)
+        per_account = runtime.daily_usage_store.get_account_usage(today)
+        logins = runtime.daily_usage_store.get_logins(today)
+        questions = runtime.daily_usage_store.get_questions(today)
     except DailyUsageReadError:
         # 读取失败明确提示，不显示零用量的正常面板
         return "⚠️ 用量面板读取失败，暂时无法显示今日用量。"
     lines = [
         f"**主人用量面板（{today}）**",
-        f"- 全局已用：{global_used:,} / {GLOBAL_DAILY_LIMIT:,} tokens",
+        f"- 全局已用：{global_used:,} / {runtime.global_daily_limit:,} tokens",
         f"- 登录次数：{logins}，提问次数：{questions}",
-        f"- 账号数量：{len(accounts)}（清单见 data/accounts.json，可自行增删）",
+        f"- 账号数量：{len(runtime.accounts)}（清单见 data/accounts.json，可自行增删）",
         "**各账号用量：**",
     ]
-    for account in accounts:
+    for account in runtime.accounts:
         name = account["username"]
         display = account.get("display_name") or name
         enabled = "✅" if account.get("enabled", True) else "⛔"
@@ -576,7 +528,7 @@ def render_usage_panel(request: gr.Request) -> str:
 
 
 def reset_account_password(
-    request: gr.Request, account_name: str, new_password: str
+    runtime, request: gr.Request, account_name: str, new_password: str
 ) -> str:
     """主人重置指定账号的密码（仅本机可见）。"""
     ip = (request.client.host if request and request.client else None) or "unknown"
@@ -586,27 +538,26 @@ def reset_account_password(
         return "ℹ️ 请选择要重置的账号。"
     if not (new_password or "").strip():
         return "⚠️ 新密码不能为空。"
-    global accounts
-    if reset_password(account_name, new_password):
-        accounts = load_accounts()
-        event_logger.log_access_event("重置密码", f"账号={account_name}")
+    if reset_password(account_name, new_password, path=runtime.accounts_path):
+        runtime.accounts = load_accounts(runtime.accounts_path)
+        runtime.event_logger.log_access_event("重置密码", f"账号={account_name}")
         return f"✅ 已重置账号 {account_name} 的密码。"
     return "⚠️ 账号不存在，请刷新页面后重试。"
 
 
-def restore_history(request: gr.Request) -> tuple[list[dict], str]:
+def restore_history(runtime, request: gr.Request) -> tuple[list[dict], str]:
     """登录后加载当前账号上次的聊天记录；读取失败时明确提示，不伪装成空历史。"""
     username = request.username if request and request.username else "unknown"
     try:
-        return history_store.load(username), ""
+        return runtime.history_store.load(username), ""
     except HistoryReadError as exc:
         return [], _RESTORE_FAILED_MSG.format(detail=exc)
 
 
-def restore_level(request: gr.Request) -> str:
+def restore_level(runtime, request: gr.Request) -> str:
     """登录后把学段默认值设为账号配置的学段（页面加载时触发）。"""
     username = request.username if request and request.username else "unknown"
-    account = get_account(username)
+    account = get_account(username, path=runtime.accounts_path)
     level = account["level"] if account else "高中"
     if level not in ("小学", "初中", "高中", "大学"):
         level = "高中"
@@ -622,6 +573,7 @@ def toggle_answer_style(mode: str):
 
 
 def confirm_clear(
+    runtime,
     request: gr.Request,
     history: list[dict],
     confirm_state: str,
@@ -649,7 +601,7 @@ def confirm_clear(
         new_stage,
         _reasoning,
         new_image_state,
-    ) = clear_conversation(request)
+    ) = clear_conversation(runtime, request)
     return (
         new_history,
         _text,
@@ -695,301 +647,363 @@ def clear_image_state():
     return _new_image_state()
 
 
+def _bind(fn, runtime):
+    """把 runtime 绑定为回调首参，并向 Gradio 暴露去掉首参后的签名。
 
-with gr.Blocks(
-    title="数学学习 AI 助手",
-    theme=gr.themes.Base(
-        primary_hue="blue", secondary_hue="blue", neutral_hue="slate"
-    ),
-    css=PAGE_CSS,
-) as demo:
-    gr.Markdown(
-        "# 🧮 数学学习 AI 助手\n\n"
-        "支持多服务商模型，采用苏格拉底式引导，一步步带你学会数学。"
-        f"支持 LaTeX 公式和图片输入（取决于所选模型）。版本 v{APP_VERSION}"
+    Gradio 按签名参数个数匹配组件输入、按注解注入 gr.Request；
+    functools.wraps 保留的 __wrapped__ 签名含 runtime 首参，会造成输入错位，
+    因此在包装器上显式设置去掉首参的 __signature__。
+    注解仍由 wraps 复制，Request 的类型注解保留，注入逻辑不受影响。
+    """
+    if inspect.isgeneratorfunction(fn):
+        @functools.wraps(fn)
+        def bound(*args, **kwargs):
+            yield from fn(runtime, *args, **kwargs)
+    else:
+        @functools.wraps(fn)
+        def bound(*args, **kwargs):
+            return fn(runtime, *args, **kwargs)
+    signature = inspect.signature(fn)
+    bound.__signature__ = signature.replace(
+        parameters=list(signature.parameters.values())[1:]
     )
-    with gr.Tabs():
-        with gr.Tab("学习"):
-            with gr.Row():
-                mode_radio = gr.Radio(
-                    [MODE_INTERACTIVE, MODE_ANSWER],
-                    value=MODE_INTERACTIVE,
-                    label="模式",
-                )
-                thinking_checkbox = gr.Checkbox(
-                    value=settings.thinking if settings else False,
-                    label="深度思考模式（更严谨，稍慢）",
-                )
-            with gr.Accordion("⚙️ 高级设置", open=False):
-                level_radio = gr.Radio(
-                    ["小学", "初中", "高中", "大学"], value="高中", label="学段"
-                )
-                provider_radio = gr.Radio(
-                      choices=[(p["name"], p["id"]) for p in ui_providers],
-                      value=(default_provider["id"] if default_provider else None),
-                      label="服务商",
-                  )
-                model_radio = gr.Radio(
-                    (default_provider.get("models") if default_provider else ["deepseek-v4-flash", "deepseek-v4-pro"]),
-                    value=(
-                        default_provider.get("default_model")
-                        if default_provider
-                        else (settings.model if settings else "deepseek-v4-flash")
-                    ),
-                    label="模型",
-                )
-                effort_radio = gr.Radio(
-                    ["low", "high", "max"],
-                    value=settings.reasoning_effort if settings else "high",
-                    label="思考强度",
-                )
-                answer_style_radio = gr.Radio(
-                    ["完整步骤+答案", "简略过程+答案", "只给答案和结论"],
-                    value="完整步骤+答案",
-                    label="解答风格（仅解答模式）",
-                    visible=False,
-                )
-            chatbot = gr.Chatbot(
-                type="messages",
-                height=430,
-                value=[],
-                allow_tags=False,
-                show_copy_button=True,
-                latex_delimiters=[
-                    {"left": "$$", "right": "$$", "display": True},
-                    {"left": "$", "right": "$", "display": False},
-                ],
-            )
-            with gr.Row():
-                textbox = gr.Textbox(
-                    placeholder="输入你的数学问题，例如：怎么解一元二次方程？",
-                    show_label=False,
-                    container=False,
-                    scale=6,
-                )
-                send_btn = gr.Button("发送", variant="primary", scale=1)
-            result_status = gr.Markdown("")
-            usage_status = gr.Markdown("")
-            usage_state = gr.State(value=new_usage_state())
-            stage_state = gr.State(value=dialogue_state.new_stage_state())
-            image_state = gr.State(value=_new_image_state())
-            provider_state = gr.State(
-                  value=(default_provider["id"] if default_provider else None)
-              )
-            with gr.Accordion("📷 题目图片（上传 / 粘贴后直接发送）", open=True):
-                image_input = gr.Image(
-                    label="支持原生视觉的模型可直接看图；纯文本模型不支持图片输入",
-                    sources=["upload", "clipboard"],
-                    type="filepath",
-                )
-            with gr.Accordion("思考过程（仅当轮，不会写入历史）", open=False):
-                reasoning_md = gr.Markdown(
-                    "（本轮暂无思考过程）",
+    return bound
+
+
+class _SafeBlocks(gr.Blocks):
+    """忽略 all_endpoints 查询参数的 Blocks。
+
+    Gradio 首页处理在登录检查之外直接调用内部 api_info()，后者会把请求里的
+    all_endpoints=true 传给 get_api_info，而该参数按设计无视 show_api=False，
+    于是未认证首页仍能取到全部事件的参数元数据（含界面里的账号取值）。
+    """
+
+    def get_api_info(self, all_endpoints: bool = False) -> dict:
+        return super().get_api_info(all_endpoints=False)
+
+
+def create_app(runtime: AppRuntime) -> gr.Blocks:
+    """显式创建界面：组装 Blocks、按运行对象取默认值并绑定全部事件。
+
+    只创建界面与事件绑定，不启动服务器、备份任务、隧道或写访问信息；
+    组件默认值与回调依赖全部来自传入的 runtime，不保留模块级状态。
+    """
+    with _SafeBlocks(
+        title="数学学习 AI 助手",
+        theme=gr.themes.Base(
+            primary_hue="blue", secondary_hue="blue", neutral_hue="slate"
+        ),
+        css=PAGE_CSS,
+    ) as demo:
+        gr.Markdown(
+            "# 🧮 数学学习 AI 助手\n\n"
+            "支持多服务商模型，采用苏格拉底式引导，一步步带你学会数学。"
+            f"支持 LaTeX 公式和图片输入（取决于所选模型）。版本 v{APP_VERSION}"
+        )
+        with gr.Tabs():
+            with gr.Tab("学习"):
+                with gr.Row():
+                    mode_radio = gr.Radio(
+                        [MODE_INTERACTIVE, MODE_ANSWER],
+                        value=MODE_INTERACTIVE,
+                        label="模式",
+                    )
+                    thinking_checkbox = gr.Checkbox(
+                        value=runtime.settings.thinking if runtime.settings else False,
+                        label="深度思考模式（更严谨，稍慢）",
+                    )
+                with gr.Accordion("⚙️ 高级设置", open=False):
+                    level_radio = gr.Radio(
+                        ["小学", "初中", "高中", "大学"], value="高中", label="学段"
+                    )
+                    provider_radio = gr.Radio(
+                          choices=[(p["name"], p["id"]) for p in runtime.ui_providers],
+                          value=(runtime.default_provider["id"] if runtime.default_provider else None),
+                          label="服务商",
+                      )
+                    model_radio = gr.Radio(
+                        (runtime.default_provider.get("models") if runtime.default_provider else ["deepseek-v4-flash", "deepseek-v4-pro"]),
+                        value=(
+                            runtime.default_provider.get("default_model")
+                            if runtime.default_provider
+                            else (runtime.settings.model if runtime.settings else "deepseek-v4-flash")
+                        ),
+                        label="模型",
+                    )
+                    effort_radio = gr.Radio(
+                        ["low", "high", "max"],
+                        value=runtime.settings.reasoning_effort if runtime.settings else "high",
+                        label="思考强度",
+                    )
+                    answer_style_radio = gr.Radio(
+                        ["完整步骤+答案", "简略过程+答案", "只给答案和结论"],
+                        value="完整步骤+答案",
+                        label="解答风格（仅解答模式）",
+                        visible=False,
+                    )
+                chatbot = gr.Chatbot(
+                    type="messages",
+                    height=430,
+                    value=[],
+                    allow_tags=False,
+                    show_copy_button=True,
                     latex_delimiters=[
                         {"left": "$$", "right": "$$", "display": True},
                         {"left": "$", "right": "$", "display": False},
                     ],
                 )
-            with gr.Row():
-                clear_btn = gr.Button("🗑️ 新对话")
-                stop_btn = gr.Button("⏹️ 停止生成")
-                continue_btn = gr.Button("▶️ 继续生成")
-            with gr.Accordion("🔐 主人设置（仅本机可见）", open=False):
                 with gr.Row():
-                    refresh_btn = gr.Button("🔄 刷新用量")
-                    usage_panel = gr.Markdown("（点击“刷新用量”查看今日用量）")
+                    textbox = gr.Textbox(
+                        placeholder="输入你的数学问题，例如：怎么解一元二次方程？",
+                        show_label=False,
+                        container=False,
+                        scale=6,
+                    )
+                    send_btn = gr.Button("发送", variant="primary", scale=1)
+                result_status = gr.Markdown("")
+                usage_status = gr.Markdown("")
+                usage_state = gr.State(value=new_usage_state())
+                stage_state = gr.State(value=dialogue_state.new_stage_state())
+                image_state = gr.State(value=_new_image_state())
+                provider_state = gr.State(
+                      value=(runtime.default_provider["id"] if runtime.default_provider else None)
+                  )
+                with gr.Accordion("📷 题目图片（上传 / 粘贴后直接发送）", open=True):
+                    image_input = gr.Image(
+                        label="支持原生视觉的模型可直接看图；纯文本模型不支持图片输入",
+                        sources=["upload", "clipboard"],
+                        type="filepath",
+                    )
+                with gr.Accordion("思考过程（仅当轮，不会写入历史）", open=False):
+                    reasoning_md = gr.Markdown(
+                        "（本轮暂无思考过程）",
+                        latex_delimiters=[
+                            {"left": "$$", "right": "$$", "display": True},
+                            {"left": "$", "right": "$", "display": False},
+                        ],
+                    )
                 with gr.Row():
-                    reset_account_dropdown = gr.Dropdown(
-                        choices=[a["username"] for a in accounts],
-                        label="重置密码账号",
-                    )
-                    reset_pwd_textbox = gr.Textbox(
-                        label="新密码",
-                        placeholder="输入新密码后点击重置",
-                    )
-                    reset_pwd_btn = gr.Button("重置密码")
-                    reset_pwd_status = gr.Markdown("")
-            gr.Examples(
-                examples=[
-                    "解方程 x² - 5x + 6 = 0，请引导我自己算出来",
-                    "什么是导数？用生活中的例子讲讲",
-                    "我不会做几何证明题，怎么入手？",
-                ],
-                inputs=textbox,
-            )
+                    clear_btn = gr.Button("🗑️ 新对话")
+                    stop_btn = gr.Button("⏹️ 停止生成")
+                    continue_btn = gr.Button("▶️ 继续生成")
+                with gr.Accordion("🔐 主人设置（仅本机可见）", open=False):
+                    with gr.Row():
+                        refresh_btn = gr.Button("🔄 刷新用量")
+                        usage_panel = gr.Markdown("（点击“刷新用量”查看今日用量）")
+                    with gr.Row():
+                        reset_account_dropdown = gr.Dropdown(
+                            choices=[a["username"] for a in runtime.accounts],
+                            label="重置密码账号",
+                        )
+                        reset_pwd_textbox = gr.Textbox(
+                            label="新密码",
+                            placeholder="输入新密码后点击重置",
+                        )
+                        reset_pwd_btn = gr.Button("重置密码")
+                        reset_pwd_status = gr.Markdown("")
+                gr.Examples(
+                    examples=[
+                        "解方程 x² - 5x + 6 = 0，请引导我自己算出来",
+                        "什么是导数？用生活中的例子讲讲",
+                        "我不会做几何证明题，怎么入手？",
+                    ],
+                    inputs=textbox,
+                )
 
-    clear_confirm_state = gr.State(value="")
-    confirm_timer = gr.Timer(value=5, active=True)
+        clear_confirm_state = gr.State(value="")
+        confirm_timer = gr.Timer(value=5, active=True)
 
-    # ===== 学习 Tab 事件 =====
-    image_input.upload(
-        on_image_upload,
-        inputs=[image_input, provider_radio],
-        outputs=[textbox, result_status, image_input, image_state],
-    )
-    image_input.clear(
-        clear_image_state,
-        inputs=None,
-        outputs=[image_state],
-    )
+        # ===== 学习 Tab 事件 =====
+        image_input.upload(
+            _bind(on_image_upload, runtime),
+            inputs=[image_input, provider_radio],
+            outputs=[textbox, result_status, image_input, image_state],
+        )
+        image_input.clear(
+            clear_image_state,
+            inputs=None,
+            outputs=[image_state],
+        )
 
-    send_event = send_btn.click(
-        respond,
-        inputs=[
-            textbox,
-            chatbot,
-            level_radio,
-            mode_radio,
-            thinking_checkbox,
-            model_radio,
-            effort_radio,
-            answer_style_radio,
-            usage_state,
-            stage_state,
-            image_state,
-              provider_radio,
-        ],
-        outputs=[
-            chatbot,
-            textbox,
-            result_status,
-            usage_status,
-            usage_state,
-            stage_state,
-            reasoning_md,
-            image_state,
-        ],
-    )
-    submit_event = textbox.submit(
-        respond,
-        inputs=[
-            textbox,
-            chatbot,
-            level_radio,
-            mode_radio,
-            thinking_checkbox,
-            model_radio,
-            effort_radio,
-            answer_style_radio,
-            usage_state,
-            stage_state,
-            image_state,
-              provider_radio,
-        ],
-        outputs=[
-            chatbot,
-            textbox,
-            result_status,
-            usage_status,
-            usage_state,
-            stage_state,
-            reasoning_md,
-            image_state,
-        ],
-    )
-    continue_event = continue_btn.click(
-        continue_last_answer,
-        inputs=[
-            chatbot,
-            level_radio,
-            mode_radio,
-            thinking_checkbox,
-            model_radio,
-            effort_radio,
-            answer_style_radio,
-            usage_state,
-            stage_state,
-            image_state,
-              provider_radio,
-        ],
-        outputs=[
-            chatbot,
-            textbox,
-            result_status,
-            usage_status,
-            usage_state,
-            stage_state,
-            reasoning_md,
-            image_state,
-        ],
-    )
-    stop_btn.click(
-        None,
-        None,
-        None,
-        cancels=[
-            send_event,
-            submit_event,
-            continue_event,
+        send_event = send_btn.click(
+            _bind(respond, runtime),
+            inputs=[
+                textbox,
+                chatbot,
+                level_radio,
+                mode_radio,
+                thinking_checkbox,
+                model_radio,
+                effort_radio,
+                answer_style_radio,
+                usage_state,
+                stage_state,
+                image_state,
+                  provider_radio,
+            ],
+            outputs=[
+                chatbot,
+                textbox,
+                result_status,
+                usage_status,
+                usage_state,
+                stage_state,
+                reasoning_md,
+                image_state,
+            ],
+        )
+        submit_event = textbox.submit(
+            _bind(respond, runtime),
+            inputs=[
+                textbox,
+                chatbot,
+                level_radio,
+                mode_radio,
+                thinking_checkbox,
+                model_radio,
+                effort_radio,
+                answer_style_radio,
+                usage_state,
+                stage_state,
+                image_state,
+                  provider_radio,
+            ],
+            outputs=[
+                chatbot,
+                textbox,
+                result_status,
+                usage_status,
+                usage_state,
+                stage_state,
+                reasoning_md,
+                image_state,
+            ],
+        )
+        continue_event = continue_btn.click(
+            _bind(continue_last_answer, runtime),
+            inputs=[
+                chatbot,
+                level_radio,
+                mode_radio,
+                thinking_checkbox,
+                model_radio,
+                effort_radio,
+                answer_style_radio,
+                usage_state,
+                stage_state,
+                image_state,
+                  provider_radio,
+            ],
+            outputs=[
+                chatbot,
+                textbox,
+                result_status,
+                usage_status,
+                usage_state,
+                stage_state,
+                reasoning_md,
+                image_state,
+            ],
+        )
+        stop_btn.click(
+            None,
+            None,
+            None,
+            cancels=[
+                send_event,
+                submit_event,
+                continue_event,
 
-        ],
-    )
-    clear_btn.click(
-        confirm_clear,
-        inputs=[chatbot, clear_confirm_state],
-        outputs=[
-            chatbot,
-            textbox,
-            result_status,
-            usage_status,
-            usage_state,
-            stage_state,
-            reasoning_md,
-            clear_btn,
-            clear_confirm_state,
-            image_state,
-        ],
-    )
-    refresh_btn.click(render_usage_panel, inputs=[], outputs=[usage_panel])
-    reset_pwd_btn.click(
-        reset_account_password,
-        inputs=[reset_account_dropdown, reset_pwd_textbox],
-        outputs=[reset_pwd_status],
-    )
-    provider_radio.change(
-          on_provider_change,
-          inputs=[provider_radio],
-          outputs=[model_radio, thinking_checkbox, effort_radio],
-      )
+            ],
+        )
+        clear_btn.click(
+            _bind(confirm_clear, runtime),
+            inputs=[chatbot, clear_confirm_state],
+            outputs=[
+                chatbot,
+                textbox,
+                result_status,
+                usage_status,
+                usage_state,
+                stage_state,
+                reasoning_md,
+                clear_btn,
+                clear_confirm_state,
+                image_state,
+            ],
+        )
+        refresh_btn.click(_bind(render_usage_panel, runtime), inputs=[], outputs=[usage_panel])
+        reset_pwd_btn.click(
+            _bind(reset_account_password, runtime),
+            inputs=[reset_account_dropdown, reset_pwd_textbox],
+            outputs=[reset_pwd_status],
+        )
+        provider_radio.change(
+              on_provider_change,
+              inputs=[provider_radio],
+              outputs=[model_radio, thinking_checkbox, effort_radio],
+          )
 
-    mode_radio.change(
-        toggle_answer_style,
-        inputs=[mode_radio],
-        outputs=[answer_style_radio],
-    )
-    confirm_timer.tick(
-        reset_confirm_buttons,
-        inputs=[clear_confirm_state],
-        outputs=[
-            clear_confirm_state,
-            clear_btn,
-        ],
-    )
-    demo.load(restore_history, outputs=[chatbot, result_status], show_progress="hidden")
-    demo.load(restore_level, outputs=[level_radio], show_progress="hidden")
+        mode_radio.change(
+            toggle_answer_style,
+            inputs=[mode_radio],
+            outputs=[answer_style_radio],
+        )
+        confirm_timer.tick(
+            reset_confirm_buttons,
+            inputs=[clear_confirm_state],
+            outputs=[
+                clear_confirm_state,
+                clear_btn,
+            ],
+        )
+        demo.load(_bind(restore_history, runtime), outputs=[chatbot, result_status], show_progress="hidden")
+        demo.load(_bind(restore_level, runtime), outputs=[level_radio], show_progress="hidden")
+    # 收敛端点元数据：show_api=False 后 /info、openapi 与登录页内嵌的
+    # gradio_api_info 不再包含各事件的参数清单（含账号用户名等取值）；
+    # all_endpoints=true 的绕过由 _SafeBlocks 忽略该参数关闭；
+    # 界面事件走队列按事件索引调用，不受影响。
+    for fn in demo.fns.values():
+        fn.show_api = False
+    return demo
 
 
-if __name__ == "__main__":
+SERVER_PORT = 7860  # 集中现有启动端口常量，仅作隔离测试的替换点，不作为生产配置项
+
+
+def main() -> None:
+    """启动边界：组装依赖 → 创建界面 → 启动服务器与配套任务 → 等待退出 → 清理。
+
+    启动异常原样向外传播（保留失败退出码与诊断信息）；
+    finally 只收尾本次启动实际拥有的资源：先置备份停止信号，再停隧道、
+    关闭界面服务器，最后等待备份线程（最多 5 秒，正在写盘的备份不保证完成）。
+    """
+    runtime = build_runtime()
+    demo = create_app(runtime)
     print(f"数学学习 AI 助手 v{APP_VERSION} 启动中…")
     auto_open = os.getenv("AUTO_OPEN_BROWSER", "true").strip().lower() != "false"
     server_name = os.getenv("GRADIO_SERVER_NAME", "0.0.0.0").strip()
     print("访问账号（固定密码，完整清单见 data/accounts.json）：")
-    for account in accounts:
+    for account in runtime.accounts:
         print(f"  {account['username']} / {account['password']}")
     backup_path = ensure_today_backup()
     if backup_path:
         print(f"数据备份：已生成 {backup_path}")
-    threading.Thread(target=daily_backup_loop, daemon=True).start()
-    demo.queue(default_concurrency_limit=4).launch(
-        server_name=server_name,
-        server_port=7860,
-        inbrowser=auto_open,
-        auth=_check_login,
-        auth_message="请输入访问用户名与密码",
-        prevent_thread_lock=True,
+    backup_stop = threading.Event()
+    backup_thread = threading.Thread(
+        target=daily_backup_loop, kwargs={"stop_event": backup_stop}, daemon=True
     )
+    backup_thread.start()
     watcher = None
     try:
+        demo.queue(default_concurrency_limit=4).launch(
+            server_name=server_name,
+            server_port=SERVER_PORT,
+            inbrowser=auto_open,
+            auth=_bind(_check_login, runtime),
+            auth_message="请输入访问用户名与密码",
+            prevent_thread_lock=True,
+        )
         cleanup_stale_tunnel()
         cloudflared_path = find_cloudflared()
         if cloudflared_path is None:
@@ -1001,7 +1015,7 @@ if __name__ == "__main__":
             print("正在建立 Cloudflare 公网隧道…")
 
             def _on_url(url: str) -> None:
-                save_access_info(url, accounts)
+                save_access_info(url, runtime.accounts)
                 print(f"公网链接已更新：{url}（已写入访问信息文件）")
 
             watcher = TunnelWatcher(cloudflared_path, on_url=_on_url)
@@ -1010,10 +1024,21 @@ if __name__ == "__main__":
                 print(f"公网链接：{watcher.url}")
             else:
                 print("公网隧道建立失败（连接 Cloudflare 超时），仍可通过局域网访问。")
-        access_file = save_access_info(watcher.url if watcher else None, accounts)
-        print(f"局域网地址：http://{get_lan_ip()}:7860")
+        access_file = save_access_info(watcher.url if watcher else None, runtime.accounts)
+        print(f"局域网地址：http://{get_lan_ip()}:{SERVER_PORT}")
         print(f"访问信息已保存到：{access_file}")
         demo.block_thread()
     finally:
-        if watcher is not None:
-            watcher.stop()
+        backup_stop.set()
+        try:
+            if watcher is not None:
+                watcher.stop()
+        finally:
+            try:
+                demo.close()
+            finally:
+                backup_thread.join(timeout=5)
+
+
+if __name__ == "__main__":
+    main()

@@ -22,33 +22,33 @@ def _fake_request():
     return type("Request", (), {"client": client, "username": "user1"})()
 
 
-def _patch_env(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module, "client", None)
-    monkeypatch.setattr(app_module, "history_store", MemoryHistoryStore())
-    monkeypatch.setattr(app_module, "daily_usage_store", MemoryDailyUsageStore())
-    monkeypatch.setattr(app_module, "event_logger", MemoryEventLogger())
-    monkeypatch.setattr(app_module, "DAILY_LIMIT", 1_000_000)
-    monkeypatch.setattr(app_module, "GLOBAL_DAILY_LIMIT", 3_000_000)
+def _patch_env(monkeypatch, tmp_path, app_runtime):
+    monkeypatch.setattr(app_runtime, "client", None)
+    monkeypatch.setattr(app_runtime, "history_store", MemoryHistoryStore())
+    monkeypatch.setattr(app_runtime, "daily_usage_store", MemoryDailyUsageStore())
+    monkeypatch.setattr(app_runtime, "event_logger", MemoryEventLogger())
+    monkeypatch.setattr(app_runtime, "daily_limit", 1_000_000)
+    monkeypatch.setattr(app_runtime, "global_daily_limit", 3_000_000)
 
 
-def test_confirm_clear_two_step(monkeypatch, tmp_path):
-    _patch_env(monkeypatch, tmp_path)
-    r1 = app_module.confirm_clear(_fake_request(), [], "")
+def test_confirm_clear_two_step(monkeypatch, tmp_path, app_runtime):
+    _patch_env(monkeypatch, tmp_path, app_runtime)
+    r1 = app_module.confirm_clear(app_runtime, _fake_request(), [], "")
     assert r1[8] == "armed"
     assert "再点一次确认" in r1[2]
-    r2 = app_module.confirm_clear(_fake_request(), [], "armed")
+    r2 = app_module.confirm_clear(app_runtime, _fake_request(), [], "armed")
     assert r2[8] == ""
     assert "已开启新对话" in r2[2]
 
 
-def test_clear_success_resets_state_and_summary(monkeypatch, tmp_path):
-    _patch_env(monkeypatch, tmp_path)
+def test_clear_success_resets_state_and_summary(monkeypatch, tmp_path, app_runtime):
+    _patch_env(monkeypatch, tmp_path, app_runtime)
     resets = []
     monkeypatch.setattr(
-        app_module.history_compressor, "reset", lambda u: resets.append(u)
+        app_runtime.history_compressor, "reset", lambda u: resets.append(u)
     )
 
-    result = app_module.clear_conversation(_fake_request())
+    result = app_module.clear_conversation(app_runtime, _fake_request())
 
     new_history, _text, msg, _usage_msg, usage, stage, reasoning, image = result
     # 界面历史、会话用量、阶段、思考与图片全部重置
@@ -60,20 +60,20 @@ def test_clear_success_resets_state_and_summary(monkeypatch, tmp_path):
     assert image == {"path": None, "fresh": False}
     # 空历史成功保存后，才清除摘要
     assert resets == ["user1"]
-    assert app_module.history_store._messages.get("user1") == []
-    assert app_module.history_store.clear_calls == 1
+    assert app_runtime.history_store._messages.get("user1") == []
+    assert app_runtime.history_store.clear_calls == 1
 
 
-def test_clear_failure_keeps_state_and_summary(monkeypatch, tmp_path):
-    _patch_env(monkeypatch, tmp_path)
+def test_clear_failure_keeps_state_and_summary(monkeypatch, tmp_path, app_runtime):
+    _patch_env(monkeypatch, tmp_path, app_runtime)
     store = FailingClearStore()
-    monkeypatch.setattr(app_module, "history_store", store)
+    monkeypatch.setattr(app_runtime, "history_store", store)
     resets = []
     monkeypatch.setattr(
-        app_module.history_compressor, "reset", lambda u: resets.append(u)
+        app_runtime.history_compressor, "reset", lambda u: resets.append(u)
     )
 
-    result = app_module.clear_conversation(_fake_request())
+    result = app_module.clear_conversation(app_runtime, _fake_request())
 
     new_history, _text, msg, _usage_msg, usage, stage, reasoning, image = result
     assert "清空未成功" in msg
