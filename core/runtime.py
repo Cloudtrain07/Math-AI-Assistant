@@ -96,8 +96,13 @@ def build_runtime(
         startup_hint = ("未找到可用的 API Key（DeepSeek / OpenAI），请检查 .env 后重启。" if not client else "")
         # 客户端已在上方按服务商构建
     except ValueError as exc:
-        # 未配置 API Key 时应用仍可启动，界面给出提示，方便先看效果
+        # 初始化失败（如客户端构造抛出 ValueError）时应用仍可启动，
+        # 全部字段落入回退值，界面给出提示
         settings = None
+        all_providers = []
+        available_providers = []
+        clients = {}
+        default_provider = None
         client = None
         ui_providers = []
         startup_hint = str(exc)

@@ -624,9 +624,13 @@ def reset_confirm_buttons(clear_state: str):
     )
 
 
-def on_provider_change(provider_id: str):
-    """服务商切换时，动态更新模型列表与思考相关控件。"""
-    provider = get_provider(provider_id)
+def on_provider_change(runtime, provider_id: str):
+    """服务商切换时，动态更新模型列表与思考相关控件。
+
+    服务商清单来自当前 runtime.all_providers，不重新读取默认配置，
+    保证界面展示与回调使用同一份配置。
+    """
+    provider = get_provider(provider_id, runtime.all_providers)
     if provider is None:
         return (
             gr.update(choices=[]),
@@ -939,7 +943,7 @@ def create_app(runtime: AppRuntime) -> gr.Blocks:
             outputs=[reset_pwd_status],
         )
         provider_radio.change(
-              on_provider_change,
+              _bind(on_provider_change, runtime),
               inputs=[provider_radio],
               outputs=[model_radio, thinking_checkbox, effort_radio],
           )

@@ -109,6 +109,29 @@ def test_build_runtime_without_key_keeps_hint_and_full_list(monkeypatch, tmp_pat
     assert "未找到可用的 API Key" in rt.startup_hint
 
 
+def test_build_runtime_client_factory_failure_falls_back(monkeypatch, tmp_path):
+    """客户端构造抛 ValueError：返回回退运行对象并保留提示，不抛 UnboundLocalError。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    def failing_factory(provider, settings):
+        raise ValueError("客户端配置非法")
+
+    rt = build_runtime(
+        data_dir=tmp_path,
+        settings=_injected_settings(),
+        client_factory=failing_factory,
+    )
+    assert rt.settings is None
+    assert rt.all_providers == []
+    assert rt.available_providers == []
+    assert rt.clients == {}
+    assert rt.default_provider is None
+    assert rt.client is None
+    assert rt.ui_providers == []
+    assert "客户端配置非法" in rt.startup_hint
+    assert rt.max_message_len == 2000  # settings 回退后限额取默认值
+
+
 def test_build_runtime_injected_dependencies_and_none_settings(monkeypatch, tmp_path):
     """注入的假依赖原样进入 runtime；显式 settings=None 走限额回退值。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")

@@ -2,7 +2,8 @@
 """app 导入与显式创建边界测试：导入只提供定义，界面经 create_app 显式创建。
 
 只覆盖本块引入的边界：导入副作用、创建入口独立性、_bind 对 Gradio 的
-签名/Request/生成器契约、未认证首页的端点元数据收敛（进程内 HTTP 响应）；
+签名/Request/生成器契约、服务商切换回调的配置使用、
+未认证首页的端点元数据收敛（进程内 HTTP 响应）；
 回调业务行为见 test_respond 等既有测试。
 """
 
@@ -260,3 +261,72 @@ def test_bind_generator_callback_respond_streams(app_runtime, monkeypatch):
     events = list(bound(*processed))
     assert events[-1][0][-1]["content"] == "你好世界"  # 生成器产出正常
     assert logger.chat_events              # 经本 app 的 runtime 记录日志
+
+
+def _providers_file(tmp_path, provider_id, model):
+    """写一份仅含一个自定义服务商的临时配置，返回文件路径。"""
+    path = tmp_path / f"providers_{provider_id}.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": provider_id,
+                    "name": f"服务商-{provider_id}",
+                    "base_url": f"https://{provider_id}.invalid/v1",
+                    "api_key_env": f"{provider_id.upper()}_API_KEY",
+                    "models": [model],
+                    "default_model": model,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _provider_change_fn(demo):
+    """取 create_app 绑定的服务商切换回调（经 _bind，签名只剩 provider_id）。"""
+    fns = [
+        bound.fn
+        for bound in demo.fns.values()
+        if bound.fn is not None  # 停止按钮等取消型绑定没有可调用对象
+        and list(inspect.signature(bound.fn).parameters) == ["provider_id"]
+    ]
+    assert len(fns) == 1
+    return fns[0]
+
+
+def test_provider_change_uses_runtime_providers(tmp_path):
+    """服务商切换回调从当前 runtime 取服务商，两个 runtime 不串配置。
+
+    默认配置中的 deepseek 不在注入配置里：若回调回退到默认配置会返回模型清单，
+    因此对其返回空清单同时证明配置隔离与"找不到服务商"的原有行为。
+    """
+    rt_review = build_runtime(
+        providers_file=_providers_file(tmp_path, "review", "review-model"),
+        history_store=MemoryHistoryStore(),
+        daily_usage_store=MemoryDailyUsageStore(),
+        event_logger=MemoryEventLogger(),
+    )
+    rt_other = build_runtime(
+        providers_file=_providers_file(tmp_path, "other", "other-model"),
+        history_store=MemoryHistoryStore(),
+        daily_usage_store=MemoryDailyUsageStore(),
+        event_logger=MemoryEventLogger(),
+    )
+
+    change_review = _provider_change_fn(app_module.create_app(rt_review))
+    models, thinking, effort = change_review("review")
+    assert models["choices"] == ["review-model"]
+    assert models["value"] == "review-model"
+    assert thinking["visible"] is True  # 默认 thinking_param 非 none，思考控件显示
+    assert effort["visible"] is True
+
+    missing_models, missing_thinking, missing_effort = change_review("deepseek")
+    assert missing_models["choices"] == []
+    assert missing_thinking["visible"] is False
+    assert missing_effort["visible"] is False
+
+    change_other = _provider_change_fn(app_module.create_app(rt_other))
+    other_models, _t, _e = change_other("other")
+    assert other_models["choices"] == ["other-model"]
