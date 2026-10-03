@@ -1,0 +1,14 @@
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #f5f6f8;
+  font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  color: #1f2328;
+}
+#app {
+  min-height: 100vh;
+}

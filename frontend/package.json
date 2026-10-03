@@ -1,0 +1,26 @@
+{
+  "name": "maa-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "test": "vitest run",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "katex": "^0.16.11",
+    "markdown-it": "^14.1.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/katex": "^0.16.7",
+    "@types/markdown-it": "^14.1.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.7.2",
+    "vite": "^6.3.5",
+    "vitest": "^3.1.4",
+    "vue-tsc": "^2.2.10"
+  }
+}
