@@ -7,6 +7,7 @@
 """
 
 import copy
+import json
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -70,6 +71,36 @@ def app_runtime():
     路径已由 pytest_configure 隔离；测试按需把单个字段替换为内存假实现。
     """
     return runtime_module.build_runtime()
+
+
+# API 测试专用：固定双账号，不依赖共享 accounts.json 里实际生成了几个账号
+# （其他测试可能把会话级共享账号文件重写为任意数量）。
+API_TEST_ACCOUNTS = [
+    {
+        "username": "alice",
+        "password": "pw-alice-1",
+        "display_name": "小明",
+        "level": "高中",
+        "enabled": True,
+    },
+    {
+        "username": "bob",
+        "password": "pw-bob-1",
+        "display_name": "小红",
+        "level": "初中",
+        "enabled": True,
+    },
+]
+
+
+@pytest.fixture
+def api_runtime(tmp_path):
+    """带固定双账号的独立 AppRuntime，供新 API 层测试使用。"""
+    accounts_path = tmp_path / "accounts.json"
+    accounts_path.write_text(
+        json.dumps(API_TEST_ACCOUNTS, ensure_ascii=False), encoding="utf-8"
+    )
+    return runtime_module.build_runtime(accounts_path=accounts_path)
 
 
 class MemoryHistoryStore:

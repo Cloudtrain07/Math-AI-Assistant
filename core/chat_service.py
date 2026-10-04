@@ -506,8 +506,15 @@ def prepare_chat_turn(
     image_note: str,
     force_continue: bool = False,
     attach_image: bool = True,
+    turn_token: int | None = None,
 ) -> dict:
-    """检查输入和额度，推进阶段、处理图片，并取得本轮保存标记。"""
+    """检查输入和额度，推进阶段、处理图片，并取得本轮保存标记。
+
+    turn_token 缺省时在本准备流程末尾调用 history_store.start_turn 取标记
+    （原行为）；显式传入时直接复用调用方预先取得的标记——API 层需要把
+    "取得标记"与清空守卫做成原子操作，保证清空前开始的轮次在清空后
+    保存必然 stale，不能在清空后重新取得新的有效保存资格。
+    """
     new_history = list(history or [])
     prepared_stage = dialogue_state.prepare_stage_state(mode, stage_state)
     new_image_state = dict(
@@ -627,7 +634,10 @@ def prepare_chat_turn(
         result["reject_message"] = image_result["reject_message"]
         return result
 
-    result["turn_token"] = history_store.start_turn(username)
+    if turn_token is None:
+        result["turn_token"] = history_store.start_turn(username)
+    else:
+        result["turn_token"] = turn_token
     return result
 
 
@@ -660,8 +670,12 @@ def run_chat_turn(
     image_note: str,
     force_continue: bool = False,
     attach_image: bool = True,
+    turn_token: int | None = None,
 ):
-    """从原始提问开始，交出拒绝、准备完成、流式和最终事件。"""
+    """从原始提问开始，交出拒绝、准备完成、流式和最终事件。
+
+    turn_token 语义同 prepare_chat_turn：缺省由核心自取，传入则复用。
+    """
     prepared = prepare_chat_turn(
         message=message,
         history=history,
@@ -682,6 +696,7 @@ def run_chat_turn(
         image_note=image_note,
         force_continue=force_continue,
         attach_image=attach_image,
+        turn_token=turn_token,
     )
 
     if prepared["status"] != "ready":

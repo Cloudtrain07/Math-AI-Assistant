@@ -2,326 +2,301 @@
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import StreamMessage from './components/StreamMessage.vue'
 import {
-  buildChunks,
-  mockAnswer,
-  mockBadAnswer,
-  mockPriceText,
-  mockQuestion,
-  mockSingleFormula,
-  mockThinking,
-} from './mock/mockData'
+  clearConversation,
+  fetchHistory,
+  fetchMe,
+  login as apiLogin,
+  logout as apiLogout,
+  streamChat,
+  type UserInfo,
+} from './api'
+import { composeDaily, composeNotice } from './notice'
 
-type Scenario = 'normal' | 'thinking' | 'bad' | 'price' | 'unstable' | 'drop'
+interface ChatEntry {
+  role: 'user' | 'assistant'
+  content: string
+  reasoning: string
+  done: boolean
+}
 
-const userMsg = ref('')
-const answerText = ref('')
-const thinkingText = ref('')
-const answerDone = ref(true)
-const thinkingDone = ref(true)
-const streaming = ref(false)
-const showThinking = ref(true)
-const chunkCount = ref(0)
+const me = ref<UserInfo | null>(null)
+const authChecked = ref(false)
+const loginName = ref('')
+const loginPassword = ref('')
+const loginError = ref('')
+const loggingIn = ref(false)
+
+const messages = ref<ChatEntry[]>([])
 const input = ref('')
-const currentScenario = ref<Scenario>('normal')
+const sending = ref(false)
+const statusText = ref('')
+const usageText = ref('')
+const elapsedSeconds = ref(0)
+const restoreNotice = ref('')
+const mode = ref('解答模式')
+const clearArmed = ref(false)
+let clearTimer: ReturnType<typeof setTimeout> | null = null
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const chatScroll = ref<HTMLElement | null>(null)
+let stickToBottom = true
 
-// ---- 公式 DOM 稳定性观测 v2 ----
-// 追踪每个公式容器（data-stream-math）及其内部的 KaTeX 排版节点：
-// - 容器多次创建 → 重建异常
-// - 容器被移除 → 删除异常（流式中任何已登记容器被移除都算异常）
-// - 容器内部子节点被替换/增删 → 内部替换异常
-// 正常清空/重播不由 DOM 变化推断：只有 play()/reset() 里的 resetDebug()
-// 这个显式操作会同步清空记录，且它总是发生在引发 DOM 清空的状态变更之前，
-// 因此流式中出现的任何删除都无法被"当作清空"漏报。
-interface FormulaRecord {
-  creations: number
-  removals: number
-  internalReplacements: number
-  signature: string
-  samples: string[]
-}
+let controller: AbortController | null = null
+let elapsedTimer: ReturnType<typeof setInterval> | null = null
 
-const chatRoot = ref<HTMLElement | null>(null)
-let observer: MutationObserver | null = null
-const records = new Map<string, FormulaRecord>()
-const stats = reactive({
-  containers: 0,
-  creations: 0,
-  removals: 0,
-  internalReplacements: 0,
-  anomalies: [] as { key: string; type: string; at: number; detail: string }[],
+onMounted(async () => {
+  me.value = await fetchMe()
+  authChecked.value = true
+  if (me.value) await restoreHistory()
 })
 
-function describeNode(n: Node): string {
-  if (!(n instanceof Element)) return n.nodeName
-  const cls = n.getAttribute('class') ?? ''
-  return `${n.tagName.toLowerCase()}${cls ? '.' + cls.split(' ')[0] : ''}`
-}
-
-function keysIn(root: Element): string[] {
-  if (root.hasAttribute('data-stream-math')) return [root.getAttribute('data-stream-math')!]
-  return Array.from(root.querySelectorAll('[data-stream-math]')).map((el) =>
-    el.getAttribute('data-stream-math')!,
-  )
-}
-
-function recordAnomaly(key: string, type: string, detail: string) {
-  stats.anomalies.push({ key, type, at: chunkCount.value, detail })
-}
-
-function refreshStats() {
-  stats.containers = records.size
-  stats.creations = 0
-  stats.removals = 0
-  stats.internalReplacements = 0
-  for (const rec of records.values()) {
-    stats.creations += rec.creations
-    stats.removals += rec.removals
-    stats.internalReplacements += rec.internalReplacements
-  }
-}
-
-function onMutations(mutations: MutationRecord[]) {
-  const addedKeys = new Set<string>()
-  const removedKeys = new Set<string>()
-  const internalHits: { key: string; detail: string }[] = []
-
-  for (const m of mutations) {
-    m.addedNodes.forEach((n) => {
-      if (!(n instanceof Element)) return
-      for (const key of keysIn(n)) {
-        addedKeys.add(key)
-        const rec = records.get(key) ?? {
-          creations: 0,
-          removals: 0,
-          internalReplacements: 0,
-          signature: '',
-          samples: [],
-        }
-        rec.creations += 1
-        if (!rec.signature) {
-          rec.signature = `${n.children.length}个子节点/${n.outerHTML.length}字符`
-        }
-        records.set(key, rec)
-        if (rec.creations > 1) recordAnomaly(key, 'recreated', `容器第 ${rec.creations} 次创建`)
-      }
-    })
-    m.removedNodes.forEach((n) => {
-      if (n instanceof Element) for (const key of keysIn(n)) removedKeys.add(key)
-    })
-    // 内部替换：变更目标位于某个已有公式容器内部（容器自身不是本批新增）
-    const target = m.target instanceof Element ? m.target : m.target.parentElement
-    if (target && (m.addedNodes.length > 0 || m.removedNodes.length > 0)) {
-      const container = target.closest('[data-stream-math]')
-      const key = container?.getAttribute('data-stream-math')
-      if (container && key && !addedKeys.has(key)) {
-        const rec = records.get(key)
-        if (rec) {
-          rec.internalReplacements += 1
-          const detail =
-            [
-              ...Array.from(m.removedNodes).map(describeNode),
-              ...Array.from(m.addedNodes).map(describeNode),
-            ]
-              .filter((s) => s !== '')
-              .slice(0, 4)
-              .join(' / ') || '(子节点变更)'
-          if (rec.samples.length < 3) rec.samples.push(detail)
-          internalHits.push({ key, detail })
-        }
-      }
-    }
-  }
-
-  // 说明：这里刻意没有"批量移除=正常清空"的推断——那种规则会在
-  // 页面只有一个公式时把流式中的错误删除漏报成清空。
-  // 清空只能由 resetDebug()（play/reset 的显式步骤）触发。
-  for (const key of removedKeys) {
-    const rec = records.get(key)
-    if (rec) {
-      rec.removals += 1
-      recordAnomaly(key, 'deleted', `容器被移除（此前创建 ${rec.creations} 次，签名 ${rec.signature}）`)
-    }
-  }
-  for (const hit of internalHits) {
-    recordAnomaly(hit.key, 'internal-replaced', `内部排版节点被替换：${hit.detail}`)
-  }
-  refreshStats()
-}
-
-onMounted(() => {
-  observer = new MutationObserver(onMutations)
-  if (chatRoot.value) observer.observe(chatRoot.value, { childList: true, subtree: true })
+onBeforeUnmount(() => {
+  if (elapsedTimer !== null) clearInterval(elapsedTimer)
 })
-onBeforeUnmount(() => observer?.disconnect())
 
-// ---- 播放控制 ----
-let stopFlag = false
-
-function resetDebug() {
-  records.clear()
-  stats.containers = 0
-  stats.creations = 0
-  stats.removals = 0
-  stats.internalReplacements = 0
-  stats.anomalies = []
-  chunkCount.value = 0
-}
-
-async function play(scenario: Scenario, customQuestion?: string) {
-  if (streaming.value) return
-  stopFlag = false
-  streaming.value = true
-  currentScenario.value = scenario
-  // 显式重置：清空观测记录（这是唯一允许清空记录的入口）
-  resetDebug()
-  userMsg.value = customQuestion ?? mockQuestion
-  answerText.value = ''
-  thinkingText.value = ''
-  answerDone.value = false
-  thinkingDone.value = false
+async function restoreHistory() {
+  const data = await fetchHistory()
+  messages.value = data.history.map((m) => ({
+    role: m.role,
+    content: m.content,
+    reasoning: '',
+    done: true,
+  }))
+  restoreNotice.value = data.notice
+  stickToBottom = true
   await nextTick()
-
-  const feed = async (target: 'answer' | 'thinking', text: string, minMs = 16, maxMs = 38) => {
-    const chunks = buildChunks(text)
-    for (const snap of chunks) {
-      if (stopFlag) return
-      if (target === 'answer') answerText.value = snap
-      else thinkingText.value = snap
-      chunkCount.value += 1
-      await sleep(minMs + Math.random() * (maxMs - minMs))
-    }
-  }
-
-  if (scenario === 'thinking') await feed('thinking', mockThinking)
-  if (scenario === 'normal' || scenario === 'thinking' || scenario === 'unstable') {
-    await feed('answer', mockAnswer)
-  } else if (scenario === 'bad') {
-    await feed('answer', mockBadAnswer)
-  } else if (scenario === 'drop') {
-    // 慢速播放，保证删除发生在流式过程中
-    await feed('answer', mockSingleFormula, 80, 140)
-  } else {
-    await feed('answer', mockPriceText)
-  }
-
-  answerDone.value = true
-  thinkingDone.value = true
-  streaming.value = false
+  scrollToBottom()
 }
 
-function stop() {
-  stopFlag = true
+async function submitLogin() {
+  if (loggingIn.value) return
+  loginError.value = ''
+  loggingIn.value = true
+  try {
+    me.value = await apiLogin(loginName.value.trim(), loginPassword.value)
+    loginPassword.value = ''
+    await restoreHistory()
+  } catch (err) {
+    loginError.value = err instanceof Error ? err.message : '登录失败'
+  } finally {
+    loggingIn.value = false
+  }
 }
 
-function reset() {
-  stop()
-  userMsg.value = ''
-  answerText.value = ''
-  thinkingText.value = ''
-  answerDone.value = true
-  thinkingDone.value = true
-  resetDebug()
+async function doLogout() {
+  stopStreaming()
+  await apiLogout()
+  me.value = null
+  messages.value = []
+  statusText.value = ''
+  usageText.value = ''
+  input.value = ''
+}
+
+// ---- 滚动跟随：用户向上阅读时不强制拉回底部 ----
+function onScroll() {
+  const el = chatScroll.value
+  if (!el) return
+  stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+}
+
+async function scrollToBottom() {
+  const el = chatScroll.value
+  if (!el || !stickToBottom) return
+  el.scrollTop = el.scrollHeight
+}
+
+// ---- 发送与流式接收 ----
+
+function startElapsedTimer() {
+  elapsedSeconds.value = 0
+  elapsedTimer = setInterval(() => {
+    elapsedSeconds.value += 1
+  }, 1000)
+}
+
+function stopElapsedTimer() {
+  if (elapsedTimer !== null) clearInterval(elapsedTimer)
+  elapsedTimer = null
+}
+
+function stopStreaming() {
+  if (controller !== null) controller.abort()
 }
 
 async function send() {
-  const q = input.value.trim()
-  if (!q || streaming.value) return
+  const text = input.value.trim()
+  if (!text || sending.value) return
   input.value = ''
-  await play('normal', q)
+  statusText.value = ''
+  messages.value.push({ role: 'user', content: text, reasoning: '', done: true })
+  const assistant = reactive<ChatEntry>({
+    role: 'assistant',
+    content: '',
+    reasoning: '',
+    done: false,
+  })
+  messages.value.push(assistant)
+  sending.value = true
+  stickToBottom = true
+  startElapsedTimer()
+  controller = new AbortController()
+
+  try {
+    const result = await streamChat(text, {
+      mode: mode.value,
+      signal: controller.signal,
+      onDelta: (d) => {
+        assistant.content += d.answer
+        assistant.reasoning += d.reasoning
+        void nextTick(scrollToBottom)
+      },
+    })
+    if (result.kind === 'rejected') {
+      // 被拒：移除占位的助手气泡，保留用户消息与提示文字
+      messages.value.splice(messages.value.indexOf(assistant), 1)
+      statusText.value = result.payload.message
+    } else {
+      const d = result.payload
+      assistant.content = d.answer
+      assistant.reasoning = d.reasoning_text
+      assistant.done = true
+      statusText.value = composeNotice(d)
+      usageText.value = [d.cumulative_usage, composeDaily(d)]
+        .filter(Boolean)
+        .join('\n')
+      await nextTick(scrollToBottom)
+    }
+  } catch (err) {
+    assistant.done = true
+    if (controller?.signal.aborted) {
+      statusText.value = '⏹ 已停止接收。未完成的回答不会写入历史。'
+    } else if (err instanceof Error) {
+      statusText.value = `⚠️ ${err.message}`
+    } else {
+      statusText.value = '⚠️ 连接中断，请稍后重试。'
+    }
+  } finally {
+    stopElapsedTimer()
+    sending.value = false
+    controller = null
+  }
+}
+
+// ---- 新对话（二次确认，与现有界面一致） ----
+
+async function onClearClick() {
+  if (sending.value) return
+  if (!clearArmed.value) {
+    clearArmed.value = true
+    clearTimer = setTimeout(() => {
+      clearArmed.value = false
+    }, 5000)
+    return
+  }
+  if (clearTimer !== null) clearTimeout(clearTimer)
+  clearArmed.value = false
+  const result = await clearConversation()
+  if (result.ok) {
+    messages.value = []
+    statusText.value = result.message
+    usageText.value = ''
+    restoreNotice.value = ''
+  } else {
+    statusText.value = result.message
+  }
 }
 </script>
 
 <template>
   <div class="page">
-    <header class="header">
-      <h1>数学助手 · 流式公式原型（第 1 步）</h1>
-      <p class="hint">
-        假数据流式输出，不调用任何模型 API。观测器 v2 追踪每个公式容器及其内部 KaTeX
-        排版节点的创建、删除与替换：正常播放应<b>无任何异常</b>；两个"对照"按钮分别故意
-        逐帧替换排版节点、删除唯一的已完成公式，用于验证观测器确实能检出问题；
-        清空与重播只由"新对话"/播放按钮显式触发，不应误报。
-      </p>
-    </header>
+    <template v-if="authChecked && !me">
+      <form class="login" @submit.prevent="submitLogin">
+        <h1>数学学习 AI 助手</h1>
+        <p class="hint">请输入访问用户名与密码</p>
+        <input
+          v-model="loginName"
+          autocomplete="username"
+          placeholder="用户名"
+        />
+        <input
+          v-model="loginPassword"
+          type="password"
+          autocomplete="current-password"
+          placeholder="密码"
+        />
+        <button type="submit" :disabled="loggingIn || !loginName.trim() || !loginPassword">
+          {{ loggingIn ? '登录中…' : '登录' }}
+        </button>
+        <p v-if="loginError" class="error">{{ loginError }}</p>
+      </form>
+    </template>
 
-    <div class="controls">
-      <button :disabled="streaming" @click="play('thinking')">▶ 播放（思考 + 回答）</button>
-      <button :disabled="streaming" @click="play('normal')">▶ 播放（仅回答）</button>
-      <button :disabled="streaming" @click="play('bad')">▶ 播放（坏公式降级）</button>
-      <button :disabled="streaming" @click="play('price')">▶ 播放（纯文本美元）</button>
-      <button :disabled="streaming" class="warn" @click="play('unstable')">▶ 对照（故意替换排版节点）</button>
-      <button :disabled="streaming" class="warn" @click="play('drop')">▶ 对照（故意删除已完成公式）</button>
-      <button :disabled="!streaming" class="ghost" @click="stop">⏹ 停止</button>
-      <button class="ghost" @click="reset">✚ 新对话</button>
-    </div>
-
-    <main ref="chatRoot" class="chat">
-      <template v-if="userMsg">
-        <div class="msg user">
-          <div class="bubble">{{ userMsg }}</div>
+    <template v-else-if="me">
+      <header class="header">
+        <h1>数学学习 AI 助手</h1>
+        <div class="user-bar">
+          <span>{{ me.display_name }}</span>
+          <select v-model="mode" :disabled="sending" class="mode-select">
+            <option value="解答模式">解答模式</option>
+            <option value="互动模式">互动模式</option>
+          </select>
+          <button class="ghost" :disabled="sending" @click="onClearClick">
+            {{ clearArmed ? '再点一次确认清空' : '🗑️ 新对话' }}
+          </button>
+          <button class="ghost" :disabled="sending" @click="doLogout">退出</button>
         </div>
-        <div class="msg assistant">
-          <details v-if="thinkingText" class="thinking" :open="showThinking || !thinkingDone">
-            <summary @click.prevent="showThinking = !showThinking">
-              思考过程 {{ thinkingDone ? '' : '（进行中）' }}
-            </summary>
-            <StreamMessage scope="thinking" :text="thinkingText" :done="thinkingDone" />
-          </details>
-          <div class="bubble answer">
-            <StreamMessage
-              scope="answer"
-              :text="answerText"
-              :done="answerDone"
-              :fault="currentScenario === 'unstable' ? 'replace' : currentScenario === 'drop' ? 'drop' : undefined"
-            />
+      </header>
+      <p v-if="restoreNotice" class="notice">{{ restoreNotice }}</p>
+
+      <main ref="chatScroll" class="chat" @scroll="onScroll">
+        <div v-if="messages.length === 0" class="placeholder">
+          输入数学问题开始提问。
+        </div>
+        <template v-for="(msg, i) in messages" :key="i">
+          <div v-if="msg.role === 'user'" class="msg user">
+            <div class="bubble">{{ msg.content }}</div>
           </div>
-        </div>
-      </template>
-      <div v-else class="placeholder">点击上方按钮或发送一条消息开始（原型使用假数据）。</div>
-    </main>
+          <div v-else class="msg assistant">
+            <details v-if="msg.reasoning" class="thinking" open>
+              <summary>思考过程{{ msg.done ? '' : '（进行中）' }}</summary>
+              <StreamMessage scope="think" :text="msg.reasoning" :done="msg.done" />
+            </details>
+            <div class="bubble answer">
+              <StreamMessage
+                v-if="msg.content || msg.done"
+                scope="ans"
+                :text="msg.content"
+                :done="msg.done"
+              />
+              <span v-else class="waiting">
+                ⏳ 正在思考… 已用时 {{ elapsedSeconds }} 秒
+              </span>
+            </div>
+          </div>
+        </template>
+      </main>
 
-    <details class="settings">
-      <summary>设置（原型占位，第 3 步接入）</summary>
-      <div class="settings-body">
-        <label>学段 <select disabled><option>初中</option></select></label>
-        <label>模式 <select disabled><option>解答模式</option></select></label>
-        <label>服务商 <select disabled><option>DeepSeek</option></select></label>
-        <label>模型 <select disabled><option>deepseek-chat</option></select></label>
-        <label>回答风格 <select disabled><option>完整步骤</option></select></label>
-        <label>深度思考 <input type="checkbox" disabled /></label>
-      </div>
-    </details>
+      <section v-if="statusText" class="status">{{ statusText }}</section>
+      <section v-if="usageText" class="usage">{{ usageText }}</section>
 
-    <footer class="input-bar">
-      <input
-        v-model="input"
-        :disabled="streaming"
-        placeholder="输入数学问题（原型：发送后播放示例回答）"
-        @keydown.enter="send"
-      />
-      <button class="send" :disabled="streaming || !input.trim()" @click="send">发送</button>
-    </footer>
-
-    <section class="debug">
-      <h2>公式稳定性观测 v2</h2>
-      <div class="debug-grid">
-        <span>分片次数：{{ chunkCount }}</span>
-        <span>公式容器：{{ stats.containers }}</span>
-        <span>容器创建总次数：{{ stats.creations }}</span>
-        <span>容器被移除：{{ stats.removals }}</span>
-        <span>内部排版节点替换：{{ stats.internalReplacements }}</span>
-        <span :class="stats.anomalies.length ? 'bad' : 'ok'">
-          {{ stats.anomalies.length ? `检测到 ${stats.anomalies.length} 项异常！` : '无异常 ✓' }}
-        </span>
-      </div>
-      <ul v-if="stats.anomalies.length" class="anomalies">
-        <li v-for="(a, i) in stats.anomalies.slice(0, 8)" :key="i">
-          [{{ a.type }}] {{ a.key }} @分片{{ a.at }} — {{ a.detail }}
-        </li>
-        <li v-if="stats.anomalies.length > 8">…共 {{ stats.anomalies.length }} 项</li>
-      </ul>
-    </section>
+      <footer class="input-bar">
+        <input
+          v-model="input"
+          :disabled="sending"
+          placeholder="输入数学问题，回车发送"
+          @keydown.enter="send"
+        />
+        <button v-if="sending" class="send stop" @click="stopStreaming">⏹ 停止</button>
+        <button
+          v-else
+          class="send"
+          :disabled="!input.trim()"
+          @click="send"
+        >
+          发送
+        </button>
+      </footer>
+    </template>
   </div>
 </template>
 
@@ -329,49 +304,101 @@ async function send() {
 .page {
   max-width: 780px;
   margin: 0 auto;
-  padding: 16px 14px 90px;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  padding: 12px 14px 0;
+}
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .header h1 {
-  font-size: 1.15rem;
-  margin: 0 0 6px;
-}
-.hint {
+  font-size: 1.1rem;
   margin: 0;
+}
+.user-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 0.85rem;
   color: #57606a;
 }
-.controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.controls button {
+.mode-select {
   border: 1px solid #d0d7de;
-  background: #fff;
   border-radius: 8px;
-  padding: 6px 12px;
+  padding: 4px 6px;
+  background: #fff;
+  font-size: 0.85rem;
+}
+.user-bar button {
+  border: 1px solid #d0d7de;
+  background: transparent;
+  border-radius: 8px;
+  padding: 4px 10px;
   cursor: pointer;
   font-size: 0.85rem;
 }
-.controls button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.controls .ghost {
-  background: transparent;
-}
-.controls .warn {
-  border-color: #f0b72f;
+.notice {
+  margin: 4px 0 0;
+  font-size: 0.85rem;
   color: #9a6700;
 }
+.login {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(320px, 90%);
+  text-align: center;
+}
+.login h1 {
+  font-size: 1.2rem;
+  margin: 0;
+}
+.login .hint {
+  margin: 0;
+  color: #57606a;
+  font-size: 0.9rem;
+}
+.login input {
+  border: 1px solid #d0d7de;
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 0.95rem;
+}
+.login button {
+  border: none;
+  background: #1a73e8;
+  color: #fff;
+  border-radius: 10px;
+  padding: 9px 0;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.login button:disabled {
+  opacity: 0.5;
+}
+.login .error {
+  color: #cf222e;
+  font-size: 0.88rem;
+  margin: 0;
+}
 .chat {
+  flex: 1;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 120px;
+  padding: 12px 2px;
+}
+.placeholder {
+  color: #8b949e;
+  text-align: center;
+  margin-top: 40px;
 }
 .msg.user {
   display: flex;
@@ -383,6 +410,8 @@ async function send() {
   border-radius: 14px 14px 4px 14px;
   padding: 8px 12px;
   max-width: 80%;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 .msg.assistant .bubble {
   background: #fff;
@@ -403,43 +432,31 @@ async function send() {
   cursor: pointer;
   user-select: none;
 }
-.placeholder {
+.waiting {
   color: #8b949e;
-  text-align: center;
-  padding: 30px 0;
+  font-size: 0.9em;
 }
-.settings {
-  border: 1px solid #e1e4e8;
-  border-radius: 10px;
-  background: #fff;
-  padding: 6px 12px;
+.status {
+  border-top: 1px solid #e1e4e8;
+  padding: 8px 2px;
   font-size: 0.88rem;
-}
-.settings-body {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  padding: 8px 0;
-}
-.settings-body label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
   color: #57606a;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.usage {
+  padding: 0 2px 6px;
+  font-size: 0.85rem;
+  color: #57606a;
+  white-space: pre-wrap;
 }
 .input-bar {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: #f5f6f8;
-  padding: 10px 14px;
   display: flex;
   gap: 8px;
-  justify-content: center;
+  padding: 10px 0 12px;
 }
 .input-bar input {
-  width: min(680px, 100%);
+  flex: 1;
   border: 1px solid #d0d7de;
   border-radius: 10px;
   padding: 9px 12px;
@@ -458,38 +475,12 @@ async function send() {
 .input-bar .send:disabled {
   opacity: 0.5;
 }
-.debug {
-  border: 1px solid #e1e4e8;
-  border-radius: 10px;
-  background: #fff;
-  padding: 8px 12px;
-  font-size: 0.85rem;
-}
-.debug h2 {
-  font-size: 0.9rem;
-  margin: 2px 0 6px;
-}
-.debug-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-}
-.debug .ok {
-  color: #1a7f37;
-  font-weight: 600;
-}
-.debug .bad {
-  color: #cf222e;
-  font-weight: 600;
-}
-.anomalies {
-  margin: 6px 0 0;
-  color: #cf222e;
-  word-break: break-all;
+.input-bar .send.stop {
+  background: #cf222e;
 }
 @media (max-width: 560px) {
-  .controls button {
-    padding: 8px 10px;
+  .page {
+    padding: 8px 8px 0;
   }
   .msg.user .bubble,
   .msg.assistant .bubble {
