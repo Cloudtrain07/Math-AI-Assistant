@@ -20,6 +20,7 @@ function base(overrides: Partial<DonePayload> = {}): DonePayload {
     daily_limit: 1000000,
     global_daily_limit: 3000000,
     image_status: '',
+    image_kept: false,
     ...overrides,
   }
 }

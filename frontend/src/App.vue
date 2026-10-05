@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import StreamMessage from './components/StreamMessage.vue'
+import ImageEditorDialog from './components/ImageEditorDialog.vue'
 import {
   clearConversation,
   continueChat,
@@ -9,11 +10,20 @@ import {
   fetchSettings,
   login as apiLogin,
   logout as apiLogout,
+  removeImage as apiRemoveImage,
   streamChat,
+  uploadImage,
   type SettingsInfo,
   type TurnSettings,
   type UserInfo,
 } from './api'
+import {
+  isOverSize,
+  isSupportedImageFile,
+  type EditParams,
+  type EditorResult,
+  type EditorSource,
+} from './imageEdit'
 import { composeDaily, composeNotice } from './notice'
 import { providerView } from './settings'
 
@@ -22,6 +32,20 @@ interface ChatEntry {
   content: string
   reasoning: string
   done: boolean
+  /** 本会话内随消息发送的图片（仅当前页面内存，恢复历史没有此项） */
+  imageUrl?: string
+}
+
+/** 待发送图片：始终保留原始文件，重新编辑从原图+参数恢复 */
+interface PendingImage {
+  source: EditorSource
+  editedBlob: Blob
+  editedUrl: string
+  editedWidth: number
+  editedHeight: number
+  params: EditParams
+  /** 已随上一条消息发送（服务端仍保留，供同题追问重新附带） */
+  sent: boolean
 }
 
 const me = ref<UserInfo | null>(null)
@@ -41,6 +65,105 @@ const restoreNotice = ref('')
 const mode = ref('互动模式')
 const clearArmed = ref(false)
 let clearTimer: ReturnType<typeof setTimeout> | null = null
+
+// ---- 待发送图片：选择/粘贴 → 编辑确认 → 缩略图 → 点击发送才上传 ----
+const pendingImage = ref<PendingImage | null>(null)
+const editorOpen = ref(false)
+const editorSource = ref<EditorSource | null>(null)
+const editorParams = ref<EditParams | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
+
+function discardPendingImage() {
+  if (pendingImage.value) {
+    URL.revokeObjectURL(pendingImage.value.editedUrl)
+    pendingImage.value = null
+  }
+}
+
+function openFilePicker() {
+  fileInput.value?.click()
+}
+
+async function onFileChange(event: Event) {
+  const picker = event.target as HTMLInputElement
+  const file = picker.files?.[0]
+  picker.value = ''
+  if (file) await acceptNewImage(file)
+}
+
+function onPaste(event: ClipboardEvent) {
+  if (!me.value || sending.value || editorOpen.value) return
+  const item = Array.from(event.clipboardData?.items ?? []).find((i) =>
+    i.type.startsWith('image/'),
+  )
+  if (!item) return
+  const file = item.getAsFile()
+  if (!file) return
+  event.preventDefault()
+  void acceptNewImage(file)
+}
+
+/** 校验并在浏览器中预解码，再进入编辑弹窗；失败给出明确提示 */
+async function acceptNewImage(file: File) {
+  if (sending.value) return
+  if (!isSupportedImageFile(file)) {
+    statusText.value = '⚠️ 不支持的图片格式，仅支持 jpg / png / webp / bmp / gif。'
+    return
+  }
+  if (isOverSize(file)) {
+    statusText.value = '⚠️ 图片超过 10MB，请压缩后再试。'
+    return
+  }
+  statusText.value = ''
+  try {
+    await decodeImage(file)
+  } catch {
+    statusText.value =
+      '⚠️ 浏览器无法解码该图片（如 HEIC 格式），请先转换为 jpg 或 png。'
+    return
+  }
+  // 新图从零开始编辑；重新编辑则由 reEdit 带入原参数
+  editorSource.value = { blob: file, name: file.name }
+  editorParams.value = null
+  editorOpen.value = true
+}
+
+function decodeImage(blob: Blob): Promise<ImageBitmap> {
+  return createImageBitmap(blob)
+}
+
+function onEditorConfirm(result: EditorResult) {
+  editorOpen.value = false
+  const source = editorSource.value
+  if (!source) return
+  discardPendingImage()
+  pendingImage.value = {
+    source,
+    editedBlob: result.blob,
+    editedUrl: URL.createObjectURL(result.blob),
+    editedWidth: result.width,
+    editedHeight: result.height,
+    params: result.params,
+    sent: false,
+  }
+  statusText.value = result.note ? `ℹ️ ${result.note}` : statusText.value
+}
+
+function reEdit() {
+  const pending = pendingImage.value
+  if (!pending || sending.value) return
+  editorSource.value = pending.source
+  editorParams.value = pending.params
+  editorOpen.value = true
+}
+
+async function removePending() {
+  if (sending.value) return
+  discardPendingImage()
+  // 同时清掉服务端可能保留的上一条附图，避免后续轮次重新附带
+  const result = await apiRemoveImage()
+  if (result && !result.ok && result.message) statusText.value = result.message
+}
 
 // ---- 界面设置（来自 /api/settings，均可在折叠区修改） ----
 const settings = ref<SettingsInfo | null>(null)
@@ -72,6 +195,7 @@ let controller: AbortController | null = null
 let elapsedTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
+  window.addEventListener('paste', onPaste)
   me.value = await fetchMe()
   authChecked.value = true
   if (me.value) {
@@ -81,6 +205,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (elapsedTimer !== null) clearInterval(elapsedTimer)
+  window.removeEventListener('paste', onPaste)
 })
 
 async function loadSettings() {
@@ -133,6 +258,7 @@ async function doLogout() {
   statusText.value = ''
   usageText.value = ''
   input.value = ''
+  discardPendingImage()
 }
 
 // ---- 滚动跟随：用户向上阅读时不强制拉回底部 ----
@@ -180,7 +306,9 @@ function currentTurnSettings(): TurnSettings {
 
 async function runTurn(kind: 'chat' | 'continue', text = '') {
   if (sending.value) return
-  if (kind === 'chat' && !text) return
+  const pendingUnsent = kind === 'chat' && pendingImage.value && !pendingImage.value.sent
+  if (kind === 'chat' && !text && !pendingUnsent) return
+  const originalText = text
   if (kind === 'chat') input.value = ''
   statusText.value = ''
   const assistant = reactive<ChatEntry>({
@@ -191,12 +319,13 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   })
   // 气泡在 start 事件后才显示：被拒（含无可继续题目）时不显示任何气泡
   let assistantShown = false
-  const showBubbles = (userContent: string) => {
+  const showBubbles = (userContent: string, imageUrl?: string) => {
     messages.value.push({
       role: 'user',
       content: userContent,
       reasoning: '',
       done: true,
+      imageUrl,
     })
     messages.value.push(assistant)
     assistantShown = true
@@ -207,6 +336,33 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   stickToBottom = true
   startElapsedTimer()
   controller = new AbortController()
+
+  // 图片在点击发送后才上传：选择、编辑、预览阶段不发生任何网络传输；
+  // 上传阶段可停止（中止后不发聊天请求），失败保留待发送图片供重试
+  let imageId: string | null = null
+  if (kind === 'chat' && pendingUnsent && pendingImage.value) {
+    const uploadSignal = controller.signal
+    try {
+      const uploaded = await uploadImage(
+        pendingImage.value.editedBlob,
+        'edited.jpg',
+        uploadSignal,
+      )
+      imageId = uploaded.image_id
+    } catch (err) {
+      input.value = originalText
+      sending.value = false
+      stopElapsedTimer()
+      controller = null
+      if (uploadSignal.aborted) {
+        statusText.value = '⏹ 已停止发送，未发起模型请求。图片已保留，可重试。'
+      } else {
+        statusText.value =
+          err instanceof Error ? `⚠️ ${err.message}` : '⚠️ 图片上传失败，请重试。'
+      }
+      return
+    }
+  }
 
   const requestSettings = currentTurnSettings()
   const onDelta = (d: { answer: string; reasoning: string }) => {
@@ -220,7 +376,9 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
       kind === 'chat'
         ? await streamChat(text, requestSettings, {
             signal: controller.signal,
-            onStart: () => showBubbles(text),
+            imageId,
+            // 纯图片发送时文本为服务端默认题目提示，气泡同时展示所发图片
+            onStart: (payload) => showBubbles(text || payload.message, imageId ? pendingImage.value?.editedUrl : undefined),
             onDelta,
           })
         : await continueChat(requestSettings, {
@@ -230,7 +388,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
             onDelta,
           })
     if (result.kind === 'rejected') {
-      // 被拒：移除占位的助手气泡（如有），保留提示文字
+      // 被拒：移除占位的助手气泡（如有），保留提示文字；待发送图片保留供重试
       if (assistantShown) {
         messages.value.splice(messages.value.indexOf(assistant), 1)
       }
@@ -244,6 +402,11 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
       usageText.value = [d.cumulative_usage, composeDaily(d)]
         .filter(Boolean)
         .join('\n')
+      // 普通发送后按核心的图片状态同步缩略图：保留（标记已发送）或被消费/丢弃
+      if (kind === 'chat' && pendingImage.value) {
+        if (d.image_kept) pendingImage.value.sent = true
+        else discardPendingImage()
+      }
       await nextTick(scrollToBottom)
     }
   } catch (err) {
@@ -263,6 +426,8 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
 }
 
 function send() {
+  const hasPending = pendingImage.value && !pendingImage.value.sent
+  if (!input.value.trim() && !hasPending) return
   runTurn('chat', input.value.trim())
 }
 
@@ -289,6 +454,7 @@ async function onClearClick() {
     statusText.value = result.message
     usageText.value = ''
     restoreNotice.value = ''
+    discardPendingImage()
   } else {
     statusText.value = result.message
   }
@@ -393,7 +559,10 @@ async function onClearClick() {
         </div>
         <template v-for="(msg, i) in messages" :key="i">
           <div v-if="msg.role === 'user'" class="msg user">
-            <div class="bubble">{{ msg.content }}</div>
+            <div class="bubble">
+              <img v-if="msg.imageUrl" :src="msg.imageUrl" class="sent-image" alt="发送的题目图片" />
+              <span>{{ msg.content }}</span>
+            </div>
           </div>
           <div v-else class="msg assistant">
             <details v-if="msg.reasoning" class="thinking" open>
@@ -418,11 +587,52 @@ async function onClearClick() {
       <section v-if="statusText" class="status">{{ statusText }}</section>
       <section v-if="usageText" class="usage">{{ usageText }}</section>
 
+      <!-- 待发送图片：确认后才出现在这里；点击发送时才上传 -->
+      <div v-if="pendingImage" class="pending-image">
+        <img class="thumb" :src="pendingImage.editedUrl" alt="待发送图片" />
+        <div class="pending-meta">
+          <span class="pending-size">
+            {{ pendingImage.editedWidth }}×{{ pendingImage.editedHeight }}
+          </span>
+          <span v-if="pendingImage.sent" class="pending-badge">已发送</span>
+        </div>
+        <div class="pending-actions">
+          <button class="chip" type="button" :disabled="sending" @click="reEdit">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.8 3.6l3.6 3.6L7 16.6l-4 1 1-4z" /></svg>
+            编辑
+          </button>
+          <button class="chip danger" type="button" :disabled="sending" @click="removePending">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" /></svg>
+            移除
+          </button>
+        </div>
+      </div>
+
       <footer class="input-bar">
+        <input
+          ref="fileInput"
+          type="file"
+          accept="image/jpeg,image/png,image/webp,image/bmp,image/gif"
+          class="file-picker"
+          @change="onFileChange"
+        />
+        <button
+          class="icon-btn img-btn"
+          type="button"
+          title="添加图片（支持裁剪、旋转）"
+          :disabled="sending"
+          @click="openFilePicker"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <rect x="2.5" y="3.5" width="15" height="13" rx="2" />
+            <circle cx="7" cy="8" r="1.4" />
+            <path d="M2.5 14l4.5-4 3 3 3.5-3.5 4 4" />
+          </svg>
+        </button>
         <input
           v-model="input"
           :disabled="sending"
-          placeholder="输入数学问题，回车发送"
+          placeholder="输入数学问题，可附图片"
           @keydown.enter="send"
         />
         <button
@@ -437,12 +647,20 @@ async function onClearClick() {
         <button
           v-else
           class="send"
-          :disabled="!input.trim()"
+          :disabled="!input.trim() && !(pendingImage && !pendingImage.sent)"
           @click="send"
         >
           发送
         </button>
       </footer>
+
+      <ImageEditorDialog
+        :open="editorOpen"
+        :source="editorSource"
+        :initial-params="editorParams"
+        @cancel="editorOpen = false"
+        @confirm="onEditorConfirm"
+      />
     </template>
   </div>
 </template>
@@ -609,6 +827,100 @@ async function onClearClick() {
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
+.sent-image {
+  display: block;
+  max-width: 240px;
+  max-height: 180px;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  background: rgba(255, 255, 255, 0.9);
+}
+/* ---- 待发送图片缩略图条 ---- */
+.pending-image {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  border: 1px solid #e1e4e8;
+  border-radius: 12px;
+  background: #fafbfc;
+}
+.pending-image .thumb {
+  width: 52px;
+  height: 52px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid #e1e4e8;
+  background: #fff;
+}
+.pending-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+.pending-size {
+  font-size: 0.78rem;
+  color: #8b949e;
+  font-variant-numeric: tabular-nums;
+}
+.pending-badge {
+  align-self: flex-start;
+  font-size: 0.72rem;
+  color: #1a73e8;
+  background: #eaf2fe;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.pending-actions {
+  display: flex;
+  gap: 6px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #d0d7de;
+  background: #fff;
+  color: #43505e;
+  border-radius: 8px;
+  padding: 4px 9px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.chip svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.chip:hover:not(:disabled) {
+  border-color: #1a73e8;
+  color: #1a73e8;
+  background: #f2f7ff;
+}
+.chip.danger:hover:not(:disabled) {
+  border-color: #cf222e;
+  color: #cf222e;
+  background: #fff5f5;
+}
+.chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.chip:focus-visible,
+.img-btn:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 1px;
+}
+.file-picker {
+  display: none;
+}
 .msg.assistant .bubble {
   background: #fff;
   border: 1px solid #e1e4e8;
@@ -650,8 +962,40 @@ async function onClearClick() {
   display: flex;
   gap: 8px;
   padding: 10px 0 12px;
+  align-items: center;
 }
-.input-bar input {
+.img-btn {
+  border: 1px solid #d0d7de;
+  background: #fff;
+  color: #57606a;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.img-btn svg {
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.img-btn:hover:not(:disabled) {
+  border-color: #1a73e8;
+  color: #1a73e8;
+  background: #f2f7ff;
+}
+.img-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.input-bar input:not(.file-picker) {
   flex: 1;
   border: 1px solid #d0d7de;
   border-radius: 10px;

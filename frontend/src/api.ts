@@ -33,6 +33,8 @@ export interface DonePayload {
   daily_limit: number
   global_daily_limit: number
   image_status: string
+  /** 本轮结束后核心是否仍保留图片状态（false 表示已被消费或按新题丢弃） */
+  image_kept: boolean
 }
 
 export interface RejectedPayload {
@@ -200,18 +202,46 @@ async function consumeTurnStream(
   throw new Error('连接中断：未收到完整回答')
 }
 
-/** 发送一条消息并消费 SSE 流。 */
+/**
+ * 上传编辑确认后的待发送图片，返回服务端临时图片 id（仅点击发送时调用）。
+ * signal 用于上传阶段停止：中止后不再发起聊天请求。
+ */
+export async function uploadImage(
+  blob: Blob,
+  name = 'edited.jpg',
+  signal?: AbortSignal,
+): Promise<{ image_id: string; width: number; height: number }> {
+  const form = new FormData()
+  form.append('file', blob, name)
+  const resp = await fetch('/api/images', { method: 'POST', body: form, signal })
+  const body = await readJson(resp)
+  if (!resp.ok) {
+    throw new Error((body && body.detail) || '图片上传失败，请重试')
+  }
+  return body as { image_id: string; width: number; height: number }
+}
+
+/** 显式移除图片（含阻止上一条消息的附图在后续轮次重新附带）。 */
+export async function removeImage(): Promise<{ ok: boolean; message?: string }> {
+  const resp = await fetch('/api/images', { method: 'DELETE' })
+  if (!resp.ok) return { ok: false }
+  return await resp.json()
+}
+
+/** 发送一条消息并消费 SSE 流；imageId 来自发送前的 uploadImage。 */
 export async function streamChat(
   message: string,
   settings: TurnSettings,
-  handlers: StreamHandlers & { signal?: AbortSignal },
+  handlers: StreamHandlers & { signal?: AbortSignal; imageId?: string | null },
 ): Promise<
   { kind: 'done'; payload: DonePayload } | { kind: 'rejected'; payload: RejectedPayload }
 > {
+  const body: Record<string, unknown> = { message, ...settings }
+  if (handlers.imageId) body.image_id = handlers.imageId
   const resp = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, ...settings }),
+    body: JSON.stringify(body),
     signal: handlers.signal,
   })
   return consumeTurnStream(resp, handlers)

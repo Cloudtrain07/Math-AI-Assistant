@@ -39,22 +39,40 @@
 确定性 close 同步生成器（ClosingStreamingResponse），busy 随之释放，
 不依赖垃圾回收。断连只表示服务端停止消费并关闭上游流，
 不代表模型侧已停止计费，界面文案不做该承诺。
+
+图片上传与临时文件：
+- 前端在点击发送后才把编辑确认的图片 POST /api/images（multipart），
+  得到服务端生成的 image_id，再随 /api/chat 提交；选择、编辑、预览阶段
+  不发生任何上传；
+- 临时文件按账号存于 data_dir/temp_images/<账号>/，文件名随机，目录不
+  对外静态服务；image_id 仅在本账号会话内可解析，跨账号引用查无此 id；
+- 图片状态（path/fresh）保存在 ChatState 上并随核心每轮返回值写回，
+  语义与旧界面 gr.State 一致：同题追问每轮重新附带原图，新题/读图失败
+  由核心置空；被替换或被丢弃的临时文件在写回时同步删除；
+- 图片挂载（mount_pending_image）在 begin_turn 之后、注册表锁内核验
+  epoch 与文件存在性：挂载前发生清空或文件已被删除时拒绝本轮，
+  不会把旧路径写回清空后的状态；
+- 清空（clear_account）与显式移除（DELETE /api/images）的状态变更与
+  文件释放在注册表锁内完成；生成中清空时文件物理删除延迟到旧轮次
+  release 释放引用之后（只删清空时记录的精确路径，不误删清空后新上传）；
+  启动时清理超过 24 小时的历史残留。
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
+import io
 import json
 import secrets
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import anyio
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -79,8 +97,9 @@ from core import dialogue_state
 from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
 from core.providers import get_provider_supports_thinking
 from core.runtime import AppRuntime, build_runtime
-from core.storage import HistoryReadError
+from core.storage import HistoryReadError, safe_account_name
 from core.usage import format_cumulative, new_usage_state
+from core.vision_client import MAX_IMAGE_BYTES, SUPPORTED_EXTS
 
 APP_ROOT = Path(__file__).resolve().parent
 FRONTEND_DIST = APP_ROOT / "frontend" / "dist"
@@ -95,6 +114,13 @@ ANSWER_STYLES = ("完整步骤+答案", "简略过程+答案", "只给答案和�
 REASONING_EFFORTS = ("low", "high", "max")
 # 继续生成没有可继续题目时的拒绝提示（与旧界面 continue_last_answer 一致）
 NO_CONTINUE_MSG = "💡 还没有可继续的题目，请先提问。"
+
+# 上传图片的像素上限：只用于防解压炸弹，不做清晰度压缩。
+# 依据：主流手机照片 12–48MP，50MP 覆盖绝大多数真实照片；
+# 更大者（如 108MP 全尺寸直出）明确拒绝并提示先缩小，不静默处理。
+# 兼容影响：旧 Gradio 界面不走此校验，行为不变；Pillow 自带的
+# DecompressionBomb 保护（约 179MP）仍作为最终兜底。
+MAX_IMAGE_PIXELS = 50_000_000
 
 
 # ===================== 会话与账号聊天状态 =====================
@@ -134,11 +160,141 @@ class SessionStore:
             self._sessions.pop(token, None)
 
 
+class TempImageStore:
+    """按账号隔离的临时图片存储。
+
+    - 文件名（image_id）由服务端随机生成，客户端不能提交本地路径或文件名；
+    - 文件落在本账号子目录（safe_account_name 隔离），目录不在任何静态挂载内；
+    - resolve 只在本账号的索引内查找，跨账号引用一律查无此 id；
+    - delete 仅删除本账号目录内的路径，防止越界删除。
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._root = Path(root)
+        self._lock = threading.Lock()
+        # username -> {image_id: path}；仅存内存，进程重启后旧 id 自然失效
+        self._index: dict[str, dict[str, Path]] = {}
+
+    def _account_dir(self, username: str) -> Path:
+        return self._root / safe_account_name(username)
+
+    def save(self, username: str, data: bytes, ext: str) -> tuple[str, Path]:
+        image_id = secrets.token_urlsafe(16)
+        account_dir = self._account_dir(username)
+        account_dir.mkdir(parents=True, exist_ok=True)
+        path = account_dir / f"{image_id}{ext}"
+        path.write_bytes(data)
+        with self._lock:
+            self._index.setdefault(username, {})[image_id] = path
+        return image_id, path
+
+    def resolve(self, username: str, image_id: str) -> Path | None:
+        with self._lock:
+            return self._index.get(username, {}).get(image_id)
+
+    def take_all(self, username: str) -> list[Path]:
+        """取出并清空该账号的文件索引，返回精确路径（供延迟删除）。"""
+        with self._lock:
+            files = self._index.pop(username, {})
+        return list(files.values())
+
+    def delete(self, username: str, path: str | Path) -> None:
+        """删除本账号目录内的一个临时文件；越界路径直接忽略。"""
+        target = Path(path)
+        try:
+            target.relative_to(self._account_dir(username))
+        except ValueError:
+            return
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        with self._lock:
+            files = self._index.get(username)
+            if files:
+                for key, value in list(files.items()):
+                    if value == target:
+                        del files[key]
+
+    def delete_all(self, username: str) -> None:
+        """删除该账号全部临时图片（清空 / 显式移除时使用）。"""
+        with self._lock:
+            files = list(self._index.pop(username, {}).values())
+        for path in files:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        account_dir = self._account_dir(username)
+        try:
+            account_dir.rmdir()
+        except OSError:
+            pass
+
+    def cleanup_expired(self, max_age_hours: float = 24) -> None:
+        """启动时清理历史残留（进程中断遗留的孤儿文件），尽力而为。"""
+        import time as _time
+
+        deadline = _time.time() - max_age_hours * 3600
+        try:
+            candidates = list(self._root.iterdir())
+        except OSError:
+            return
+        for account_dir in candidates:
+            if not account_dir.is_dir():
+                continue
+            for path in account_dir.iterdir():
+                try:
+                    if path.is_file() and path.stat().st_mtime < deadline:
+                        path.unlink()
+                except OSError:
+                    pass
+
+
+def _validate_image_bytes(data: bytes) -> tuple[int, int]:
+    """独立校验上传图片：结构校验 → 像素上限 → 实际像素解码。
+
+    三步都不信任扩展名与 Content-Type：
+    - verify() 只查结构与 CRC，不解码像素，拦截损坏与截断文件；
+    - 像素上限在解码前检查，解压炸弹在此被拒（同时限定了下一步
+      实际解码的内存上界：≤50MP 的解码约数百 MB 以内）；
+    - load() 真实解码像素：头部可读但像素数据损坏（如 IDAT 流损坏）
+      的文件也在上传阶段被拒绝，不会等到发送时才由核心报读图失败。
+    """
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="图片文件损坏或无法解码，请换一张图片"
+        )
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+            if width * height > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"图片像素过大（{width}×{height}），请缩小到 5000 万像素以内再试",
+                )
+            img.load()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="图片文件损坏或无法解码，请换一张图片"
+        )
+    return width, height
+
+
 @dataclass
 class ChatState:
     """单个账号的服务端聊天状态；history 初值来自磁盘。
 
     epoch 为清空计数：清空时递增，旧轮次完成后凭它判断状态是否仍有效。
+    image_state 与旧界面 gr.State 语义一致：path 为服务端临时文件路径，
+    fresh 表示本回合刚上传（交给核心 route_image_for_turn 判定是否附图）。
     """
 
     history: list[dict]
@@ -146,15 +302,22 @@ class ChatState:
     stage_state: dict
     load_error: str | None = None
     epoch: int = 0
+    image_state: dict = field(
+        default_factory=lambda: {"path": None, "fresh": False}
+    )
 
 
 class ChatRegistry:
     """按账号保存聊天状态，并保证同一账号同时只有一轮生成。"""
 
-    def __init__(self) -> None:
+    def __init__(self, image_store: TempImageStore | None = None) -> None:
         self._states: dict[str, ChatState] = {}
         self._busy: set[str] = set()
         self._lock = threading.Lock()
+        self._image_store = image_store
+        # 生成中清空时暂存的待删文件路径（精确路径，不含清空后的新上传）；
+        # 旧轮次仍可能读取文件，物理删除延迟到 release 释放引用之后
+        self._deferred_image_deletes: dict[str, list[str]] = {}
 
     def _build_state(self, runtime: AppRuntime, username: str) -> ChatState:
         load_error = None
@@ -203,6 +366,9 @@ class ChatRegistry:
 
         全程持有 registry 锁，与 begin_turn 串行化。磁盘清空失败时不动
         内存状态（与既有行为一致：等待用户重试）。返回磁盘清空是否成功。
+        清空同时重置图片状态并删除该账号全部临时图片（含未发送的上传残留）；
+        生成中清空时文件物理删除延迟到 release（旧轮次可能仍需读取），
+        状态本身立即失效（epoch 递增，旧轮次无法写回或重新挂图）。
         """
         with self._lock:
             try:
@@ -217,6 +383,14 @@ class ChatRegistry:
                 state.stage_state = dialogue_state.new_stage_state()
                 state.load_error = None
                 state.epoch += 1
+                state.image_state = {"path": None, "fresh": False}
+            if self._image_store is not None:
+                if username in self._busy:
+                    self._deferred_image_deletes.setdefault(username, []).extend(
+                        str(p) for p in self._image_store.take_all(username)
+                    )
+                else:
+                    self._image_store.delete_all(username)
             return True
 
     def clear_state(self, username: str) -> None:
@@ -229,6 +403,70 @@ class ChatRegistry:
                 state.stage_state = dialogue_state.new_stage_state()
                 state.load_error = None
                 state.epoch += 1
+                state.image_state = {"path": None, "fresh": False}
+
+    def mount_pending_image(
+        self, username: str, state: ChatState, epoch: int, image_id: str
+    ) -> bool:
+        """发送前挂载本次上传的图片（fresh=True，由核心判定是否附图）。
+
+        图片归属、索引有效性与挂载在同一同步边界（注册表锁）内核验：
+        - epoch 未变：begin_turn 之后没有发生过清空；
+        - image_id 仍在本账号索引内：生成中清空会移除索引（延迟删除文件），
+          release 已释放 busy、旧文件尚未物理删除的窗口里，仅凭 epoch 与
+          path.exists() 会把旧图重新挂上并随后被删除——索引校验在此拒绝，
+          已从账号索引移除的路径一律不接受；
+        - 文件存在：兜底索引与磁盘不一致的残况。
+        替换旧图时旧文件不再被引用，在同一锁内删除。
+        锁序固定为 registry → store（clear_account/release 同序，无死锁）。
+        """
+        with self._lock:
+            if self._states.get(username) is not state or state.epoch != epoch:
+                return False
+            if self._image_store is None:
+                return False
+            path = self._image_store.resolve(username, image_id)
+            if path is None or not path.exists():
+                return False
+            old_path = state.image_state.get("path")
+            state.image_state = {"path": str(path), "fresh": True}
+            if old_path and old_path != str(path):
+                self._image_store.delete(username, old_path)
+            return True
+
+    def sync_image_state(
+        self, username: str, state: ChatState, epoch: int, image_state: dict
+    ) -> bool:
+        """轮次结束后写回核心给出的图片状态；期间被清空（epoch 变化）则放弃。
+
+        核心在新题判定 / 读图失败时把 path 置 None——被替换或被丢弃的旧
+        临时文件在此删除。写回与删除在同一把锁内完成，不会误删新状态引用的文件。
+        """
+        with self._lock:
+            if self._states.get(username) is not state or state.epoch != epoch:
+                return False
+            old_path = state.image_state.get("path")
+            state.image_state = dict(image_state)
+            new_path = state.image_state.get("path")
+            if old_path and old_path != new_path and self._image_store is not None:
+                self._image_store.delete(username, old_path)
+            return True
+
+    def clear_image(self, username: str) -> bool:
+        """用户显式移除图片：状态变更与文件释放在同一锁边界内完成。
+
+        持锁删除保证不会出现在"清状态后、删文件前"的窗口里被新一轮
+        begin_turn + 挂图插进来、随后误删新图的竞态；生成中拒绝移除。
+        """
+        with self._lock:
+            if username in self._busy:
+                return False
+            state = self._states.get(username)
+            if state is not None:
+                state.image_state = {"path": None, "fresh": False}
+            if self._image_store is not None:
+                self._image_store.delete_all(username)
+        return True
 
     def finish_turn(
         self,
@@ -257,8 +495,21 @@ class ChatRegistry:
             return True
 
     def release(self, username: str) -> None:
+        """释放账号 busy，并在同一锁边界内执行延迟的临时图片删除。
+
+        删除放在锁内：busy 释放与旧文件删除对后续请求原子可见，
+        不存在"busy 已释放、文件未删"的可观察窗口；索引在清空时已移除，
+        即使 unlink 失败（如 Windows 下文件仍被占用）旧图也无法再被挂载，
+        残留文件由启动时的过期清理兜底。
+        """
         with self._lock:
             self._busy.discard(username)
+            deferred = self._deferred_image_deletes.pop(username, None)
+            if deferred and self._image_store is not None:
+                # 只删清空时记录的精确路径：此后新轮次挂载的是新上传文件，
+                # 路径不同，不会误删；账号目录校验仍在 store.delete 内执行
+                for path in deferred:
+                    self._image_store.delete(username, path)
 
 
 # ===================== 请求依赖 =====================
@@ -305,6 +556,8 @@ class TurnSettings(BaseModel):
 
 class ChatBody(TurnSettings):
     message: str
+    # /api/images 返回的服务端临时图片 id；缺省表示纯文本发送
+    image_id: str | None = None
 
 
 class ContinueBody(TurnSettings):
@@ -479,6 +732,8 @@ def _done_payload(
         "daily_limit": runtime.daily_limit,
         "global_daily_limit": runtime.global_daily_limit,
         "image_status": turn.get("image_status", ""),
+        # 本轮结束后核心是否仍保留图片状态（false 表示图片已被消费/按新题丢弃）
+        "image_kept": bool((turn.get("image_state") or {}).get("path")),
     }
 
 
@@ -497,6 +752,7 @@ def chat_event_stream(
     resolved: dict,
     *,
     force_continue: bool = False,
+    image_id: str | None = None,
 ):
     """核心 run_chat_turn 事件 → SSE 文本流（同步生成器，Starlette 线程池执行）。
 
@@ -507,6 +763,12 @@ def chat_event_stream(
     用 build_continue_message 构造指令并向核心传 force_continue，与普通发送
     共享 busy、清空守卫、SSE、用量结算与保存；无可继续题目以 no_continue
     拒绝且不调用模型。
+
+    图片接入：image_id 非空时（普通发送且前端已上传），在本轮开始后经
+    mount_pending_image 于注册表锁内重新验证索引有效性再挂到账号图片
+    状态（fresh=True），交给核心 route_image_for_turn 判定附图 / 旧图丢弃 /
+    不支持视觉拒绝——不复制任何图片业务逻辑；轮次结束（含被拒、断连关闭
+    生成器）后经 sync_image_state 写回并清理被替换或被丢弃的临时文件。
     """
     turn = registry.begin_turn(runtime, username)
     if turn is None:
@@ -519,8 +781,25 @@ def chat_event_stream(
         )
         return
     state, start_epoch, turn_token = turn
+    prepared: dict | None = None
 
     try:
+        if image_id is not None and not registry.mount_pending_image(
+            username, state, start_epoch, image_id
+        ):
+            # 端点的 resolve 只是快速预检；权威校验在此处的锁内完成：
+            # 挂载前发生清空（epoch 变化）、image_id 已被清空移出索引
+            # （含 release 已释放 busy、文件尚未物理删除的窗口）或文件
+            # 已删除时拒绝本轮，不调用模型，也不把旧路径写回状态
+            yield _sse(
+                "rejected",
+                {
+                    "status": "image_invalid",
+                    "message": "⚠️ 图片已失效（对话已清空或文件被删除），请重新选择图片后发送。",
+                },
+            )
+            return
+
         if force_continue:
             message = chat_service.build_continue_message(state.history, IMAGE_NOTE)
             if message is None:
@@ -543,7 +822,7 @@ def chat_event_stream(
             level=level,
             mode=body.mode,
             stage_state=state.stage_state,
-            image_state=None,
+            image_state=state.image_state,
             thinking=resolved["thinking"],
             model=resolved["model"],
             reasoning_effort=resolved["reasoning_effort"],
@@ -568,6 +847,7 @@ def chat_event_stream(
         ):
             event_type = event["type"]
             turn = event["turn"]
+            prepared = turn
 
             if event_type == "rejected":
                 yield _sse(
@@ -630,6 +910,12 @@ def chat_event_stream(
             yield _sse("done", payload)
             return
     finally:
+        # 写回核心给出的图片状态（被拒、断连、异常路径同样适用）；
+        # 期间被清空则 epoch 已变，写回自动放弃，临时文件由清空删除
+        if prepared is not None:
+            registry.sync_image_state(
+                username, state, start_epoch, prepared["image_state"]
+            )
         registry.release(username)
 
 
@@ -663,13 +949,21 @@ def create_api_app(
     *,
     sessions: SessionStore | None = None,
     registry: ChatRegistry | None = None,
+    image_store: TempImageStore | None = None,
     frontend_dir: Path | None = "default",
 ) -> FastAPI:
     """组装 FastAPI 应用；会话与状态对象可注入，便于测试隔离。"""
     app = FastAPI(title="数学学习 AI 助手 API", docs_url=None, redoc_url=None)
     app.state.runtime = runtime
     app.state.sessions = sessions if sessions is not None else SessionStore()
-    app.state.registry = registry if registry is not None else ChatRegistry()
+    if image_store is None:
+        image_store = TempImageStore(Path(runtime.data_dir) / "temp_images")
+    app.state.image_store = image_store
+    app.state.registry = registry if registry is not None else ChatRegistry(image_store)
+    try:
+        image_store.cleanup_expired()
+    except Exception:
+        pass
 
     @app.post("/api/login", dependencies=[Depends(_same_origin)])
     def login(body: LoginBody, response: Response):
@@ -766,6 +1060,39 @@ def create_api_app(
             "startup_hint": rt.startup_hint,
         }
 
+    @app.post("/api/images", dependencies=[Depends(_same_origin)])
+    async def upload_image(
+        file: UploadFile = File(...),
+        username: str = Depends(_current_user),
+    ):
+        """接收编辑确认后的待发送图片，返回服务端临时 image_id。
+
+        - 大小按读取字节数校验（上限 MAX_IMAGE_BYTES），不信任 Content-Type；
+        - 扩展名仅作为格式声明校验，真实解码与像素上限独立校验；
+        - 文件名由服务端生成，按账号隔离存储，不对外暴露目录。
+        """
+        store: TempImageStore = app.state.image_store
+        data = await file.read(MAX_IMAGE_BYTES + 1)
+        if len(data) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="图片超过 10MB，请压缩后再试")
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in SUPPORTED_EXTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的图片格式：{ext or '(无扩展名)'}，仅支持 jpg/png/webp/bmp/gif",
+            )
+        width, height = _validate_image_bytes(data)
+        image_id, _path = store.save(username, data, ext)
+        return {"image_id": image_id, "width": width, "height": height}
+
+    @app.delete("/api/images", dependencies=[Depends(_same_origin)])
+    def remove_image(username: str = Depends(_current_user)):
+        """用户显式移除图片（含上一条消息附图，阻止后续轮次重新附带）。"""
+        ok = app.state.registry.clear_image(username)
+        if not ok:
+            return {"ok": False, "message": "⚠️ 回答生成中，请结束后再移除图片。"}
+        return {"ok": True}
+
     @app.post("/api/chat", dependencies=[Depends(_same_origin)])
     def chat(
         body: ChatBody,
@@ -774,11 +1101,26 @@ def create_api_app(
     ):
         if body.mode not in MODES:
             raise HTTPException(status_code=400, detail="不支持的模式")
+        image_id = None
+        if body.image_id is not None:
+            # 快速预检：未知或跨账号 id 直接 400，不启动 SSE 流；
+            # 权威校验在挂载点（registry 锁内重验索引与 epoch）
+            if app.state.image_store.resolve(username, body.image_id) is None:
+                raise HTTPException(
+                    status_code=400, detail="图片已失效，请重新选择或编辑后发送"
+                )
+            image_id = body.image_id
         resolved = _resolve_turn_settings(app.state.runtime, username, body)
         ip = (request.client.host if request.client else None) or "unknown"
         return ClosingStreamingResponse(
             chat_event_stream(
-                app.state.runtime, app.state.registry, username, body, ip, resolved
+                app.state.runtime,
+                app.state.registry,
+                username,
+                body,
+                ip,
+                resolved,
+                image_id=image_id,
             ),
             media_type="text/event-stream",
             headers={

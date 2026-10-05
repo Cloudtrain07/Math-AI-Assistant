@@ -32,9 +32,17 @@ class FakeStreamClient:
         self.last_messages = [dict(m) for m in messages]
 
         user_turns = sum(1 for m in messages if m.get("role") == "user")
-        last_user = next(
-            (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+        last_user_message = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
         )
+        content = last_user_message.get("content") if last_user_message else ""
+        if isinstance(content, list):
+            # 多模态消息只回显文本部分，不回显图片 data URL
+            last_user = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            last_user = content or ""
         answer = (
             f"（假模型 · 第 {user_turns} 轮）\n\n"
             f"你问的是：{last_user}\n\n"
