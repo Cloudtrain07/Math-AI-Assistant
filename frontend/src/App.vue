@@ -1,16 +1,21 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import StreamMessage from './components/StreamMessage.vue'
 import {
   clearConversation,
+  continueChat,
   fetchHistory,
   fetchMe,
+  fetchSettings,
   login as apiLogin,
   logout as apiLogout,
   streamChat,
+  type SettingsInfo,
+  type TurnSettings,
   type UserInfo,
 } from './api'
 import { composeDaily, composeNotice } from './notice'
+import { providerView } from './settings'
 
 interface ChatEntry {
   role: 'user' | 'assistant'
@@ -33,9 +38,32 @@ const statusText = ref('')
 const usageText = ref('')
 const elapsedSeconds = ref(0)
 const restoreNotice = ref('')
-const mode = ref('解答模式')
+const mode = ref('互动模式')
 const clearArmed = ref(false)
 let clearTimer: ReturnType<typeof setTimeout> | null = null
+
+// ---- 界面设置（来自 /api/settings，均可在折叠区修改） ----
+const settings = ref<SettingsInfo | null>(null)
+const level = ref('高中')
+const providerId = ref<string | null>(null)
+const model = ref('')
+const thinking = ref(false)
+const effort = ref('high')
+const answerStyle = ref('完整步骤+答案')
+
+const currentProvider = computed(
+  () => settings.value?.providers.find((p) => p.id === providerId.value) ?? null,
+)
+// 深度思考开关与思考强度只在服务商支持时显示（与旧界面一致）
+const supportsThinking = computed(() => currentProvider.value?.supports_thinking ?? false)
+// 解答风格只在解答模式下显示（与旧界面一致）
+const showAnswerStyle = computed(() => mode.value === '解答模式')
+const modes = computed(() => settings.value?.modes ?? ['互动模式', '解答模式'])
+
+// 切换服务商：模型列表与选中值同步为新服务商配置，避免残留无效模型
+watch(providerId, () => {
+  model.value = providerView(settings.value?.providers ?? [], providerId.value).model
+})
 
 const chatScroll = ref<HTMLElement | null>(null)
 let stickToBottom = true
@@ -46,12 +74,27 @@ let elapsedTimer: ReturnType<typeof setInterval> | null = null
 onMounted(async () => {
   me.value = await fetchMe()
   authChecked.value = true
-  if (me.value) await restoreHistory()
+  if (me.value) {
+    await Promise.all([loadSettings(), restoreHistory()])
+  }
 })
 
 onBeforeUnmount(() => {
   if (elapsedTimer !== null) clearInterval(elapsedTimer)
 })
+
+async function loadSettings() {
+  settings.value = await fetchSettings()
+  const s = settings.value
+  if (!s) return
+  level.value = s.default_level
+  mode.value = s.default_mode
+  providerId.value = s.default_provider
+  model.value = providerView(s.providers, s.default_provider).model
+  thinking.value = s.default_thinking
+  effort.value = s.default_reasoning_effort
+  answerStyle.value = s.default_answer_style
+}
 
 async function restoreHistory() {
   const data = await fetchHistory()
@@ -74,7 +117,7 @@ async function submitLogin() {
   try {
     me.value = await apiLogin(loginName.value.trim(), loginPassword.value)
     loginPassword.value = ''
-    await restoreHistory()
+    await Promise.all([loadSettings(), restoreHistory()])
   } catch (err) {
     loginError.value = err instanceof Error ? err.message : '登录失败'
   } finally {
@@ -105,7 +148,7 @@ async function scrollToBottom() {
   el.scrollTop = el.scrollHeight
 }
 
-// ---- 发送与流式接收 ----
+// ---- 发送与流式接收：普通发送与继续生成共享设置、busy 与收尾处理 ----
 
 function startElapsedTimer() {
   elapsedSeconds.value = 0
@@ -123,37 +166,74 @@ function stopStreaming() {
   if (controller !== null) controller.abort()
 }
 
-async function send() {
-  const text = input.value.trim()
-  if (!text || sending.value) return
-  input.value = ''
+function currentTurnSettings(): TurnSettings {
+  return {
+    mode: mode.value,
+    level: level.value,
+    thinking: thinking.value,
+    provider_id: providerId.value,
+    model: model.value,
+    answer_style: answerStyle.value,
+    reasoning_effort: effort.value,
+  }
+}
+
+async function runTurn(kind: 'chat' | 'continue', text = '') {
+  if (sending.value) return
+  if (kind === 'chat' && !text) return
+  if (kind === 'chat') input.value = ''
   statusText.value = ''
-  messages.value.push({ role: 'user', content: text, reasoning: '', done: true })
   const assistant = reactive<ChatEntry>({
     role: 'assistant',
     content: '',
     reasoning: '',
     done: false,
   })
-  messages.value.push(assistant)
+  // 气泡在 start 事件后才显示：被拒（含无可继续题目）时不显示任何气泡
+  let assistantShown = false
+  const showBubbles = (userContent: string) => {
+    messages.value.push({
+      role: 'user',
+      content: userContent,
+      reasoning: '',
+      done: true,
+    })
+    messages.value.push(assistant)
+    assistantShown = true
+    stickToBottom = true
+    void nextTick(scrollToBottom)
+  }
   sending.value = true
   stickToBottom = true
   startElapsedTimer()
   controller = new AbortController()
 
+  const requestSettings = currentTurnSettings()
+  const onDelta = (d: { answer: string; reasoning: string }) => {
+    assistant.content += d.answer
+    assistant.reasoning += d.reasoning
+    void nextTick(scrollToBottom)
+  }
+
   try {
-    const result = await streamChat(text, {
-      mode: mode.value,
-      signal: controller.signal,
-      onDelta: (d) => {
-        assistant.content += d.answer
-        assistant.reasoning += d.reasoning
-        void nextTick(scrollToBottom)
-      },
-    })
+    const result =
+      kind === 'chat'
+        ? await streamChat(text, requestSettings, {
+            signal: controller.signal,
+            onStart: () => showBubbles(text),
+            onDelta,
+          })
+        : await continueChat(requestSettings, {
+            signal: controller.signal,
+            // 继续指令由服务端构造，start 事件带回原文仅供展示
+            onStart: (payload) => showBubbles(payload.message),
+            onDelta,
+          })
     if (result.kind === 'rejected') {
-      // 被拒：移除占位的助手气泡，保留用户消息与提示文字
-      messages.value.splice(messages.value.indexOf(assistant), 1)
+      // 被拒：移除占位的助手气泡（如有），保留提示文字
+      if (assistantShown) {
+        messages.value.splice(messages.value.indexOf(assistant), 1)
+      }
       statusText.value = result.payload.message
     } else {
       const d = result.payload
@@ -180,6 +260,14 @@ async function send() {
     sending.value = false
     controller = null
   }
+}
+
+function send() {
+  runTurn('chat', input.value.trim())
+}
+
+function continueTurn() {
+  runTurn('continue')
 }
 
 // ---- 新对话（二次确认，与现有界面一致） ----
@@ -237,8 +325,7 @@ async function onClearClick() {
         <div class="user-bar">
           <span>{{ me.display_name }}</span>
           <select v-model="mode" :disabled="sending" class="mode-select">
-            <option value="解答模式">解答模式</option>
-            <option value="互动模式">互动模式</option>
+            <option v-for="m in modes" :key="m" :value="m">{{ m }}</option>
           </select>
           <button class="ghost" :disabled="sending" @click="onClearClick">
             {{ clearArmed ? '再点一次确认清空' : '🗑️ 新对话' }}
@@ -247,6 +334,58 @@ async function onClearClick() {
         </div>
       </header>
       <p v-if="restoreNotice" class="notice">{{ restoreNotice }}</p>
+
+      <details class="settings">
+        <summary>⚙️ 设置</summary>
+        <div class="settings-grid">
+          <label>
+            服务商
+            <select v-model="providerId" :disabled="sending || !settings">
+              <option v-for="p in settings?.providers ?? []" :key="p.id" :value="p.id">
+                {{ p.name }}
+              </option>
+            </select>
+          </label>
+          <label>
+            模型
+            <select v-model="model" :disabled="sending || !currentProvider">
+              <option v-for="m in currentProvider?.models ?? []" :key="m" :value="m">
+                {{ m }}
+              </option>
+            </select>
+          </label>
+          <label>
+            学段
+            <select v-model="level" :disabled="sending">
+              <option v-for="l in settings?.levels ?? ['小学', '初中', '高中', '大学']" :key="l" :value="l">
+                {{ l }}
+              </option>
+            </select>
+          </label>
+          <template v-if="supportsThinking">
+            <label class="checkbox">
+              <input v-model="thinking" type="checkbox" :disabled="sending" />
+              深度思考模式（更严谨，稍慢）
+            </label>
+            <label>
+              思考强度
+              <select v-model="effort" :disabled="sending">
+                <option value="low">low</option>
+                <option value="high">high</option>
+                <option value="max">max</option>
+              </select>
+            </label>
+          </template>
+          <label v-if="showAnswerStyle">
+            解答风格
+            <select v-model="answerStyle" :disabled="sending">
+              <option v-for="s in settings?.answer_styles ?? []" :key="s" :value="s">
+                {{ s }}
+              </option>
+            </select>
+          </label>
+        </div>
+      </details>
 
       <main ref="chatScroll" class="chat" @scroll="onScroll">
         <div v-if="messages.length === 0" class="placeholder">
@@ -286,6 +425,14 @@ async function onClearClick() {
           placeholder="输入数学问题，回车发送"
           @keydown.enter="send"
         />
+        <button
+          v-if="!sending"
+          class="ghost continue"
+          :disabled="sending"
+          @click="continueTurn"
+        >
+          ▶️ 继续生成
+        </button>
         <button v-if="sending" class="send stop" @click="stopStreaming">⏹ 停止</button>
         <button
           v-else
@@ -346,6 +493,55 @@ async function onClearClick() {
   margin: 4px 0 0;
   font-size: 0.85rem;
   color: #9a6700;
+}
+.settings {
+  border: 1px solid #e1e4e8;
+  border-radius: 10px;
+  margin-top: 8px;
+  font-size: 0.88rem;
+  background: #fafbfc;
+}
+.settings summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 6px 10px;
+  color: #57606a;
+}
+.settings-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 4px 10px 10px;
+}
+.settings-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #57606a;
+}
+.settings-grid label.checkbox {
+  flex-direction: row;
+  align-items: center;
+}
+.settings-grid select {
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+  padding: 4px 6px;
+  background: #fff;
+  font-size: 0.88rem;
+}
+.input-bar .ghost.continue {
+  border: 1px solid #d0d7de;
+  background: #fff;
+  color: #1a73e8;
+  border-radius: 10px;
+  padding: 0 12px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.input-bar .ghost.continue:disabled {
+  opacity: 0.5;
 }
 .login {
   margin: auto;

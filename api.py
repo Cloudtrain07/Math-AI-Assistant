@@ -29,7 +29,7 @@
 
 流式契约（SSE，text/event-stream）：
 - event: rejected  data:{status, message}          准备阶段被拒（含额度/长度/无客户端）
-- event: start     data:{}                          通过校验，开始生成
+- event: start     data:{message}                   通过校验，开始生成（含本轮消息原文，供前端展示）
 - event: delta     data:{answer?, reasoning?}       增量片段（核心累计快照的差分）
 - ": ping" 注释行                                   核心心跳（每秒）转成 SSE 注释保活
 - event: done      data:{...}                       收尾：最终文本、用量、保存/每日状态
@@ -77,6 +77,7 @@ from app import (
 from core import chat_service
 from core import dialogue_state
 from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
+from core.providers import get_provider_supports_thinking
 from core.runtime import AppRuntime, build_runtime
 from core.storage import HistoryReadError
 from core.usage import format_cumulative, new_usage_state
@@ -90,6 +91,10 @@ SESSION_TTL_SECONDS = 7 * 24 * 3600
 LEVELS = ("小学", "初中", "高中", "大学")
 MODES = (MODE_INTERACTIVE, MODE_ANSWER)
 DEFAULT_ANSWER_STYLE = "完整步骤+答案"
+ANSWER_STYLES = ("完整步骤+答案", "简略过程+答案", "只给答案和结论")
+REASONING_EFFORTS = ("low", "high", "max")
+# 继续生成没有可继续题目时的拒绝提示（与旧界面 continue_last_answer 一致）
+NO_CONTINUE_MSG = "💡 还没有可继续的题目，请先提问。"
 
 
 # ===================== 会话与账号聊天状态 =====================
@@ -286,11 +291,24 @@ class LoginBody(BaseModel):
     password: str
 
 
-class ChatBody(BaseModel):
-    message: str
+class TurnSettings(BaseModel):
+    """界面设置：全部可缺省，缺省时按当前注入 runtime 的默认值解析。"""
+
     mode: str = MODE_INTERACTIVE
     level: str | None = None
     thinking: bool | None = None
+    provider_id: str | None = None
+    model: str | None = None
+    answer_style: str | None = None
+    reasoning_effort: str | None = None
+
+
+class ChatBody(TurnSettings):
+    message: str
+
+
+class ContinueBody(TurnSettings):
+    """继续生成：不带消息文本，指令由服务端按服务端历史构造。"""
 
 
 # ===================== SSE 事件映射 =====================
@@ -315,12 +333,118 @@ def _reject_message(status: str, turn: dict, runtime: AppRuntime) -> str:
     return turn.get("reject_message") or "⚠️ 请求被拒绝。"
 
 
-def _default_model(runtime: AppRuntime) -> str:
-    if runtime.default_provider:
-        return str(runtime.default_provider.get("default_model") or "")
-    if runtime.settings is not None:
-        return runtime.settings.model
-    return "deepseek-v4-flash"
+def _resolve_turn_settings(runtime: AppRuntime, username: str, body: TurnSettings) -> dict:
+    """把前端提交的界面设置解析为核心调用参数。
+
+    配置只来自当前注入的 runtime，不重新读取默认配置。区分"字段未提供"
+    与"显式非法值"：显式提交（含空字符串）的非法服务商、模型、学段、
+    思考强度或解答风格一律 400，不静默换成其他模型或当成缺省；
+    字段缺省时按默认值解析——服务商取默认项，客户端缺失时保留启动回退
+    （由核心以 no_client 拒绝并展示启动提示）。
+    """
+    settings = runtime.settings
+
+    if body.level is not None:
+        if body.level not in LEVELS:
+            raise HTTPException(status_code=400, detail="无效的学段")
+        level = body.level
+    else:
+        account_level = next(
+            (
+                a.get("level")
+                for a in runtime.accounts
+                if a["username"] == username
+            ),
+            None,
+        )
+        level = account_level if account_level in LEVELS else "高中"
+
+    if runtime.ui_providers:
+        if body.provider_id is not None:
+            provider_id = body.provider_id
+            provider = next(
+                (p for p in runtime.ui_providers if p["id"] == provider_id), None
+            )
+            if provider is None:
+                raise HTTPException(
+                    status_code=400, detail="不支持的服务商，请刷新页面后重试"
+                )
+            # 显式选择后只使用该服务商的客户端，不可用即拒绝，不回退其他客户端
+            active_client = runtime.clients.get(provider_id)
+            if active_client is None:
+                raise HTTPException(
+                    status_code=400, detail="所选服务商当前不可用，请重新选择"
+                )
+        else:
+            provider_id = (
+                runtime.default_provider["id"] if runtime.default_provider else None
+            )
+            provider = next(
+                (p for p in runtime.ui_providers if p["id"] == provider_id), None
+            )
+            active_client = (
+                runtime.clients.get(provider_id)
+                if provider_id is not None
+                else None
+            )
+            if active_client is None:
+                # 缺省路径保留启动回退：无客户端时由核心 no_client 拒绝
+                active_client = runtime.client
+        if body.model is not None:
+            model = body.model
+            if provider is None or model not in (provider.get("models") or []):
+                raise HTTPException(
+                    status_code=400, detail="所选服务商不支持该模型，请重新选择"
+                )
+        else:
+            model = (
+                provider.get("default_model")
+                if provider is not None
+                else (
+                    settings.model if settings is not None else "deepseek-v4-flash"
+                )
+            )
+    else:
+        # 没有任何可展示服务商（组装回退）：不接受显式服务商或模型
+        if body.provider_id is not None:
+            raise HTTPException(
+                status_code=400, detail="不支持的服务商，请刷新页面后重试"
+            )
+        if body.model is not None:
+            raise HTTPException(
+                status_code=400, detail="所选服务商不支持该模型，请重新选择"
+            )
+        provider = None
+        model = settings.model if settings is not None else "deepseek-v4-flash"
+        active_client = runtime.client
+
+    if body.reasoning_effort is not None:
+        effort = body.reasoning_effort
+        if effort not in REASONING_EFFORTS:
+            raise HTTPException(status_code=400, detail="无效的思考强度")
+    else:
+        effort = settings.reasoning_effort if settings is not None else "high"
+
+    if body.answer_style is not None:
+        answer_style = body.answer_style
+        if answer_style not in ANSWER_STYLES:
+            raise HTTPException(status_code=400, detail="无效的解答风格")
+    else:
+        answer_style = DEFAULT_ANSWER_STYLE
+
+    thinking = (
+        body.thinking
+        if body.thinking is not None
+        else (settings.thinking if settings is not None else False)
+    )
+    return {
+        "client": active_client,
+        "model": model,
+        "level": level,
+        "thinking": thinking,
+        "reasoning_effort": effort,
+        "answer_style": answer_style,
+    }
 
 
 def _done_payload(
@@ -368,13 +492,21 @@ def chat_event_stream(
     runtime: AppRuntime,
     registry: ChatRegistry,
     username: str,
-    body: ChatBody,
+    body: TurnSettings,
     ip: str,
+    resolved: dict,
+    *,
+    force_continue: bool = False,
 ):
     """核心 run_chat_turn 事件 → SSE 文本流（同步生成器，Starlette 线程池执行）。
 
     生成期间若账号被清空（epoch 变化），完成时不写回内存状态，
     done 的会话累计改按清空后的状态显示；磁盘侧由核心保存标记判 stale。
+
+    force_continue=True 时为「继续生成」：在 begin_turn 取得的服务端状态上
+    用 build_continue_message 构造指令并向核心传 force_continue，与普通发送
+    共享 busy、清空守卫、SSE、用量结算与保存；无可继续题目以 no_continue
+    拒绝且不调用模型。
     """
     turn = registry.begin_turn(runtime, username)
     if turn is None:
@@ -389,24 +521,20 @@ def chat_event_stream(
     state, start_epoch, turn_token = turn
 
     try:
-        account_level = None
-        for account in runtime.accounts:
-            if account["username"] == username:
-                account_level = account.get("level")
-                break
-        level = body.level if body.level in LEVELS else (
-            account_level if account_level in LEVELS else "高中"
-        )
-        thinking = (
-            body.thinking
-            if body.thinking is not None
-            else (runtime.settings.thinking if runtime.settings is not None else False)
-        )
+        if force_continue:
+            message = chat_service.build_continue_message(state.history, IMAGE_NOTE)
+            if message is None:
+                yield _sse("rejected", {"status": "no_continue", "message": NO_CONTINUE_MSG})
+                return
+        else:
+            message = body.message
+
+        level = resolved["level"]
 
         prev_answer = ""
         prev_reasoning = ""
         for event in chat_service.run_chat_turn(
-            message=body.message,
+            message=message,
             history=state.history,
             usage_state=state.usage_state,
             username=username,
@@ -416,15 +544,11 @@ def chat_event_stream(
             mode=body.mode,
             stage_state=state.stage_state,
             image_state=None,
-            thinking=thinking,
-            model=_default_model(runtime),
-            reasoning_effort=(
-                runtime.settings.reasoning_effort
-                if runtime.settings is not None
-                else "high"
-            ),
-            answer_style=DEFAULT_ANSWER_STYLE,
-            active_client=runtime.client,
+            thinking=resolved["thinking"],
+            model=resolved["model"],
+            reasoning_effort=resolved["reasoning_effort"],
+            answer_style=resolved["answer_style"],
+            active_client=resolved["client"],
             history_compressor=runtime.history_compressor,
             history_store=runtime.history_store,
             daily_usage_store=runtime.daily_usage_store,
@@ -440,6 +564,7 @@ def chat_event_stream(
             image_only_prompt=_IMAGE_ONLY_PROMPT,
             image_note=IMAGE_NOTE,
             turn_token=turn_token,
+            force_continue=force_continue,
         ):
             event_type = event["type"]
             turn = event["turn"]
@@ -455,7 +580,8 @@ def chat_event_stream(
                 return
 
             if event_type == "ready":
-                yield _sse("start", {})
+                # start 携带本轮消息原文，供前端展示继续生成的指令
+                yield _sse("start", {"message": message})
                 continue
 
             reply = event["reply"]
@@ -599,6 +725,47 @@ def create_api_app(
             return {"ok": False, "message": "⚠️ 清空未成功，请稍后重试。"}
         return {"ok": True, "message": "🗑️ 已开启新对话。"}
 
+    @app.get("/api/settings")
+    def read_settings(username: str = Depends(_current_user)):
+        """界面设置清单：只含展示所需字段，全部来自当前注入的 runtime。
+
+        不返回 base_url、api_key 环境变量、内部连接地址或客户端对象等
+        非展示配置；默认模型与模型选项同源，前端无需二次推断。
+        """
+        rt = app.state.runtime
+        account = next(
+            (a for a in rt.accounts if a["username"] == username), None
+        )
+        level = account.get("level") if account else None
+        return {
+            "providers": [
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "models": list(p.get("models") or []),
+                    "default_model": p.get("default_model"),
+                    "supports_thinking": get_provider_supports_thinking(p),
+                }
+                for p in rt.ui_providers
+            ],
+            "default_provider": (
+                rt.default_provider["id"] if rt.default_provider else None
+            ),
+            "levels": list(LEVELS),
+            "modes": list(MODES),
+            "answer_styles": list(ANSWER_STYLES),
+            "default_level": level if level in LEVELS else "高中",
+            "default_mode": MODE_INTERACTIVE,
+            "default_answer_style": DEFAULT_ANSWER_STYLE,
+            "default_thinking": (
+                rt.settings.thinking if rt.settings is not None else False
+            ),
+            "default_reasoning_effort": (
+                rt.settings.reasoning_effort if rt.settings is not None else "high"
+            ),
+            "startup_hint": rt.startup_hint,
+        }
+
     @app.post("/api/chat", dependencies=[Depends(_same_origin)])
     def chat(
         body: ChatBody,
@@ -607,9 +774,40 @@ def create_api_app(
     ):
         if body.mode not in MODES:
             raise HTTPException(status_code=400, detail="不支持的模式")
+        resolved = _resolve_turn_settings(app.state.runtime, username, body)
         ip = (request.client.host if request.client else None) or "unknown"
         return ClosingStreamingResponse(
-            chat_event_stream(app.state.runtime, app.state.registry, username, body, ip),
+            chat_event_stream(
+                app.state.runtime, app.state.registry, username, body, ip, resolved
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/api/continue", dependencies=[Depends(_same_origin)])
+    def continue_turn(
+        body: ContinueBody,
+        request: Request,
+        username: str = Depends(_current_user),
+    ):
+        """继续生成：服务端历史 + build_continue_message + force_continue=True。"""
+        if body.mode not in MODES:
+            raise HTTPException(status_code=400, detail="不支持的模式")
+        resolved = _resolve_turn_settings(app.state.runtime, username, body)
+        ip = (request.client.host if request.client else None) or "unknown"
+        return ClosingStreamingResponse(
+            chat_event_stream(
+                app.state.runtime,
+                app.state.registry,
+                username,
+                body,
+                ip,
+                resolved,
+                force_continue=True,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

@@ -155,3 +155,45 @@ def test_normal_completion_closes_and_full_contract(server):
         while not fake.closed and time.time() < deadline:
             time.sleep(0.05)
         assert fake.closed
+
+
+def test_continue_disconnect_releases_busy(server):
+    """继续生成断连：上游确定性关闭、busy 释放，后续请求可正常进行。"""
+    base, api_runtime = server
+    fake: SlowClient = api_runtime.client
+    account = api_runtime.accounts[0]
+    username = account["username"]
+
+    # 预置服务端历史，使继续生成有可继续题目
+    store = api_runtime.history_store
+    store.save(
+        [
+            {"role": "user", "content": "会被中断的题目"},
+            {"role": "assistant", "content": "未完成的回答"},
+        ],
+        username=username,
+        turn_token=store.start_turn(username),
+    )
+
+    with httpx.Client(base_url=base) as client:
+        login(client, account)
+        with client.stream("POST", "/api/continue", json={}) as stream:
+            assert stream.status_code == 200
+            got_delta = False
+            for line in stream.iter_lines():
+                if line.startswith("event: delta"):
+                    got_delta = True
+                    break
+            assert got_delta, "中断前未收到任何增量"
+        # 退出 with：客户端停止读取 → 断连 → 生成器链被确定性 close
+        deadline = time.time() + 5
+        while not fake.closed and time.time() < deadline:
+            time.sleep(0.05)
+        assert fake.closed, "断连后上游生成器未被确定性关闭"
+
+    # busy 已释放：普通发送可正常完成
+    with httpx.Client(base_url=base, timeout=30) as client:
+        login(client, account)
+        resp = client.post("/api/chat", json={"message": "中断后的新问题"})
+        assert "event: done" in resp.text
+        assert "event: rejected" not in resp.text
