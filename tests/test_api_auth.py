@@ -83,6 +83,33 @@ def test_login_logs_access_event(api_runtime):
     assert any("成功" in part for part in results[1])
 
 
+def test_login_side_effects_not_duplicated(api_runtime):
+    """登录副作用唯一：每次登录恰好 1 条日志、成功登录恰好 +1 次计数
+    （解耦后由 core.login.verify_login 提供，新 API 与旧界面共用）。"""
+    import datetime
+
+    from conftest import MemoryDailyUsageStore, MemoryEventLogger
+
+    store = MemoryDailyUsageStore()
+    logger = MemoryEventLogger()
+    api_runtime.daily_usage_store = store
+    api_runtime.event_logger = logger
+    tc = TestClient(create_api_app(api_runtime))
+    account = _first_account(api_runtime)
+    today = datetime.date.today().isoformat()
+    tc.post(
+        "/api/login",
+        json={"username": account["username"], "password": "bad"},
+    )
+    tc.post(
+        "/api/login",
+        json={"username": account["username"], "password": account["password"]},
+    )
+    assert store.get_logins(today) == 1
+    login_events = [parts for parts in logger.access_events if parts[0] == "登录"]
+    assert len(login_events) == 2  # 失败 + 成功各一条，无重复
+
+
 def test_logout_invalidates_session(client):
     tc, runtime = client
     account = _first_account(runtime)

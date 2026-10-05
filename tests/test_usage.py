@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as app_module
 from conftest import MemoryDailyUsageStore, MemoryEventLogger
+from core import login as login_module
 from core.usage import (
     check_daily_quota,
     estimate_tokens,
@@ -204,7 +205,8 @@ def _fake_request():
 def test_check_login_records_login_and_keeps_result(monkeypatch, app_runtime):
     store = MemoryDailyUsageStore()
     monkeypatch.setattr(app_runtime, "daily_usage_store", store)
-    monkeypatch.setattr(app_module, "check_login", lambda u, p, path=None: True)
+    # 校验接缝已下沉 core.login（app._check_login 经 verify_login 委托）
+    monkeypatch.setattr(login_module, "check_login", lambda u, p, path=None: True)
     monkeypatch.setattr(app_runtime, "event_logger", MemoryEventLogger())
 
     assert app_module._check_login(app_runtime, "user1", "pw") is True
@@ -219,7 +221,7 @@ def test_check_login_failure_keeps_result_and_logs(monkeypatch, app_runtime):
     store = FailingLoginStore()
     logger = MemoryEventLogger()
     monkeypatch.setattr(app_runtime, "daily_usage_store", store)
-    monkeypatch.setattr(app_module, "check_login", lambda u, p, path=None: True)
+    monkeypatch.setattr(login_module, "check_login", lambda u, p, path=None: True)
     monkeypatch.setattr(app_runtime, "event_logger", logger)
 
     # 登录次数记录失败不改变密码校验结果，并留下明确失败信息

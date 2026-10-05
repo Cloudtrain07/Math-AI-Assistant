@@ -9,6 +9,8 @@ export interface UserInfo {
   username: string
   display_name: string
   level: string
+  /** 仅本机直连的登录用户为 true；远程用户据此不展示、不请求管理数据 */
+  local_admin?: boolean
 }
 
 export interface ChatMessage {
@@ -226,6 +228,52 @@ export async function removeImage(): Promise<{ ok: boolean; message?: string }> 
   const resp = await fetch('/api/images', { method: 'DELETE' })
   if (!resp.ok) return { ok: false }
   return await resp.json()
+}
+
+// ---- 管理员接口（后端仅放行本机直连的已登录用户） ----
+
+export interface AdminAccountUsage {
+  username: string
+  display_name: string
+  enabled: boolean
+  /** 今日已用 tokens */
+  used: number
+}
+
+export interface AdminStats {
+  date: string
+  global_used: number
+  global_daily_limit: number
+  logins: number
+  questions: number
+  accounts: AdminAccountUsage[]
+}
+
+/** 读取今日管理统计；未登录 401、非本机 403、读取失败 503，均抛可展示错误 */
+export async function fetchAdminStats(): Promise<AdminStats> {
+  const resp = await fetch('/api/admin/stats')
+  const body = await readJson(resp)
+  if (!resp.ok) {
+    throw new Error((body && body.detail) || '用量数据读取失败，请稍后重试')
+  }
+  return body as AdminStats
+}
+
+/** 重置指定账号密码；请求与响应、日志都不包含任何密码 */
+export async function adminResetPassword(
+  username: string,
+  newPassword: string,
+): Promise<{ ok: boolean }> {
+  const resp = await fetch('/api/admin/reset-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, new_password: newPassword }),
+  })
+  const body = await readJson(resp)
+  if (!resp.ok) {
+    throw new Error((body && body.detail) || '重置失败，请稍后重试')
+  }
+  return body as { ok: boolean }
 }
 
 /** 发送一条消息并消费 SSE 流；imageId 来自发送前的 uploadImage。 */

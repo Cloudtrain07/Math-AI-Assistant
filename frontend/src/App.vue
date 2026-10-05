@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import StreamMessage from './components/StreamMessage.vue'
 import ImageEditorDialog from './components/ImageEditorDialog.vue'
+import AdminPanel from './components/AdminPanel.vue'
 import {
   clearConversation,
   continueChat,
@@ -552,6 +553,10 @@ async function onClearClick() {
           </label>
         </div>
       </details>
+
+      <!-- 管理区域：仅本机直连的登录用户挂载（local_admin 由后端判定），
+           默认折叠、首次展开才请求统计，远程用户不加载管理数据 -->
+      <AdminPanel v-if="me.local_admin" />
 
       <main ref="chatScroll" class="chat" @scroll="onScroll">
         <div v-if="messages.length === 0" class="placeholder">

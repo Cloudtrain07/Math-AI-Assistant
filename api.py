@@ -3,13 +3,13 @@
 本层只做协议适配：额度判断、阶段推进、上下文压缩、模型调用、历史保存、
 用量结算与日志全部留在 core.chat_service，不在 API 层复制。
 
-剩余耦合（已知且暂不重构）：本层从 app.py 导入登录副作用与展示文案
-（_check_login、_friendly_error、提示常量），而 app.py 依赖 gradio，
-因此新 API 间接依赖 Gradio；"core/app 零改动"不是硬性指标，
-后续如需解耦可把这些纯展示常量与登录日志下沉到 core，再由两界面共用。
+剩余耦合（已解除）：登录副作用与展示文案原从 app.py 导入，现下沉到
+core.login（校验+日志+登录计数唯一入口）与 core.ui_text（共用文案与
+用量/错误格式化），由两界面共同引用；本层不再导入 app 或 gradio。
 
 身份与会话：
-- 复用 accounts.check_login（经 app._check_login，含访问日志与登录计数）；
+- 复用 core.accounts.check_login（经 core.login.verify_login，
+  含访问日志与登录计数）；
 - 会话为服务端内存 token（secrets.token_urlsafe），经 HttpOnly + SameSite=Lax
   Cookie 下发，进程重启即失效需重新登录；不引入数据库；
 - 写请求做同源校验（浏览器 POST 带 Origin 时必须与 Host 一致），
@@ -56,6 +56,19 @@
   文件释放在注册表锁内完成；生成中清空时文件物理删除延迟到旧轮次
   release 释放引用之后（只删清空时记录的精确路径，不误删清空后新上传）；
   启动时清理超过 24 小时的历史残留。
+
+管理员能力（仅本机）：
+- 判定在服务端：已登录会话 + client.host 为回环地址 + 不带任何转发头
+  （Forwarded / X-Forwarded-* / X-Real-IP / Via）+ Host 头为回环 +
+  Origin（浏览器写请求携带时）为回环。任一不满足一律 403；
+- 统计接口读取失败返回 503 错误，不返回伪装成正常的全零数据；
+- 重置密码复用 core.accounts.reset_password，成功后重载 runtime.accounts
+  并记录审计日志；接口不返回也不记录任何密码；
+- 局限（如实说明）：不设置转发头且不改写 Host 的同机反向代理在应用层
+  无法与真实本机用户区分，此类部署需在部署侧保证（不要在回环上挂无
+  转发头的代理）；
+- 会话策略：重置密码不使现有会话失效（会话 token 与密码无关），
+  旧密码不能再建立新会话；不提供"踢出所有设备"。
 """
 
 from __future__ import annotations
@@ -78,27 +91,31 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 
-# 复用 app.py 的登录副作用与用户文案映射，保持新旧界面提示一致
-from app import (
-    _DAILY_FAILED_MSG,
-    _DAILY_STATS_FAILED_MSG,
-    _IMAGE_ONLY_PROMPT,
-    _QUOTA_CHECK_FAILED_MSG,
-    _RESTORE_FAILED_MSG,
-    _SAVE_FAILED_MSG,
-    _SAVE_STALE_MSG,
-    _check_login,
-    _friendly_error,
-    IMAGE_NOTE,
-    format_usage,
-)
+# 与旧界面共用：登录副作用与文案/格式化来自 core，本层不依赖 app/gradio
 from core import chat_service
 from core import dialogue_state
+from core.access import is_owner_host
+from core.accounts import load_accounts, reset_password
+from core.login import verify_login
 from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
 from core.providers import get_provider_supports_thinking
 from core.runtime import AppRuntime, build_runtime
 from core.storage import HistoryReadError, safe_account_name
+from core.ui_text import (
+    DAILY_FAILED_MSG,
+    DAILY_STATS_FAILED_MSG,
+    IMAGE_NOTE,
+    IMAGE_ONLY_PROMPT,
+    NO_CONTINUE_MSG,
+    QUOTA_CHECK_FAILED_MSG,
+    RESTORE_FAILED_MSG,
+    SAVE_FAILED_MSG,
+    SAVE_STALE_MSG,
+    format_usage,
+    friendly_error,
+)
 from core.usage import format_cumulative, new_usage_state
+from core.usage_store import DailyUsageReadError
 from core.vision_client import MAX_IMAGE_BYTES, SUPPORTED_EXTS
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -112,8 +129,6 @@ MODES = (MODE_INTERACTIVE, MODE_ANSWER)
 DEFAULT_ANSWER_STYLE = "完整步骤+答案"
 ANSWER_STYLES = ("完整步骤+答案", "简略过程+答案", "只给答案和结论")
 REASONING_EFFORTS = ("low", "high", "max")
-# 继续生成没有可继续题目时的拒绝提示（与旧界面 continue_last_answer 一致）
-NO_CONTINUE_MSG = "💡 还没有可继续的题目，请先提问。"
 
 # 上传图片的像素上限：只用于防解压炸弹，不做清晰度压缩。
 # 依据：主流手机照片 12–48MP，50MP 覆盖绝大多数真实照片；
@@ -325,7 +340,7 @@ class ChatRegistry:
             history = runtime.history_store.load(username)
         except HistoryReadError as exc:
             history = []
-            load_error = _RESTORE_FAILED_MSG.format(detail=exc)
+            load_error = RESTORE_FAILED_MSG.format(detail=exc)
         return ChatState(
             history=history,
             usage_state=new_usage_state(),
@@ -537,9 +552,69 @@ def _current_user(request: Request) -> str:
     return username
 
 
+# ===================== 本机管理员判定 =====================
+
+# 与 core.access.is_owner_host 一致的回环判定；Host/Origin 头的回环形态
+# （含端口）另行解析
+_FORWARDED_HEADERS = (
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "via",
+)
+
+
+def _host_header_is_loopback(value: str) -> bool:
+    """解析 Host/Origin 的 netloc（剥掉端口与 IPv6 方括号）后判回环。"""
+    host = (value or "").strip().lower()
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return is_owner_host(host)
+
+
+def _is_local_admin_request(request: Request) -> bool:
+    """本机直连判定：回环来源 + 无转发头 + 回环 Host/Origin，全部满足才放行。
+
+    - 远程直连：client.host 非回环，拒绝；
+    - 本机反代/隧道转来的外部请求：通常带转发头或 Host 已改写为外部域名，
+      转发头**存在**即拒绝（含空值头，不看其内容），伪造头也无法借此提权；
+    - uvicorn 默认 proxy_headers 会信任来自回环的 X-Forwarded-For 并改写
+      client.host：转发头一票否决同时覆盖了这一路径；
+    - 无法区分"不设转发头且不改写 Host 的同机反代"，如实按局限对待。
+    """
+    client_host = (request.client.host if request.client else "") or ""
+    if not is_owner_host(client_host):
+        return False
+    if any(name in request.headers for name in _FORWARDED_HEADERS):
+        return False
+    if not _host_header_is_loopback(request.headers.get("host", "")):
+        return False
+    origin = request.headers.get("origin")
+    if origin and not _host_header_is_loopback(urllib.parse.urlsplit(origin).netloc):
+        return False
+    return True
+
+
+def _require_local_admin(request: Request) -> str:
+    """管理员接口依赖：先要求已登录（401），再要求本机直连（403）。"""
+    username = _current_user(request)
+    if not _is_local_admin_request(request):
+        raise HTTPException(status_code=403, detail="管理员功能仅限本机登录用户使用")
+    return username
+
+
 class LoginBody(BaseModel):
     username: str
     password: str
+
+
+class AdminResetPasswordBody(BaseModel):
+    username: str
+    new_password: str
 
 
 class TurnSettings(BaseModel):
@@ -580,7 +655,7 @@ def _reject_message(status: str, turn: dict, runtime: AppRuntime) -> str:
             f"⚠️ 消息过长（最多 {runtime.max_message_len:,} 字符），请精简后重试。"
         )
     if status == "quota_read_failed":
-        return _QUOTA_CHECK_FAILED_MSG
+        return QUOTA_CHECK_FAILED_MSG
     if status == "no_client":
         return f"⚠️ {runtime.startup_hint}" if runtime.startup_hint else "⚠️ 模型客户端不可用。"
     return turn.get("reject_message") or "⚠️ 请求被拒绝。"
@@ -710,7 +785,7 @@ def _done_payload(
         "answer": _normalize_final(reply["answer"]),
         "reasoning_text": _normalize_final(reply["reasoning_text"]),
         "truncated": reply["truncated"],
-        "error": _friendly_error(result["error"]) if result["error"] else "",
+        "error": friendly_error(result["error"]) if result["error"] else "",
         "empty_reply": not reply["answer"] and result["error"] is None,
         "turn_total": result["turn_total"],
         "usage_note": format_usage(reply["usage"]),
@@ -719,13 +794,13 @@ def _done_payload(
         "save_note": {
             None: "",
             "saved": "",
-            "failed": _SAVE_FAILED_MSG,
-            "stale": _SAVE_STALE_MSG,
+            "failed": SAVE_FAILED_MSG,
+            "stale": SAVE_STALE_MSG,
         }[save_status],
         "daily_note": {
             "recorded": "",
-            "record_failed": _DAILY_FAILED_MSG,
-            "stats_failed": _DAILY_STATS_FAILED_MSG,
+            "record_failed": DAILY_FAILED_MSG,
+            "stats_failed": DAILY_STATS_FAILED_MSG,
         }.get(daily_result["status"], "") if daily_result is not None else "",
         "daily_used": daily_result["daily_used"] if daily_result else None,
         "global_used": daily_result["global_used"] if daily_result else None,
@@ -840,7 +915,7 @@ def chat_event_stream(
             ),
             daily_limit=runtime.daily_limit,
             global_daily_limit=runtime.global_daily_limit,
-            image_only_prompt=_IMAGE_ONLY_PROMPT,
+            image_only_prompt=IMAGE_ONLY_PROMPT,
             image_note=IMAGE_NOTE,
             turn_token=turn_token,
             force_continue=force_continue,
@@ -966,9 +1041,9 @@ def create_api_app(
         pass
 
     @app.post("/api/login", dependencies=[Depends(_same_origin)])
-    def login(body: LoginBody, response: Response):
+    def login(body: LoginBody, request: Request, response: Response):
         username = body.username.strip()
-        ok = _check_login(runtime, username, body.password)
+        ok = verify_login(runtime, username, body.password)
         if not ok:
             raise HTTPException(status_code=401, detail="用户名或密码不正确")
         token = app.state.sessions.create(username)
@@ -987,6 +1062,7 @@ def create_api_app(
             "username": username,
             "display_name": account.get("display_name") if account else username,
             "level": account.get("level") if account else "高中",
+            "local_admin": _is_local_admin_request(request),
         }
 
     @app.post("/api/logout", dependencies=[Depends(_same_origin)])
@@ -996,7 +1072,7 @@ def create_api_app(
         return {"ok": True}
 
     @app.get("/api/me")
-    def me(username: str = Depends(_current_user)):
+    def me(request: Request, username: str = Depends(_current_user)):
         account = next(
             (a for a in runtime.accounts if a["username"] == username), None
         )
@@ -1004,6 +1080,8 @@ def create_api_app(
             "username": username,
             "display_name": account.get("display_name") if account else username,
             "level": account.get("level") if account else "高中",
+            # 远程用户为 False：前端据此不展示、不请求管理员数据
+            "local_admin": _is_local_admin_request(request),
         }
 
     @app.get("/api/history")
@@ -1156,6 +1234,73 @@ def create_api_app(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # ===================== 管理员接口（仅本机直连的已登录用户） =====================
+
+    @app.get("/api/admin/stats")
+    def admin_stats(username: str = Depends(_require_local_admin)):
+        """今日全局用量/登录/提问次数与各账号用量（结构化，不含密码）。
+
+        读取失败返回 503 固定提示：明确报错，不返回伪装成正常的全零数据，
+        响应与诊断日志都不含异常详情（可能带内部路径）。
+        """
+        rt = app.state.runtime
+        today = datetime.date.today().isoformat()
+        try:
+            store = rt.daily_usage_store
+            global_used = store.get_total(today)
+            per_account = store.get_account_usage(today)
+            logins = store.get_logins(today)
+            questions = store.get_questions(today)
+        except Exception as exc:
+            # 诊断日志只记异常类型名：异常消息可能含内部路径、Key 等敏感信息
+            try:
+                rt.event_logger.log_access_event(
+                    "用量统计读取失败", f"类型={type(exc).__name__}"
+                )
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=503, detail="今日用量读取失败，请稍后重试"
+            )
+        return {
+            "date": today,
+            "global_used": global_used,
+            "global_daily_limit": rt.global_daily_limit,
+            "logins": logins,
+            "questions": questions,
+            "accounts": [
+                {
+                    "username": a["username"],
+                    "display_name": a.get("display_name") or a["username"],
+                    "enabled": bool(a.get("enabled", True)),
+                    "used": int(per_account.get(a["username"], 0) or 0),
+                }
+                for a in rt.accounts
+            ],
+        }
+
+    @app.post("/api/admin/reset-password", dependencies=[Depends(_same_origin)])
+    def admin_reset_password(
+        body: AdminResetPasswordBody,
+        username: str = Depends(_require_local_admin),
+    ):
+        """本机管理员重置指定账号的密码（复用 core.accounts.reset_password）。
+
+        成功后重载 runtime.accounts 保持清单一致，并记录审计日志；
+        请求与响应、日志都不包含旧密码或新密码。
+        """
+        rt = app.state.runtime
+        account_name = body.username.strip()
+        if not account_name:
+            raise HTTPException(status_code=400, detail="请选择要重置的账号")
+        if not body.new_password.strip():
+            raise HTTPException(status_code=400, detail="新密码不能为空")
+        if not reset_password(account_name, body.new_password, path=rt.accounts_path):
+            raise HTTPException(status_code=404, detail="账号不存在，请刷新后重试")
+        rt.accounts = load_accounts(rt.accounts_path)
+        rt.event_logger.log_access_event("重置密码", f"账号={account_name}")
+        return {"ok": True, "username": account_name}
 
     if frontend_dir == "default":
         frontend_dir = FRONTEND_DIST
