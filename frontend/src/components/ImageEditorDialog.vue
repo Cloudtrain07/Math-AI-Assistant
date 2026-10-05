@@ -45,11 +45,15 @@ let objectUrl = ''
 let baseRotation = 0
 let naturalWidth = 0
 let naturalHeight = 0
+/** 打开前的触发元素：关闭（含 Esc/取消/确认）后把焦点还给调用处 */
+let lastTrigger: HTMLElement | null = null
 
 watch(
   () => props.open,
   async (open) => {
     if (open) {
+      lastTrigger =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null
       if (props.source) objectUrl = URL.createObjectURL(props.source.blob)
       baseRotation = 0
       fineAngle.value = 0
@@ -59,6 +63,8 @@ watch(
       imgEl.value?.focus()
     } else {
       destroy()
+      lastTrigger?.focus()
+      lastTrigger = null
     }
   },
 )
@@ -305,24 +311,27 @@ async function onUseOriginal() {
 </template>
 
 <style scoped>
+/* 深色弹窗：编辑区保持中性浅色棋盘底，图片像素不做任何滤镜/混合处理，
+   裁剪框与控制点用主色（亮蓝）确保深底上清晰 */
 .editor-overlay {
   position: fixed;
   inset: 0;
   z-index: 60;
-  background: rgba(15, 23, 42, 0.55);
+  background: rgba(0, 0, 0, 0.55);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 16px;
 }
 .editor-dialog {
-  background: #fff;
-  border-radius: 14px;
+  background: var(--surface, #1d1f26);
+  border: 1px solid var(--line, #343843);
+  border-radius: var(--radius-card, 12px);
   width: min(680px, 100%);
   max-height: min(92dvh, 760px);
   display: flex;
   flex-direction: column;
-  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.28);
+  box-shadow: var(--shadow-pop, 0 2px 10px rgba(0, 0, 0, 0.3));
   overflow: hidden;
 }
 .editor-header {
@@ -334,7 +343,7 @@ async function onUseOriginal() {
 .editor-header h2 {
   margin: 0;
   font-size: 1rem;
-  color: #1f2328;
+  color: var(--ink, #e4e6eb);
 }
 .icon-btn {
   border: none;
@@ -343,14 +352,14 @@ async function onUseOriginal() {
   height: 30px;
   border-radius: 8px;
   cursor: pointer;
-  color: #57606a;
+  color: var(--ink-2, #a9afbb);
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
 .icon-btn:hover {
-  background: #f0f3f7;
-  color: #1f2328;
+  background: var(--surface-2, #262932);
+  color: var(--ink, #e4e6eb);
 }
 .icon-btn svg,
 .tool svg {
@@ -365,12 +374,12 @@ async function onUseOriginal() {
 .editor-hint {
   margin: 0 16px 8px;
   font-size: 0.82rem;
-  color: #8b949e;
+  color: var(--ink-3, #7d8492);
 }
 .crop-stage {
   margin: 0 16px;
   height: clamp(220px, 44vh, 420px);
-  border: 1px solid #e1e4e8;
+  border: 1px solid var(--line, #343843);
   border-radius: 10px;
   overflow: hidden;
   background:
@@ -382,13 +391,13 @@ async function onUseOriginal() {
   max-width: 100%;
   outline: none;
 }
-/* 裁剪框与控制点在浅色棋盘上保持清晰 */
+/* 裁剪框与控制点：主色亮蓝在深底与浅色图片上都保持清晰 */
 .crop-stage :deep(.cropper-view-box) {
-  outline: 1.5px solid #1a73e8;
+  outline: 1.5px solid var(--accent, #7c9cff);
 }
 .crop-stage :deep(.cropper-line),
 .crop-stage :deep(.cropper-point) {
-  background-color: #1a73e8;
+  background-color: var(--accent, #7c9cff);
 }
 .crop-stage :deep(.cropper-point) {
   width: 7px;
@@ -403,9 +412,9 @@ async function onUseOriginal() {
   padding: 10px 16px 4px;
 }
 .tool {
-  border: 1px solid #d0d7de;
-  background: #fff;
-  color: #43505e;
+  border: 1px solid var(--line, #343843);
+  background: var(--surface, #1d1f26);
+  color: var(--ink-2, #a9afbb);
   width: 34px;
   height: 34px;
   border-radius: 9px;
@@ -415,12 +424,13 @@ async function onUseOriginal() {
   justify-content: center;
 }
 .tool:hover:not(:disabled) {
-  border-color: #1a73e8;
-  color: #1a73e8;
-  background: #f2f7ff;
+  border-color: var(--accent, #7c9cff);
+  color: var(--accent, #7c9cff);
+  background: var(--accent-weak, #232b45);
 }
 .tool:disabled {
-  opacity: 0.45;
+  border-color: var(--line-soft, #2b2f38);
+  color: var(--ink-3, #7d8492);
   cursor: default;
 }
 .tool svg {
@@ -435,23 +445,23 @@ async function onUseOriginal() {
   min-width: 160px;
   max-width: 240px;
   padding: 0 6px;
-  color: #57606a;
+  color: var(--ink-2, #a9afbb);
   font-size: 0.82rem;
 }
 .fine input[type='range'] {
   flex: 1;
-  accent-color: #1a73e8;
+  accent-color: var(--accent, #7c9cff);
 }
 .fine-val {
   min-width: 34px;
   text-align: right;
   font-variant-numeric: tabular-nums;
-  color: #1f2328;
+  color: var(--ink, #e4e6eb);
 }
 .toolbar-divider {
   width: 1px;
   height: 20px;
-  background: #e1e4e8;
+  background: var(--line, #343843);
 }
 .editor-footer {
   display: flex;
@@ -463,12 +473,12 @@ async function onUseOriginal() {
 }
 .editor-note {
   font-size: 0.82rem;
-  color: #8b949e;
+  color: var(--ink-3, #7d8492);
   flex: 1;
   min-width: 120px;
 }
 .editor-note.warn {
-  color: #9a6700;
+  color: var(--warn, #d9a441);
 }
 .editor-actions {
   display: flex;
@@ -482,31 +492,37 @@ async function onUseOriginal() {
   white-space: nowrap;
 }
 .btn.ghost {
-  border: 1px solid #d0d7de;
-  background: #fff;
-  color: #1f2328;
+  border: 1px solid var(--line, #343843);
+  background: var(--surface, #1d1f26);
+  color: var(--ink, #e4e6eb);
 }
 .btn.ghost:hover:not(:disabled) {
-  border-color: #1a73e8;
-  color: #1a73e8;
+  border-color: var(--accent, #7c9cff);
+  color: var(--accent, #7c9cff);
+  background: var(--accent-weak, #232b45);
 }
 .btn.primary {
   border: none;
-  background: #1a73e8;
-  color: #fff;
+  background: var(--accent, #7c9cff);
+  color: var(--accent-contrast, #14151a);
+  font-weight: 550;
 }
 .btn.primary:hover:not(:disabled) {
-  background: #1765cc;
+  background: var(--accent-deep, #93b0ff);
 }
 .btn:disabled {
-  opacity: 0.5;
+  border-color: var(--line-soft, #2b2f38);
+  color: var(--ink-3, #7d8492);
   cursor: default;
+}
+.btn.primary:disabled {
+  background: #2b3148;
 }
 .btn:focus-visible,
 .tool:focus-visible,
 .icon-btn:focus-visible {
-  outline: 2px solid #1a73e8;
-  outline-offset: 1px;
+  outline: none;
+  box-shadow: var(--focus-ring, 0 0 0 2px #14151a, 0 0 0 4px #7c9cff);
 }
 @media (max-width: 560px) {
   .editor-overlay {

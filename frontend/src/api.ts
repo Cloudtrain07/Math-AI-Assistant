@@ -29,6 +29,7 @@ export interface DonePayload {
   cumulative_usage: string
   save_note: string
   save_status: string | null
+  daily_status: string | null
   daily_note: string
   daily_used: number | null
   global_used: number | null

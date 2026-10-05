@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import StreamMessage from './components/StreamMessage.vue'
+import { installFormulaProbe, type FormulaProbeHandle } from './streaming/formulaProbe'
 import {
   buildChunks,
   mockAnswer,
@@ -26,25 +27,11 @@ const currentScenario = ref<Scenario>('normal')
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-// ---- 公式 DOM 稳定性观测 v2 ----
-// 追踪每个公式容器（data-stream-math）及其内部的 KaTeX 排版节点：
-// - 容器多次创建 → 重建异常
-// - 容器被移除 → 删除异常（流式中任何已登记容器被移除都算异常）
-// - 容器内部子节点被替换/增删 → 内部替换异常
-// 正常清空/重播不由 DOM 变化推断：只有 play()/reset() 里的 resetDebug()
-// 这个显式操作会同步清空记录，且它总是发生在引发 DOM 清空的状态变更之前，
-// 因此流式中出现的任何删除都无法被"当作清空"漏报。
-interface FormulaRecord {
-  creations: number
-  removals: number
-  internalReplacements: number
-  signature: string
-  samples: string[]
-}
-
+// ---- 公式 DOM 稳定性观测 v2（复用共享探针模块） ----
+// 追踪每个公式容器（data-stream-math）及其内部 KaTeX 排版节点的创建、删除与替换；
+// 清空只能由 resetDebug() 显式触发（总是发生在引发 DOM 清空的状态变更之前）。
 const chatRoot = ref<HTMLElement | null>(null)
-let observer: MutationObserver | null = null
-const records = new Map<string, FormulaRecord>()
+let probe: FormulaProbeHandle | null = null
 const stats = reactive({
   containers: 0,
   creations: 0,
@@ -53,114 +40,26 @@ const stats = reactive({
   anomalies: [] as { key: string; type: string; at: number; detail: string }[],
 })
 
-function describeNode(n: Node): string {
-  if (!(n instanceof Element)) return n.nodeName
-  const cls = n.getAttribute('class') ?? ''
-  return `${n.tagName.toLowerCase()}${cls ? '.' + cls.split(' ')[0] : ''}`
-}
-
-function keysIn(root: Element): string[] {
-  if (root.hasAttribute('data-stream-math')) return [root.getAttribute('data-stream-math')!]
-  return Array.from(root.querySelectorAll('[data-stream-math]')).map((el) =>
-    el.getAttribute('data-stream-math')!,
-  )
-}
-
-function recordAnomaly(key: string, type: string, detail: string) {
-  stats.anomalies.push({ key, type, at: chunkCount.value, detail })
-}
-
-function refreshStats() {
-  stats.containers = records.size
-  stats.creations = 0
-  stats.removals = 0
-  stats.internalReplacements = 0
-  for (const rec of records.values()) {
-    stats.creations += rec.creations
-    stats.removals += rec.removals
-    stats.internalReplacements += rec.internalReplacements
-  }
-}
-
-function onMutations(mutations: MutationRecord[]) {
-  const addedKeys = new Set<string>()
-  const removedKeys = new Set<string>()
-  const internalHits: { key: string; detail: string }[] = []
-
-  for (const m of mutations) {
-    m.addedNodes.forEach((n) => {
-      if (!(n instanceof Element)) return
-      for (const key of keysIn(n)) {
-        addedKeys.add(key)
-        const rec = records.get(key) ?? {
-          creations: 0,
-          removals: 0,
-          internalReplacements: 0,
-          signature: '',
-          samples: [],
-        }
-        rec.creations += 1
-        if (!rec.signature) {
-          rec.signature = `${n.children.length}个子节点/${n.outerHTML.length}字符`
-        }
-        records.set(key, rec)
-        if (rec.creations > 1) recordAnomaly(key, 'recreated', `容器第 ${rec.creations} 次创建`)
-      }
-    })
-    m.removedNodes.forEach((n) => {
-      if (n instanceof Element) for (const key of keysIn(n)) removedKeys.add(key)
-    })
-    // 内部替换：变更目标位于某个已有公式容器内部（容器自身不是本批新增）
-    const target = m.target instanceof Element ? m.target : m.target.parentElement
-    if (target && (m.addedNodes.length > 0 || m.removedNodes.length > 0)) {
-      const container = target.closest('[data-stream-math]')
-      const key = container?.getAttribute('data-stream-math')
-      if (container && key && !addedKeys.has(key)) {
-        const rec = records.get(key)
-        if (rec) {
-          rec.internalReplacements += 1
-          const detail =
-            [
-              ...Array.from(m.removedNodes).map(describeNode),
-              ...Array.from(m.addedNodes).map(describeNode),
-            ]
-              .filter((s) => s !== '')
-              .slice(0, 4)
-              .join(' / ') || '(子节点变更)'
-          if (rec.samples.length < 3) rec.samples.push(detail)
-          internalHits.push({ key, detail })
-        }
-      }
-    }
-  }
-
-  // 说明：这里刻意没有"批量移除=正常清空"的推断——那种规则会在
-  // 页面只有一个公式时把流式中的错误删除漏报成清空。
-  // 清空只能由 resetDebug()（play/reset 的显式步骤）触发。
-  for (const key of removedKeys) {
-    const rec = records.get(key)
-    if (rec) {
-      rec.removals += 1
-      recordAnomaly(key, 'deleted', `容器被移除（此前创建 ${rec.creations} 次，签名 ${rec.signature}）`)
-    }
-  }
-  for (const hit of internalHits) {
-    recordAnomaly(hit.key, 'internal-replaced', `内部排版节点被替换：${hit.detail}`)
-  }
-  refreshStats()
-}
-
 onMounted(() => {
-  observer = new MutationObserver(onMutations)
-  if (chatRoot.value) observer.observe(chatRoot.value, { childList: true, subtree: true })
+  if (!chatRoot.value) return
+  probe = installFormulaProbe(chatRoot.value, {
+    getTick: () => chunkCount.value,
+    onChange: (s) => {
+      stats.containers = s.containers
+      stats.creations = s.creations
+      stats.removals = s.removals
+      stats.internalReplacements = s.internalReplacements
+      stats.anomalies = s.anomalies
+    },
+  })
 })
-onBeforeUnmount(() => observer?.disconnect())
+onBeforeUnmount(() => probe?.disconnect())
 
 // ---- 播放控制 ----
 let stopFlag = false
 
 function resetDebug() {
-  records.clear()
+  probe?.reset()
   stats.containers = 0
   stats.creations = 0
   stats.removals = 0

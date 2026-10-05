@@ -797,6 +797,8 @@ def _done_payload(
             "failed": SAVE_FAILED_MSG,
             "stale": SAVE_STALE_MSG,
         }[save_status],
+        # 结构化状态：界面据此选择图标/样式，不靠搜索中文提示字符串判断
+        "daily_status": daily_result["status"] if daily_result else None,
         "daily_note": {
             "recorded": "",
             "record_failed": DAILY_FAILED_MSG,
@@ -1310,6 +1312,25 @@ def create_api_app(
     return app
 
 
+def enable_fake_clients(runtime: AppRuntime, *, piece_delay: float = 0.02) -> None:
+    """--fake 开发链路：把设置解析可能选中的客户端全部替换为假实现。
+
+    必须覆盖两类路径，否则真实客户端仍会被选中：
+    - 显式服务商选择读取 runtime.clients（不能只补空缺项，要整体替换）；
+    - 缺省回退读取 runtime.client。
+    假客户端能力（supports_vision 等）与该服务商配置声明一致，
+    不把所有服务商都伪装成视觉模型。
+    """
+    from dev_fake import build_fake_clients
+
+    clients = build_fake_clients(runtime.ui_providers, piece_delay=piece_delay)
+    runtime.clients = clients
+    default_id = runtime.default_provider["id"] if runtime.default_provider else None
+    runtime.client = clients.get(default_id) if default_id else None
+    if runtime.client is None and clients:
+        runtime.client = next(iter(clients.values()))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="数学学习 AI 助手（FastAPI 版）")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1317,7 +1338,7 @@ def main() -> None:
     parser.add_argument(
         "--fake",
         action="store_true",
-        help="开发联调：用内置假模型客户端替换默认服务商客户端（不调用任何真实 API）",
+        help="开发联调：用内置假模型客户端替换全部可选中服务商客户端（不调用任何真实 API）",
     )
     parser.add_argument(
         "--isolated",
@@ -1341,9 +1362,8 @@ def main() -> None:
         runtime = build_runtime()
 
     if args.fake:
-        from dev_fake import FakeStreamClient
-
-        runtime.client = FakeStreamClient()
+        # 整体替换所有可选中客户端：既有真实客户端不得残留（含已配置密钥的服务商）
+        enable_fake_clients(runtime)
         print("[dev] 已启用假模型客户端（不产生真实调用）")
 
     # 只允许输出隔离测试账号的凭据；--fake 不代表账号是假的，严禁打印真实密码

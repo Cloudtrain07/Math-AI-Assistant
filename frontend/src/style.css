@@ -1,3 +1,59 @@
+/* ============================================================
+   共享设计令牌 —— 「深色炭黑 · 以内容为中心」（用户已确认定稿，
+   与 frontend/src/preview/DesignPreview.vue 的实际效果一致）
+   柔和炭黑背景 + 浅色文字 + 无卡片回答 + 克制浅蓝主色；
+   层次靠排版、留白、细边框和稍亮的深色表面，
+   不靠玻璃、渐变、发光、噪点或重阴影。
+   所有页面（App / AdminPanel / ImageEditorDialog / 预览）统一引用。
+   ============================================================ */
+:root {
+  color-scheme: dark;
+
+  /* 背景 / 表面 */
+  --bg: #14151a; /* 柔和炭黑页面背景 */
+  --surface: #1d1f26; /* 稍亮深色表面（设置 / 输入 / 登录等操作区） */
+  --surface-2: #262932; /* 次级表面（表头、悬停、弱化内容） */
+
+  /* 墨色三级 */
+  --ink: #e4e6eb; /* 正文（不用纯白） */
+  --ink-2: #a9afbb; /* 次要文字 */
+  --ink-3: #7d8492; /* 弱化文字 / 占位（保持可读对比） */
+
+  /* 结构线 */
+  --line: #343843;
+  --line-soft: #2b2f38;
+
+  /* 用户气泡：低对比深色 */
+  --user-bubble: #262932;
+
+  /* 主色：克制的浅蓝 */
+  --accent: #7c9cff;
+  --accent-deep: #93b0ff; /* 深色主题下 hover 取更亮一档 */
+  --accent-weak: #232b45; /* 蓝色弱底（悬停、选中背景） */
+  --accent-line: #46538a;
+
+  /* 语义色（深底可读的降饱和版本） */
+  --ok: #58b380;
+  --ok-bg: #1c2b22;
+  --ok-line: #2e4a38;
+  --warn: #d9a441;
+  --warn-bg: #2a2416;
+  --warn-line: #4a3d1e;
+  --danger: #e0786a;
+  --danger-bg: #2a1a17;
+  --danger-line: #52302a;
+
+  /* 主按钮文字：亮蓝底上用近黑字，对比优于白字 */
+  --accent-contrast: #14151a;
+
+  /* 圆角 / 阴影 / 焦点 */
+  --radius-ctl: 8px;
+  --radius-card: 12px;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-pop: 0 2px 10px rgba(0, 0, 0, 0.3);
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -5,10 +61,35 @@ html,
 body {
   margin: 0;
   padding: 0;
-  background: #f5f6f8;
+  background: var(--bg);
   font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
-  color: #1f2328;
+  color: var(--ink);
 }
 #app {
   min-height: 100vh;
+}
+
+/* 深色滚动条：避免原生亮色滚动条在深底上刺眼（全局，含弹窗与局部滚动区） */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 6px;
+  border: 2px solid var(--bg);
+}
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 全局焦点可见性：所有可交互控件获得统一焦点环 */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }

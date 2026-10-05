@@ -59,7 +59,7 @@ async function submitReset() {
   try {
     await adminResetPassword(account, password)
     resetOk.value = true
-    resetMessage.value = `✅ 已重置账号 ${account} 的密码。`
+    resetMessage.value = `已重置账号 ${account} 的密码。`
     // 成功后立即清空输入框，页面不留新密码
     newPassword.value = ''
   } catch (err) {
@@ -72,8 +72,15 @@ async function submitReset() {
 </script>
 
 <template>
-  <details class="admin" :open="open" @toggle="onToggle">
-    <summary>🛡️ 管理（仅本机可用）</summary>
+  <details class="panel admin" :open="open" @toggle="onToggle">
+    <summary>
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        <path d="M10 2.6l5.8 2.1v4.4c0 3.9-2.5 6.6-5.8 8.1-3.3-1.5-5.8-4.2-5.8-8.1V4.7z" />
+        <path d="M7.4 10l1.9 1.9 3.4-3.6" />
+      </svg>
+      管理（仅本机可用）
+      <span class="summary-hint">用量统计 · 密码重置</span>
+    </summary>
     <div class="admin-body">
       <section class="stats">
         <div class="stats-bar">
@@ -85,35 +92,49 @@ async function submitReset() {
               / {{ formatTokens(stats.global_daily_limit) }} tokens · 登录
               {{ stats.logins }} 次 · 提问 {{ stats.questions }} 次
             </span>
-            <button class="ghost" type="button" :disabled="loading" @click="refresh">
-              🔄 刷新统计
+            <button class="btn ghost small" type="button" :disabled="loading" @click="refresh">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M15.5 10a5.5 5.5 0 1 1-1.6-3.9M15.5 3.5v3h-3" />
+              </svg>
+              刷新统计
             </button>
           </template>
           <template v-else>
             <span class="hint">暂无统计数据</span>
-            <button class="ghost" type="button" @click="refresh">🔄 重试</button>
+            <button class="btn ghost small" type="button" @click="refresh">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M15.5 10a5.5 5.5 0 1 1-1.6-3.9M15.5 3.5v3h-3" />
+              </svg>
+              重试
+            </button>
           </template>
         </div>
         <p v-if="loadError" class="error">{{ loadError }}</p>
-        <table v-if="stats" class="accounts">
-          <thead>
-            <tr>
-              <th>账号</th>
-              <th>状态</th>
-              <th class="num">今日用量</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="a in stats.accounts" :key="a.username">
-              <td>
-                {{ a.username }}
-                <span v-if="a.display_name !== a.username" class="display">（{{ a.display_name }}）</span>
-              </td>
-              <td>{{ a.enabled ? '✅' : '⛔' }}</td>
-              <td class="num">{{ formatTokens(a.used) }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div v-if="stats" class="table-wrap">
+          <table class="accounts">
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th>状态</th>
+                <th class="num">今日用量</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="a in stats.accounts" :key="a.username">
+                <td>
+                  {{ a.username }}
+                  <span v-if="a.display_name !== a.username" class="display">（{{ a.display_name }}）</span>
+                </td>
+                <td>
+                  <span class="pill" :class="a.enabled ? 'ok' : 'off'">
+                    {{ a.enabled ? '正常' : '停用' }}
+                  </span>
+                </td>
+                <td class="num">{{ formatTokens(a.used) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <form class="reset" @submit.prevent="submitReset">
@@ -137,37 +158,77 @@ async function submitReset() {
           />
         </label>
         <button
-          class="send"
+          class="btn primary"
           type="submit"
           :disabled="resetting || statsUnavailable || !resetAccount || !newPassword"
         >
           {{ resetting ? '重置中…' : '确认重置' }}
         </button>
       </form>
-      <p v-if="resetMessage" :class="resetOk ? 'hint' : 'error'">{{ resetMessage }}</p>
+      <p v-if="resetMessage" :class="resetOk ? 'success' : 'error'">{{ resetMessage }}</p>
     </div>
   </details>
 </template>
 
 <style scoped>
-.admin {
-  border: 1px solid #e1e4e8;
-  border-radius: 10px;
-  margin-top: 8px;
+/* 与设置面板同族的折叠面板体系（变量来自共享 style.css） */
+.panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  margin-top: 10px;
   font-size: 0.88rem;
-  background: #fafbfc;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
 }
-.admin summary {
+.panel summary {
   cursor: pointer;
   user-select: none;
-  padding: 6px 10px;
-  color: #57606a;
+  padding: 9px 14px;
+  color: var(--ink-2);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  border-radius: var(--radius-card);
+}
+.panel summary::-webkit-details-marker {
+  display: none;
+}
+.panel summary::after {
+  content: '';
+  margin-left: auto;
+  width: 8px;
+  height: 8px;
+  border-right: 1.6px solid var(--ink-3);
+  border-bottom: 1.6px solid var(--ink-3);
+  transform: rotate(45deg);
+  transition: transform 0.15s;
+}
+.panel[open] summary::after {
+  transform: rotate(225deg);
+}
+.panel summary svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.panel summary:hover {
+  color: var(--ink);
+  background: var(--surface-2);
+}
+.summary-hint {
+  color: var(--ink-3);
+  font-size: 0.78rem;
 }
 .admin-body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 2px 10px 10px;
+  gap: 12px;
+  padding: 4px 14px 14px;
 }
 .stats-bar {
   display: flex;
@@ -175,46 +236,50 @@ async function submitReset() {
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
-  color: #43505e;
+  color: var(--ink);
+  font-size: 0.86rem;
 }
 .stats-bar strong {
   font-variant-numeric: tabular-nums;
+  color: var(--ink);
 }
-.admin .ghost {
-  border: 1px solid #d0d7de;
-  background: #fff;
-  color: #43505e;
-  border-radius: 8px;
-  padding: 3px 10px;
-  cursor: pointer;
-  font-size: 0.85rem;
+.btn.small {
+  padding: 4px 10px;
+  font-size: 0.82rem;
+  background: var(--surface);
 }
-.admin .ghost:hover:not(:disabled) {
-  border-color: #1a73e8;
-  color: #1a73e8;
-  background: #f2f7ff;
+.btn svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
 }
-.admin .ghost:disabled {
-  opacity: 0.5;
-  cursor: default;
+.table-wrap {
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  overflow-x: auto;
+  background: var(--surface);
 }
 .accounts {
   width: 100%;
   border-collapse: collapse;
-  background: #fff;
-  border: 1px solid #e1e4e8;
-  border-radius: 8px;
+  font-size: 0.85rem;
 }
 .accounts th,
 .accounts td {
   text-align: left;
-  padding: 5px 10px;
-  border-bottom: 1px solid #eef1f4;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line-soft);
 }
 .accounts th {
-  color: #57606a;
-  font-weight: 500;
-  background: #fafbfc;
+  color: var(--ink-2);
+  font-weight: 550;
+  background: var(--surface-2);
+  font-size: 0.8rem;
 }
 .accounts tr:last-child td {
   border-bottom: none;
@@ -223,50 +288,61 @@ async function submitReset() {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+.pill {
+  display: inline-block;
+  font-size: 0.74rem;
+  border-radius: 999px;
+  padding: 1px 9px;
+}
+.pill.ok {
+  color: var(--ok);
+  background: var(--ok-bg);
+  border: 1px solid var(--ok-line);
+}
+.pill.off {
+  color: var(--ink-3);
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+}
 .display {
-  color: #8b949e;
+  color: var(--ink-3);
 }
 .reset {
   display: flex;
   align-items: flex-end;
-  gap: 8px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 .reset label {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  color: #57606a;
+  color: var(--ink-2);
+  font-size: 0.84rem;
 }
 .reset select,
 .reset input {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 5px 8px;
-  background: #fff;
+  padding: 7px 10px;
+  background: var(--surface);
   font-size: 0.88rem;
-  min-width: 160px;
+  color: var(--ink);
+  min-width: 170px;
 }
-.reset .send {
-  border: none;
-  background: #1a73e8;
-  color: #fff;
-  border-radius: 8px;
-  padding: 6px 14px;
-  font-size: 0.88rem;
-  cursor: pointer;
-  white-space: nowrap;
+.reset .btn.primary {
+  padding: 8px 16px;
 }
-.reset .send:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.hint {
+.success {
   margin: 0;
-  color: #57606a;
+  color: var(--ok);
 }
 .error {
   margin: 0;
-  color: #cf222e;
+  color: var(--danger);
+}
+.hint {
+  margin: 0;
+  color: var(--ink-2);
 }
 </style>

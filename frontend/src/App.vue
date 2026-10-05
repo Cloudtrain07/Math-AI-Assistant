@@ -25,7 +25,9 @@ import {
   type EditorResult,
   type EditorSource,
 } from './imageEdit'
-import { composeDaily, composeNotice } from './notice'
+import { shouldSendOnEnter } from './ime'
+import { classifyDone, composeDaily, composeNotice } from './notice'
+import { isFollowingBottom, shouldShowJumpToBottom } from './scrollFollow'
 import { providerView } from './settings'
 
 interface ChatEntry {
@@ -49,6 +51,8 @@ interface PendingImage {
   sent: boolean
 }
 
+type StatusKind = 'info' | 'success' | 'warn' | 'error' | 'stopped'
+
 const me = ref<UserInfo | null>(null)
 const authChecked = ref(false)
 const loginName = ref('')
@@ -60,6 +64,7 @@ const messages = ref<ChatEntry[]>([])
 const input = ref('')
 const sending = ref(false)
 const statusText = ref('')
+const statusKind = ref<StatusKind>('info')
 const usageText = ref('')
 const elapsedSeconds = ref(0)
 const restoreNotice = ref('')
@@ -67,12 +72,30 @@ const mode = ref('互动模式')
 const clearArmed = ref(false)
 let clearTimer: ReturnType<typeof setTimeout> | null = null
 
+/** 状态提示统一入口：文字 + 种类（图标与颜色由种类决定，不只靠颜色区分） */
+function setStatus(text: string, kind: StatusKind = 'info') {
+  statusText.value = text
+  statusKind.value = kind
+}
+
 // ---- 待发送图片：选择/粘贴 → 编辑确认 → 缩略图 → 点击发送才上传 ----
 const pendingImage = ref<PendingImage | null>(null)
 const editorOpen = ref(false)
 const editorSource = ref<EditorSource | null>(null)
 const editorParams = ref<EditParams | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
+const composerInput = ref<HTMLTextAreaElement | null>(null)
+
+/** 多行输入自动增高：按内容高度撑开，超出 CSS max-height 时局部滚动，不撑破页面 */
+function autosizeComposer() {
+  const el = composerInput.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
+
+// 内容变化（含发送后清空、粘贴、换行）后重新计算高度
+watch(input, () => void nextTick(autosizeComposer))
 
 function discardPendingImage() {
   if (pendingImage.value) {
@@ -108,19 +131,18 @@ function onPaste(event: ClipboardEvent) {
 async function acceptNewImage(file: File) {
   if (sending.value) return
   if (!isSupportedImageFile(file)) {
-    statusText.value = '⚠️ 不支持的图片格式，仅支持 jpg / png / webp / bmp / gif。'
+    setStatus('不支持的图片格式，仅支持 jpg / png / webp / bmp / gif。', 'error')
     return
   }
   if (isOverSize(file)) {
-    statusText.value = '⚠️ 图片超过 10MB，请压缩后再试。'
+    setStatus('图片超过 10MB，请压缩后再试。', 'error')
     return
   }
-  statusText.value = ''
+  setStatus('')
   try {
     await decodeImage(file)
   } catch {
-    statusText.value =
-      '⚠️ 浏览器无法解码该图片（如 HEIC 格式），请先转换为 jpg 或 png。'
+    setStatus('浏览器无法解码该图片（如 HEIC 格式），请先转换为 jpg 或 png。', 'error')
     return
   }
   // 新图从零开始编辑；重新编辑则由 reEdit 带入原参数
@@ -147,7 +169,7 @@ function onEditorConfirm(result: EditorResult) {
     params: result.params,
     sent: false,
   }
-  statusText.value = result.note ? `ℹ️ ${result.note}` : statusText.value
+  if (result.note) setStatus(result.note, 'info')
 }
 
 function reEdit() {
@@ -163,7 +185,7 @@ async function removePending() {
   discardPendingImage()
   // 同时清掉服务端可能保留的上一条附图，避免后续轮次重新附带
   const result = await apiRemoveImage()
-  if (result && !result.ok && result.message) statusText.value = result.message
+  if (result && !result.ok && result.message) setStatus(result.message, 'error')
 }
 
 // ---- 界面设置（来自 /api/settings，均可在折叠区修改） ----
@@ -189,14 +211,18 @@ watch(providerId, () => {
   model.value = providerView(settings.value?.providers ?? [], providerId.value).model
 })
 
+// .page 是唯一滚动容器：页头与输入卡为玻璃悬浮层，消息从其下方穿过
 const chatScroll = ref<HTMLElement | null>(null)
 let stickToBottom = true
+/** 用户明显离开底部时的「回到底部」入口（流式输出不会把阅读位置拉回去） */
+const showJump = ref(false)
 
 let controller: AbortController | null = null
 let elapsedTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
   window.addEventListener('paste', onPaste)
+  await nextTick(autosizeComposer)
   me.value = await fetchMe()
   authChecked.value = true
   if (me.value) {
@@ -231,7 +257,7 @@ async function restoreHistory() {
     done: true,
   }))
   restoreNotice.value = data.notice
-  stickToBottom = true
+  followLatest()
   await nextTick()
   scrollToBottom()
 }
@@ -256,23 +282,65 @@ async function doLogout() {
   await apiLogout()
   me.value = null
   messages.value = []
-  statusText.value = ''
+  setStatus('')
   usageText.value = ''
   input.value = ''
   discardPendingImage()
+  // 会话整体没了：重置跟随与「回到底部」状态，重新登录后不带残留
+  followLatest()
 }
 
 // ---- 滚动跟随：用户向上阅读时不强制拉回底部 ----
+
+/**
+ * 上一次由程序贴底后的 scrollTop。
+ * 滚动事件要等到下一帧才派发，用户在这之前向上翻时，光靠事件里的标记会把他的阅读位置拉回去，
+ * 所以贴底前先按当前位置核对一次。
+ */
+let pinnedTop = -1
+
+/** 重新开始跟随最新内容（新回合、恢复历史、清空、退出、点「回到底部」） */
+function followLatest() {
+  stickToBottom = true
+  pinnedTop = -1
+  showJump.value = false
+}
+
+/** 只刷新按钮显隐：不改动跟随状态，也不移动滚动位置 */
+function refreshJumpState() {
+  const el = chatScroll.value
+  if (el) showJump.value = shouldShowJumpToBottom(el)
+}
+
 function onScroll() {
   const el = chatScroll.value
-  if (!el) return
-  stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  if (el) followReader(el)
 }
 
 async function scrollToBottom() {
   const el = chatScroll.value
-  if (!el || !stickToBottom) return
-  el.scrollTop = el.scrollHeight
+  if (!el) return
+  // 滚动事件要到下一帧才派发：位置已被用户改动时，先按实时几何量核对要不要继续跟随
+  if (stickToBottom && pinnedTop >= 0 && el.scrollTop < pinnedTop - 4) followReader(el)
+  if (stickToBottom) {
+    el.scrollTop = el.scrollHeight
+    pinnedTop = el.scrollTop
+  }
+  // 内容增高本身不派发滚动事件：布局完成后按实时几何量重算显隐（不把向上阅读的人拉回来）
+  refreshJumpState()
+}
+
+/** 用户自己滚动了：按实时几何量决定要不要继续跟随 */
+function followReader(el: HTMLElement) {
+  stickToBottom = isFollowingBottom(el)
+  if (stickToBottom) pinnedTop = -1
+  refreshJumpState()
+}
+
+/** 回到底部：沿用同一个滚动容器，并恢复既有的自动跟随规则 */
+function jumpToBottom() {
+  followLatest()
+  void scrollToBottom()
 }
 
 // ---- 发送与流式接收：普通发送与继续生成共享设置、busy 与收尾处理 ----
@@ -311,7 +379,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   if (kind === 'chat' && !text && !pendingUnsent) return
   const originalText = text
   if (kind === 'chat') input.value = ''
-  statusText.value = ''
+  setStatus('')
   const assistant = reactive<ChatEntry>({
     role: 'assistant',
     content: '',
@@ -330,11 +398,11 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
     })
     messages.value.push(assistant)
     assistantShown = true
-    stickToBottom = true
+    // 不在此处重新声明跟随：若用户在请求往返期间已向上阅读，首包到达时不应把他拉回底部
     void nextTick(scrollToBottom)
   }
   sending.value = true
-  stickToBottom = true
+  followLatest()
   startElapsedTimer()
   controller = new AbortController()
 
@@ -356,10 +424,9 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
       stopElapsedTimer()
       controller = null
       if (uploadSignal.aborted) {
-        statusText.value = '⏹ 已停止发送，未发起模型请求。图片已保留，可重试。'
+        setStatus('已停止发送，未发起模型请求。图片已保留，可重试。', 'stopped')
       } else {
-        statusText.value =
-          err instanceof Error ? `⚠️ ${err.message}` : '⚠️ 图片上传失败，请重试。'
+        setStatus(err instanceof Error ? err.message : '图片上传失败，请重试。', 'error')
       }
       return
     }
@@ -393,13 +460,14 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
       if (assistantShown) {
         messages.value.splice(messages.value.indexOf(assistant), 1)
       }
-      statusText.value = result.payload.message
+      setStatus(result.payload.message, 'info')
     } else {
       const d = result.payload
       assistant.content = d.answer
       assistant.reasoning = d.reasoning_text
       assistant.done = true
-      statusText.value = composeNotice(d)
+      // done ≠ 全部成功：状态种类由结构化字段判定（模型错误/空回答/截断/保存失败/stale/用量失败）
+      setStatus(composeNotice(d), classifyDone(d))
       usageText.value = [d.cumulative_usage, composeDaily(d)]
         .filter(Boolean)
         .join('\n')
@@ -413,16 +481,18 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   } catch (err) {
     assistant.done = true
     if (controller?.signal.aborted) {
-      statusText.value = '⏹ 已停止接收。未完成的回答不会写入历史。'
+      setStatus('已停止接收。未完成的回答不会写入历史。', 'stopped')
     } else if (err instanceof Error) {
-      statusText.value = `⚠️ ${err.message}`
+      setStatus(err.message, 'error')
     } else {
-      statusText.value = '⚠️ 连接中断，请稍后重试。'
+      setStatus('连接中断，请稍后重试。', 'error')
     }
   } finally {
     stopElapsedTimer()
     sending.value = false
     controller = null
+    // 收尾时状态行/用量行会改变内容高度：布局完成后再核对一次按钮显隐
+    void nextTick(refreshJumpState)
   }
 }
 
@@ -430,6 +500,14 @@ function send() {
   const hasPending = pendingImage.value && !pendingImage.value.sent
   if (!input.value.trim() && !hasPending) return
   runTurn('chat', input.value.trim())
+}
+
+/** Enter 发送；Shift+Enter 换行；中文输入法组合输入（选词/确认候选）不触发发送 */
+function onComposerKey(event: KeyboardEvent) {
+  if (!shouldSendOnEnter(event)) return
+  // 阻止 Enter 在 textarea 中插入换行后再发送
+  event.preventDefault()
+  send()
 }
 
 function continueTurn() {
@@ -452,59 +530,109 @@ async function onClearClick() {
   const result = await clearConversation()
   if (result.ok) {
     messages.value = []
-    statusText.value = result.message
+    setStatus(result.message, 'success')
     usageText.value = ''
     restoreNotice.value = ''
     discardPendingImage()
+    // 内容清空后没有「上方」可读：按钮状态与跟随一起归零
+    followLatest()
   } else {
-    statusText.value = result.message
+    setStatus(result.message, 'error')
   }
 }
 </script>
 
 <template>
-  <div class="page">
+  <div ref="chatScroll" class="page" @scroll="onScroll">
     <template v-if="authChecked && !me">
       <form class="login" @submit.prevent="submitLogin">
+        <span class="mark large" aria-hidden="true">∑</span>
         <h1>数学学习 AI 助手</h1>
         <p class="hint">请输入访问用户名与密码</p>
         <input
           v-model="loginName"
           autocomplete="username"
           placeholder="用户名"
+          aria-label="用户名"
         />
         <input
           v-model="loginPassword"
           type="password"
           autocomplete="current-password"
           placeholder="密码"
+          aria-label="密码"
         />
         <button type="submit" :disabled="loggingIn || !loginName.trim() || !loginPassword">
           {{ loggingIn ? '登录中…' : '登录' }}
         </button>
         <p v-if="loginError" class="error">{{ loginError }}</p>
+        <p class="foot">仅限授权用户访问 · 登录即记录用量</p>
       </form>
     </template>
 
     <template v-else-if="me">
       <header class="header">
-        <h1>数学学习 AI 助手</h1>
+        <div class="brand">
+          <span class="mark" aria-hidden="true">∑</span>
+          <h1>数学学习 AI 助手</h1>
+        </div>
         <div class="user-bar">
-          <span>{{ me.display_name }}</span>
-          <select v-model="mode" :disabled="sending" class="mode-select">
+          <span class="user-chip">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <circle cx="10" cy="7" r="3" />
+              <path d="M4 16.5c1.2-2.8 3.4-4 6-4s4.8 1.2 6 4" />
+            </svg>
+            <span class="chip-name">{{ me.display_name }}</span>
+          </span>
+          <span class="divider" aria-hidden="true"></span>
+          <select v-model="mode" :disabled="sending" class="mode-select" aria-label="模式">
             <option v-for="m in modes" :key="m" :value="m">{{ m }}</option>
           </select>
-          <button class="ghost" :disabled="sending" @click="onClearClick">
-            {{ clearArmed ? '再点一次确认清空' : '🗑️ 新对话' }}
-          </button>
-          <button class="ghost" :disabled="sending" @click="doLogout">退出</button>
+          <div class="user-actions">
+            <button class="btn ghost" :class="{ armed: clearArmed }" :disabled="sending" @click="onClearClick">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <circle cx="10" cy="10" r="7.2" />
+                <path d="M10 6.6v6.8M6.6 10h6.8" />
+              </svg>
+              {{ clearArmed ? '再点一次确认清空' : '新对话' }}
+            </button>
+            <!-- 手机端：继续生成移到页头与「新对话」并排（桌面端此按钮隐藏，用输入区的同名按钮） -->
+            <button class="btn ghost continue-top" :disabled="sending" @click="continueTurn">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M7.5 5.5l7 4.5-7 4.5z" />
+              </svg>
+              继续生成
+            </button>
+            <button class="btn ghost" :disabled="sending" @click="doLogout">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M8 4H5.5A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8M12.5 6.8 15.7 10l-3.2 3.2M15.5 10H7.8" />
+              </svg>
+              退出
+            </button>
+          </div>
         </div>
       </header>
-      <p v-if="restoreNotice" class="notice">{{ restoreNotice }}</p>
 
-      <details class="settings">
-        <summary>⚙️ 设置</summary>
-        <div class="settings-grid">
+      <p v-if="restoreNotice" class="notice">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="10" r="7.2" />
+          <path d="M10 9v4.4M10 6.4v.2" />
+        </svg>
+        {{ restoreNotice }}
+      </p>
+
+      <details class="panel">
+        <summary>
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="10" cy="10" r="2.7" />
+            <path
+              d="M10 3v2M10 15v2M3 10h2M15 10h2M5 5l1.4 1.4M13.6 13.6 15 15M15 5l-1.4 1.4M6.4 13.6 5 15"
+            />
+          </svg>
+          设置
+          <span class="summary-hint">服务商 · 模型 · 学段 · 思考</span>
+        </summary>
+        <div class="panel-grid">
           <label>
             服务商
             <select v-model="providerId" :disabled="sending || !settings">
@@ -558,9 +686,10 @@ async function onClearClick() {
            默认折叠、首次展开才请求统计，远程用户不加载管理数据 -->
       <AdminPanel v-if="me.local_admin" />
 
-      <main ref="chatScroll" class="chat" @scroll="onScroll">
+      <main class="chat">
         <div v-if="messages.length === 0" class="placeholder">
-          输入数学问题开始提问。
+          <span class="mark" aria-hidden="true">∑</span>
+          <p>输入数学问题开始提问。</p>
         </div>
         <template v-for="(msg, i) in messages" :key="i">
           <div v-if="msg.role === 'user'" class="msg user">
@@ -570,8 +699,14 @@ async function onClearClick() {
             </div>
           </div>
           <div v-else class="msg assistant">
-            <details v-if="msg.reasoning" class="thinking" open>
-              <summary>思考过程{{ msg.done ? '' : '（进行中）' }}</summary>
+            <details v-if="msg.reasoning" class="thinking" :class="{ streaming: !msg.done }" open>
+              <summary>
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M10 3.2 12.2 8l5.1.5-3.8 3.4 1.1 5-4.6-2.7L5.4 16.9l1.1-5L2.7 8.5 7.8 8z" />
+                </svg>
+                思考过程{{ msg.done ? '' : '（进行中）' }}
+                <span v-if="!msg.done" class="pulse" aria-hidden="true"></span>
+              </summary>
               <StreamMessage scope="think" :text="msg.reasoning" :done="msg.done" />
             </details>
             <div class="bubble answer">
@@ -582,14 +717,36 @@ async function onClearClick() {
                 :done="msg.done"
               />
               <span v-else class="waiting">
-                ⏳ 正在思考… 已用时 {{ elapsedSeconds }} 秒
+                <span class="spinner" aria-hidden="true"></span>
+                正在思考… 已用时 {{ elapsedSeconds }} 秒
               </span>
             </div>
           </div>
         </template>
       </main>
 
-      <section v-if="statusText" class="status">{{ statusText }}</section>
+      <section v-if="statusText" class="status" :class="statusKind">
+        <svg v-if="statusKind === 'success'" viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="10" r="7.2" />
+          <path d="M6.6 10.2l2.3 2.3 4.5-4.8" />
+        </svg>
+        <svg v-else-if="statusKind === 'error'" viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="10" r="7.2" />
+          <path d="M10 6.4v4.6M10 13.4v.2" />
+        </svg>
+        <svg v-else-if="statusKind === 'warn'" viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M10 3.4l7.1 12.4H2.9z" />
+          <path d="M10 8.4v3.4M10 13.8v.2" />
+        </svg>
+        <svg v-else-if="statusKind === 'stopped'" viewBox="0 0 20 20" aria-hidden="true">
+          <rect x="4.5" y="4.5" width="11" height="11" rx="2" />
+        </svg>
+        <svg v-else viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="10" r="7.2" />
+          <path d="M10 9v4.4M10 6.4v.2" />
+        </svg>
+        {{ statusText }}
+      </section>
       <section v-if="usageText" class="usage">{{ usageText }}</section>
 
       <!-- 待发送图片：确认后才出现在这里；点击发送时才上传 -->
@@ -613,7 +770,7 @@ async function onClearClick() {
         </div>
       </div>
 
-      <footer class="input-bar">
+      <footer class="composer">
         <input
           ref="fileInput"
           type="file"
@@ -622,7 +779,7 @@ async function onClearClick() {
           @change="onFileChange"
         />
         <button
-          class="icon-btn img-btn"
+          class="icon-btn"
           type="button"
           title="添加图片（支持裁剪、旋转）"
           :disabled="sending"
@@ -634,28 +791,52 @@ async function onClearClick() {
             <path d="M2.5 14l4.5-4 3 3 3.5-3.5 4 4" />
           </svg>
         </button>
-        <input
+        <textarea
+          ref="composerInput"
           v-model="input"
+          class="composer-input"
+          rows="1"
           :disabled="sending"
           placeholder="输入数学问题，可附图片"
-          @keydown.enter="send"
-        />
+          aria-label="输入数学问题，可附图片"
+          @keydown="onComposerKey"
+          @input="autosizeComposer"
+        ></textarea>
         <button
           v-if="!sending"
-          class="ghost continue"
+          class="btn ghost continue"
           :disabled="sending"
           @click="continueTurn"
         >
-          ▶️ 继续生成
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M7.5 5.5l7 4.5-7 4.5z" />
+          </svg>
+          继续生成
         </button>
-        <button v-if="sending" class="send stop" @click="stopStreaming">⏹ 停止</button>
+        <button v-if="sending" class="btn danger-btn" @click="stopStreaming">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <rect x="5.5" y="5.5" width="9" height="9" rx="1.5" />
+          </svg>
+          停止
+        </button>
         <button
           v-else
-          class="send"
+          class="btn primary send"
           :disabled="!input.trim() && !(pendingImage && !pendingImage.sent)"
           @click="send"
         >
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M3.2 10.2 17 3.6l-3 12.6-4.2-4z" />
+            <path d="M9.8 12.2 17 3.6" />
+          </svg>
           发送
+        </button>
+        <!-- 回到底部：只在明显离开底部时出现，浮在输入卡上方，不改用新的滚动容器 -->
+        <button v-if="showJump" class="jump-bottom" type="button" @click="jumpToBottom">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M10 4.2v9.6M6.2 10.6 10 14.4l3.8-3.8" />
+          </svg>
+          回到底部
         </button>
       </footer>
 
@@ -671,192 +852,558 @@ async function onClearClick() {
 </template>
 
 <style scoped>
+/* ===== 页面框架：唯一滚动容器；单栏内容流，页头不加卡片（与设计预览一致） ===== */
 .page {
-  max-width: 780px;
+  width: min(780px, 100%);
   margin: 0 auto;
   height: 100dvh;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   padding: 12px 14px 0;
+  scrollbar-gutter: stable;
 }
+
+/* ===== 通用控件 ===== */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-ctl);
+  font-size: 0.88rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
+}
+.btn svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+.btn.ghost {
+  background: transparent;
+  color: var(--ink-2);
+  padding: 6px 12px;
+}
+.btn.ghost:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-weak);
+}
+.btn.primary {
+  border: none;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  padding: 8px 18px;
+  font-weight: 550;
+}
+.btn.primary:hover:not(:disabled) {
+  background: var(--accent-deep);
+}
+.btn.primary:disabled {
+  background: #2b3148;
+  color: var(--ink-3);
+  cursor: default;
+}
+.btn.danger-btn {
+  border: none;
+  background: var(--danger);
+  color: var(--accent-contrast);
+  padding: 8px 18px;
+  font-weight: 550;
+}
+.btn.danger-btn:hover:not(:disabled) {
+  background: #e78d81;
+}
+.btn.ghost:disabled,
+.btn.ghost:disabled:hover {
+  border-color: var(--line-soft);
+  color: var(--ink-3);
+  background: transparent;
+  cursor: default;
+}
+.btn:disabled {
+  cursor: default;
+}
+.btn.ghost.armed {
+  /* 二次确认态用危险色：清空不可撤销，提示要区别于普通次级按钮 */
+  border-color: var(--danger);
+  color: var(--danger);
+  background: var(--danger-bg);
+  font-weight: 600;
+}
+.icon-btn {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-ctl);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.icon-btn svg {
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.icon-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-weak);
+}
+.icon-btn:disabled,
+.icon-btn:disabled:hover {
+  border-color: var(--line-soft);
+  color: var(--ink-3);
+  background: var(--surface);
+  cursor: default;
+}
+select {
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 8px;
+  background: var(--surface);
+  font-size: 0.88rem;
+  color: var(--ink);
+}
+.file-picker {
+  display: none;
+}
+
+/* ===== 品牌标志 ===== */
+.mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-size: 1.05rem;
+  font-family: Georgia, 'Times New Roman', serif;
+  flex-shrink: 0;
+}
+.mark.large {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  font-size: 1.5rem;
+}
+
+/* ===== 页头：与页面同色，仅一条细底线，不加卡片 ===== */
 .header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
   flex-wrap: wrap;
+  padding: 10px 2px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line-soft);
 }
-.header h1 {
-  font-size: 1.1rem;
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.brand h1 {
+  font-size: 1.08rem;
   margin: 0;
+  font-weight: 650;
+  letter-spacing: 0.01em;
 }
 .user-bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 0.85rem;
-  color: #57606a;
-}
-.mode-select {
-  border: 1px solid #d0d7de;
-  border-radius: 8px;
-  padding: 4px 6px;
-  background: #fff;
-  font-size: 0.85rem;
-}
-.user-bar button {
-  border: 1px solid #d0d7de;
-  background: transparent;
-  border-radius: 8px;
-  padding: 4px 10px;
-  cursor: pointer;
-  font-size: 0.85rem;
-}
-.notice {
-  margin: 4px 0 0;
-  font-size: 0.85rem;
-  color: #9a6700;
-}
-.settings {
-  border: 1px solid #e1e4e8;
-  border-radius: 10px;
-  margin-top: 8px;
   font-size: 0.88rem;
-  background: #fafbfc;
+  color: var(--ink-2);
 }
-.settings summary {
-  cursor: pointer;
-  user-select: none;
-  padding: 6px 10px;
-  color: #57606a;
-}
-.settings-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-  padding: 4px 10px 10px;
-}
-.settings-grid label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  color: #57606a;
-}
-.settings-grid label.checkbox {
-  flex-direction: row;
+.user-chip {
+  display: inline-flex;
   align-items: center;
+  gap: 6px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+  font-size: 0.84rem;
+  background: transparent;
 }
-.settings-grid select {
-  border: 1px solid #d0d7de;
-  border-radius: 8px;
-  padding: 4px 6px;
-  background: #fff;
-  font-size: 0.88rem;
+.user-chip svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
 }
-.input-bar .ghost.continue {
-  border: 1px solid #d0d7de;
-  background: #fff;
-  color: #1a73e8;
-  border-radius: 10px;
-  padding: 0 12px;
-  font-size: 0.9rem;
-  cursor: pointer;
+/* 用户名过长时省略，不推着页头按钮换行或溢出 */
+.chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.input-bar .ghost.continue:disabled {
-  opacity: 0.5;
-}
-.login {
-  margin: auto;
+/* 页头操作按钮成组：桌面端与原样一致，手机端整组换到「新对话 / 继续生成」并排的一行 */
+.user-actions {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: min(320px, 90%);
-  text-align: center;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
-.login h1 {
-  font-size: 1.2rem;
-  margin: 0;
+.divider {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
 }
-.login .hint {
-  margin: 0;
-  color: #57606a;
-  font-size: 0.9rem;
+.mode-select {
+  border-radius: 999px;
+  padding: 5px 10px;
+  color: var(--ink);
 }
-.login input {
-  border: 1px solid #d0d7de;
-  border-radius: 10px;
-  padding: 9px 12px;
-  font-size: 0.95rem;
-}
-.login button {
-  border: none;
-  background: #1a73e8;
-  color: #fff;
-  border-radius: 10px;
-  padding: 9px 0;
-  font-size: 0.95rem;
-  cursor: pointer;
-}
-.login button:disabled {
-  opacity: 0.5;
-}
-.login .error {
-  color: #cf222e;
-  font-size: 0.88rem;
-  margin: 0;
-}
-.chat {
-  flex: 1;
-  overflow-y: auto;
+
+/* ===== 恢复提示：弱化警示条 ===== */
+.notice {
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 12px 2px;
+  align-items: center;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 7px 12px;
+  font-size: 0.84rem;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius-ctl);
 }
-.placeholder {
-  color: #8b949e;
-  text-align: center;
-  margin-top: 40px;
+.notice svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  flex-shrink: 0;
 }
-.msg.user {
+
+/* ===== 状态与用量：弱化紧凑文字行，图标区分种类（不只靠颜色） ===== */
+.status {
   display: flex;
-  justify-content: flex-end;
-}
-.msg.user .bubble {
-  background: #1a73e8;
-  color: #fff;
-  border-radius: 14px 14px 4px 14px;
-  padding: 8px 12px;
-  max-width: 80%;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0 2px;
+  font-size: 0.82rem;
+  color: var(--ink-2);
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
+.status svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.status.success svg {
+  stroke: var(--ok);
+}
+.status.warn svg {
+  stroke: var(--warn);
+}
+.status.error {
+  color: var(--danger);
+}
+.status.stopped svg {
+  stroke: var(--ink-2);
+}
+.usage {
+  margin: 6px 0 0;
+  padding: 0 2px;
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  white-space: pre-wrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== 折叠面板（设置）：稍亮表面 + 细边框 ===== */
+.panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  margin-top: 12px;
+  font-size: 0.88rem;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+.panel summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 9px 14px;
+  color: var(--ink-2);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  border-radius: var(--radius-card);
+}
+.panel summary::-webkit-details-marker {
+  display: none;
+}
+.panel summary::after {
+  content: '';
+  margin-left: auto;
+  width: 8px;
+  height: 8px;
+  border-right: 1.6px solid var(--ink-3);
+  border-bottom: 1.6px solid var(--ink-3);
+  transform: rotate(45deg);
+  transition: transform 0.15s;
+}
+.panel[open] summary::after {
+  transform: rotate(225deg);
+}
+.panel summary svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.panel summary:hover {
+  color: var(--ink);
+  background: var(--surface-2);
+}
+.summary-hint {
+  color: var(--ink-3);
+  font-size: 0.78rem;
+}
+.panel-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  padding: 6px 14px 14px;
+}
+.panel-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--ink-2);
+  font-size: 0.84rem;
+}
+.panel-grid label.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink);
+  padding-top: 18px;
+}
+.panel-grid input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+/* ===== 聊天区：回答直接呈现在页面背景上，无卡片 ===== */
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 20px 2px;
+}
+.placeholder {
+  margin: 48px auto 0;
+  text-align: center;
+  color: var(--ink-3);
+}
+.placeholder .mark {
+  opacity: 0.45;
+  margin-bottom: 10px;
+}
+.placeholder p {
+  margin: 0;
+  font-size: 0.9rem;
+}
+.msg {
+  display: flex;
+}
+.msg.user {
+  justify-content: flex-end;
+}
+.msg.user .bubble {
+  background: var(--user-bubble);
+  color: var(--ink);
+  border-radius: 16px 16px 4px 16px;
+  padding: 9px 14px;
+  max-width: 78%;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  line-height: 1.65;
+  font-size: 0.95rem;
+}
+.msg.assistant {
+  flex-direction: column;
+}
+.msg.assistant .bubble.answer {
+  max-width: 100%;
+  font-size: 0.95rem;
+  line-height: 1.8;
+  color: var(--ink);
+}
 .sent-image {
   display: block;
-  max-width: 240px;
-  max-height: 180px;
-  border-radius: 8px;
-  margin-bottom: 6px;
-  background: rgba(255, 255, 255, 0.9);
+  max-width: min(240px, 100%);
+  max-height: 170px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  margin-bottom: 8px;
+  background: #fff;
 }
-/* ---- 待发送图片缩略图条 ---- */
+
+/* 思考区：左侧细线 + 弱化内容，不抢回答的视觉中心 */
+.thinking {
+  border: none;
+  border-left: 2px solid var(--line);
+  border-radius: 0;
+  padding: 1px 0 1px 12px;
+  margin-bottom: 10px;
+  background: transparent;
+  font-size: 0.9em;
+  color: var(--ink-2);
+  max-width: 100%;
+}
+.thinking[open] {
+  padding-bottom: 2px;
+}
+.thinking.streaming {
+  border-left-color: var(--accent);
+}
+.thinking summary {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  list-style: none;
+  color: var(--ink-2);
+  font-size: 0.82rem;
+}
+.thinking summary::after {
+  content: '';
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid var(--ink-3);
+  border-bottom: 1.5px solid var(--ink-3);
+  transform: rotate(45deg);
+  transition: transform 0.15s;
+}
+.thinking[open] summary::after {
+  transform: rotate(225deg);
+}
+.thinking summary::-webkit-details-marker {
+  display: none;
+}
+.thinking summary svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+}
+.thinking summary:hover {
+  color: var(--ink);
+}
+.thinking :deep(.stream-body) {
+  color: var(--ink-2);
+  font-size: 0.92em;
+}
+.pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 2px;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.waiting {
+  color: var(--ink-3);
+  font-size: 0.9em;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-line);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ===== 待发送图片缩略图条 ===== */
 .pending-image {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 6px 0 0;
+  margin: 12px 0 0;
   padding: 6px 8px;
-  border: 1px solid #e1e4e8;
-  border-radius: 12px;
-  background: #fafbfc;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
 }
 .pending-image .thumb {
   width: 52px;
   height: 52px;
   object-fit: cover;
   border-radius: 8px;
-  border: 1px solid #e1e4e8;
+  border: 1px solid var(--line-soft);
   background: #fff;
 }
 .pending-meta {
@@ -868,14 +1415,15 @@ async function onClearClick() {
 }
 .pending-size {
   font-size: 0.78rem;
-  color: #8b949e;
+  color: var(--ink-3);
   font-variant-numeric: tabular-nums;
 }
 .pending-badge {
   align-self: flex-start;
   font-size: 0.72rem;
-  color: #1a73e8;
-  background: #eaf2fe;
+  color: var(--accent);
+  background: var(--accent-weak);
+  border: 1px solid var(--accent-line);
   border-radius: 999px;
   padding: 1px 8px;
 }
@@ -887,9 +1435,9 @@ async function onClearClick() {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  border: 1px solid #d0d7de;
-  background: #fff;
-  color: #43505e;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
   border-radius: 8px;
   padding: 4px 9px;
   font-size: 0.8rem;
@@ -905,131 +1453,293 @@ async function onClearClick() {
   stroke-linejoin: round;
 }
 .chip:hover:not(:disabled) {
-  border-color: #1a73e8;
-  color: #1a73e8;
-  background: #f2f7ff;
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-weak);
 }
 .chip.danger:hover:not(:disabled) {
-  border-color: #cf222e;
-  color: #cf222e;
-  background: #fff5f5;
+  border-color: var(--danger);
+  color: var(--danger);
+  background: var(--danger-bg);
 }
 .chip:disabled {
-  opacity: 0.5;
+  border-color: var(--line-soft);
+  color: var(--ink-3);
   cursor: default;
 }
-.chip:focus-visible,
-.img-btn:focus-visible {
-  outline: 2px solid #1a73e8;
-  outline-offset: 1px;
-}
-.file-picker {
-  display: none;
-}
-.msg.assistant .bubble {
-  background: #fff;
-  border: 1px solid #e1e4e8;
-  border-radius: 4px 14px 14px 14px;
-  padding: 10px 14px;
-}
-.thinking {
-  border: 1px dashed #d0d7de;
-  border-radius: 10px;
-  padding: 6px 12px;
-  margin-bottom: 8px;
-  background: #fafbfc;
-  font-size: 0.92em;
-  color: #57606a;
-}
-.thinking summary {
-  cursor: pointer;
-  user-select: none;
-}
-.waiting {
-  color: #8b949e;
-  font-size: 0.9em;
-}
-.status {
-  border-top: 1px solid #e1e4e8;
-  padding: 8px 2px;
-  font-size: 0.88rem;
-  color: #57606a;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-}
-.usage {
-  padding: 0 2px 6px;
-  font-size: 0.85rem;
-  color: #57606a;
-  white-space: pre-wrap;
-}
-.input-bar {
+
+/* ===== 输入区：实心表面 + 细边框，专注但不厚重 ===== */
+.composer {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
   display: flex;
   gap: 8px;
-  padding: 10px 0 12px;
   align-items: center;
+  padding: 8px 10px;
+  margin: 18px 0 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-pop);
 }
-.img-btn {
-  border: 1px solid #d0d7de;
-  background: #fff;
-  color: #57606a;
-  width: 40px;
-  height: 40px;
-  border-radius: 10px;
-  cursor: pointer;
+.composer-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding: 8px 4px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--ink);
+  /* 多行输入：自动增高到上限后局部滚动，不撑破页面/不遮挡内容 */
+  resize: none;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.composer-input::placeholder {
+  color: var(--ink-3);
+}
+.composer-input:focus-visible {
+  box-shadow: none;
+}
+.composer:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+.send {
+  padding: 0 18px;
+  height: 38px;
+  white-space: nowrap;
+}
+.send svg {
+  width: 15px;
+  height: 15px;
+}
+.continue {
+  height: 38px;
+  padding: 0 12px;
+  white-space: nowrap;
+  background: var(--surface);
+}
+/* 页头「继续生成」仅在手机端替代输入区里的同名按钮，桌面端不显示，避免重复可见 */
+.continue-top {
+  display: none;
+}
+
+/* 回到底部：跟随输入卡这一悬浮层，贴在它上方右侧，不覆盖输入区 */
+.jump-bottom {
+  position: absolute;
+  right: 10px;
+  bottom: calc(100% + 6px);
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
+  gap: 5px;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 0.78rem;
+  cursor: pointer;
+  box-shadow: var(--shadow-card);
 }
-.img-btn svg {
-  width: 19px;
-  height: 19px;
+.jump-bottom:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.jump-bottom svg {
+  width: 13px;
+  height: 13px;
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.6;
+  stroke-width: 1.7;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.img-btn:hover:not(:disabled) {
-  border-color: #1a73e8;
-  color: #1a73e8;
-  background: #f2f7ff;
+
+/* ===== 登录页：同配色同控件，简洁无装饰 ===== */
+.login {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(360px, 92%);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: var(--shadow-pop);
+  padding: 34px 30px 26px;
+  text-align: center;
 }
-.img-btn:disabled {
-  opacity: 0.5;
+.login .mark.large {
+  align-self: center;
+  margin-bottom: 2px;
+}
+.login h1 {
+  font-size: 1.25rem;
+  margin: 0;
+  font-weight: 650;
+}
+.login .hint {
+  margin: 0 0 10px;
+  color: var(--ink-3);
+  font-size: 0.86rem;
+}
+.login input {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-ctl);
+  padding: 10px 12px;
+  font-size: 0.95rem;
+  background: var(--surface);
+  color: var(--ink);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.login input:focus-visible {
+  border-color: var(--accent);
+}
+.login button[type='submit'] {
+  border: none;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-radius: var(--radius-ctl);
+  padding: 11px 0;
+  font-size: 0.95rem;
+  font-weight: 550;
+  letter-spacing: 0.3em;
+  text-indent: 0.3em;
+  cursor: pointer;
+  margin-top: 6px;
+}
+.login button[type='submit']:hover:not(:disabled) {
+  background: var(--accent-deep);
+}
+.login button:disabled {
+  background: #2b3148;
+  color: var(--ink-3);
   cursor: default;
 }
-.input-bar input:not(.file-picker) {
-  flex: 1;
-  border: 1px solid #d0d7de;
-  border-radius: 10px;
-  padding: 9px 12px;
-  font-size: 0.95rem;
+.login .error {
+  color: var(--danger);
+  font-size: 0.88rem;
+  margin: 0;
 }
-.input-bar .send {
-  border: none;
-  background: #1a73e8;
-  color: #fff;
-  border-radius: 10px;
-  padding: 0 18px;
-  font-size: 0.95rem;
-  cursor: pointer;
-  white-space: nowrap;
+.login .foot {
+  margin: 12px 0 0;
+  font-size: 0.76rem;
+  color: var(--ink-3);
 }
-.input-bar .send:disabled {
-  opacity: 0.5;
-}
-.input-bar .send.stop {
-  background: #cf222e;
-}
+
+/* ===== 手机视口 ===== */
 @media (max-width: 560px) {
   .page {
-    padding: 8px 8px 0;
+    /* 顶部避开刘海、底部避开手势条：页头与输入卡都是 sticky，按容器内边距留位 */
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 8px
+      calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+  .header {
+    padding: 8px 2px;
+  }
+  .brand h1 {
+    font-size: 1rem;
+  }
+  .user-bar {
+    width: 100%;
+    justify-content: flex-start;
+    /* 窄屏页头换行而非横向溢出 */
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .user-chip {
+    min-width: 0;
+    max-width: 100%;
+  }
+  /* 操作按钮整组另起一行：「新对话」与「继续生成」必定并排，组内再按宽度换行 */
+  .user-actions {
+    width: 100%;
+    gap: 10px;
+  }
+  /* 拇指可点区域：页头次级按钮与模式选择都抬高到 40px */
+  .user-actions .btn,
+  .mode-select {
+    min-height: 40px;
   }
   .msg.user .bubble,
-  .msg.assistant .bubble {
+  .msg.assistant .bubble.answer {
     max-width: 94%;
+  }
+  .thinking {
+    max-width: 96%;
+  }
+  .chat {
+    /* 内容不足一屏时也把输入区顶到屏幕底部，避免下方留出大片空白 */
+    flex: 1;
+    gap: 16px;
+    padding: 14px 2px;
+  }
+  /* 手机端显示页头「继续生成」，隐藏输入区里的同名按钮（避免重复） */
+  .continue-top {
+    display: inline-flex;
+  }
+  /* 输入区改为上下两行：第一行 textarea 独占宽度，第二行放图片上传、回到底部与发送/停止 */
+  .composer {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 6px 8px;
+    align-items: center;
+    margin: 10px 0 8px;
+  }
+  .composer .composer-input {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    max-height: 120px;
+  }
+  .composer .icon-btn {
+    grid-column: 1;
+    grid-row: 2;
+    width: 44px;
+    height: 44px;
+  }
+  .composer .send,
+  .composer .danger-btn {
+    grid-column: 3;
+    grid-row: 2;
+    /* 普通长度即取自然宽度，靠右对齐，不铺满整行 */
+    justify-self: end;
+    height: 44px;
+  }
+  .composer .continue {
+    display: none;
+  }
+  /* 手机端把「回到底部」放进第二行的空档：不压住正文，也不用另起一个悬浮层 */
+  .composer .jump-bottom {
+    position: static;
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: start;
+    min-height: 34px;
+  }
+}
+
+/* 软键盘占用半屏（布局视口随之变矮）：压缩悬浮层留白与输入增高上限，保住正文可读高度 */
+@media (max-width: 560px) and (max-height: 560px) {
+  .page {
+    padding-top: calc(4px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(4px + env(safe-area-inset-bottom, 0px));
+  }
+  .header {
+    padding: 4px 2px;
+  }
+  .chat {
+    padding: 8px 2px;
+  }
+  .composer {
+    padding: 6px 8px;
+    margin: 6px 0 4px;
+  }
+  .composer .composer-input {
+    max-height: 88px;
   }
 }
 </style>

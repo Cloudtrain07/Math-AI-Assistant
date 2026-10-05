@@ -2,7 +2,12 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit：让 CSS 里的 env(safe-area-inset-*) 生效（否则恒为 0）；
+         interactive-widget：软键盘弹出时收缩布局视口，sticky 输入区跟着抬到键盘上方 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <title>数学助手 · 流式公式原型</title>
   </head>
   <body>

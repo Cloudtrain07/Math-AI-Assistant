@@ -37,6 +37,30 @@ export function composeNotice(d: DonePayload): string {
   return notes.join('\n\n')
 }
 
+/** 提示种类：决定状态区图标与配色，不只靠文字区分。 */
+export type StatusKind = 'info' | 'success' | 'warn' | 'error'
+
+/**
+ * 按 done 载荷的**结构化字段**判定收尾状态种类，不搜索中文提示字符串：
+ * - error：模型错误 / 历史保存失败（最严重）；
+ * - warn：空回答 / 截断 / 图片读取失败 / 每日用量记账失败；
+ * - info：保存标记过期（stale，非失败，仅说明本次未落盘）；
+ * - success：正常完成。
+ * 这是「done ≠ 全部成功」的判定入口。
+ */
+export function classifyDone(d: DonePayload): StatusKind {
+  if (d.error) return 'error'
+  if (d.save_status === 'failed') return 'error'
+  if (d.empty_reply) return 'warn'
+  if (d.truncated) return 'warn'
+  if (d.image_status) return 'warn'
+  if (d.daily_status === 'record_failed' || d.daily_status === 'stats_failed') {
+    return 'warn'
+  }
+  if (d.save_status === 'stale') return 'info'
+  return 'success'
+}
+
 export function composeDaily(d: DonePayload): string {
   if (d.daily_used === null) return ''
   const mine = `🛡️ 今日已用 ${d.daily_used.toLocaleString()} / ${d.daily_limit.toLocaleString()}（本账号）`

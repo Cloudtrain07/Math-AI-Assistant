@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { composeDaily, composeNotice } from './notice'
+import { classifyDone, composeDaily, composeNotice } from './notice'
 import type { DonePayload } from './api'
 
 function base(overrides: Partial<DonePayload> = {}): DonePayload {
@@ -14,6 +14,7 @@ function base(overrides: Partial<DonePayload> = {}): DonePayload {
     cumulative_usage: '📊 本会话累计 10 tokens（共 1 轮）',
     save_note: '',
     save_status: 'saved',
+    daily_status: 'recorded',
     daily_note: '',
     daily_used: 10,
     global_used: 10,
@@ -92,5 +93,51 @@ describe('composeDaily', () => {
     const text = composeDaily(base({ global_used: null }))
     expect(text).toContain('本账号')
     expect(text).not.toContain('全局')
+  })
+})
+
+describe('classifyDone（done ≠ 全部成功，按结构化字段判定）', () => {
+  it('正常完成 → success', () => {
+    expect(classifyDone(base())).toBe('success')
+  })
+
+  it('模型错误 → error', () => {
+    expect(classifyDone(base({ error: '⚠️ 请求失败（RuntimeError）' }))).toBe('error')
+  })
+
+  it('空回答 → warn', () => {
+    expect(classifyDone(base({ answer: '', empty_reply: true }))).toBe('warn')
+  })
+
+  it('截断 → warn', () => {
+    expect(classifyDone(base({ truncated: true }))).toBe('warn')
+  })
+
+  it('图片读取失败 → warn', () => {
+    expect(classifyDone(base({ image_status: '⚠️ 图片读取失败，已按纯文本发送。' }))).toBe('warn')
+  })
+
+  it('历史保存失败 → error（优先于其它 warn）', () => {
+    expect(classifyDone(base({ save_status: 'failed', truncated: true }))).toBe('error')
+  })
+
+  it('保存 stale → info（非失败）', () => {
+    expect(classifyDone(base({ save_status: 'stale' }))).toBe('info')
+  })
+
+  it('每日用量记账失败 → warn', () => {
+    expect(classifyDone(base({ daily_status: 'record_failed' }))).toBe('warn')
+    expect(classifyDone(base({ daily_status: 'stats_failed' }))).toBe('warn')
+  })
+
+  it('每日用量正常 → success', () => {
+    expect(classifyDone(base({ daily_status: 'recorded' }))).toBe('success')
+    expect(classifyDone(base({ daily_status: null }))).toBe('success')
+  })
+
+  it('模型错误优先于保存失败之外的一切降级状态', () => {
+    expect(
+      classifyDone(base({ error: 'x', empty_reply: true, save_status: 'stale' })),
+    ).toBe('error')
   })
 })

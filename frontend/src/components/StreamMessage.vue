@@ -196,6 +196,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
 <style scoped>
 .stream-body {
   overflow-wrap: break-word;
+  min-width: 0;
 }
 .line {
   display: block;
@@ -205,33 +206,45 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
 }
 .math-block {
   overflow-x: auto;
-  margin: 0.6em 0;
+  margin: 1em 0;
 }
 .math-inline {
   white-space: nowrap;
 }
 .code-block {
   overflow-x: auto;
-  background: #f6f8fa;
-  border-radius: 6px;
-  padding: 0.75em 1em;
+  background: var(--surface, #1d1f26);
+  border: 1px solid var(--line, #343843);
+  border-radius: 10px;
+  padding: 0.8em 1.1em;
   font-size: 0.9em;
   line-height: 1.5;
 }
 .heading {
-  margin: 0.8em 0 0.4em;
+  font-size: 1.06em;
+  font-weight: 650;
+  margin: 1.3em 0 0.45em;
+  color: var(--ink, #e4e6eb);
+}
+.heading:first-child {
+  margin-top: 0.15em;
 }
 .para {
-  margin: 0.35em 0;
+  margin: 0.5em 0;
 }
 .list {
-  margin: 0.35em 0;
-  padding-left: 1.5em;
+  margin: 0.5em 0;
+  padding-left: 1.4em;
+}
+.list li {
+  margin: 0.3em 0;
 }
 .quote {
-  margin: 0.5em 0;
-  padding: 0.1em 0.9em;
-  border-left: 4px solid #d0d7de;
-  color: #57606a;
+  margin: 0.8em 0;
+  padding: 0.1em 0.95em;
+  border-left: 2px solid var(--accent-line, #46538a);
+  color: var(--ink-2, #a9afbb);
+  background: transparent;
+  border-radius: 0;
 }
 </style>
