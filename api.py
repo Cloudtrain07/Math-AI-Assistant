@@ -69,6 +69,20 @@ core.login（校验+日志+登录计数唯一入口）与 core.ui_text（共用�
   转发头的代理）；
 - 会话策略：重置密码不使现有会话失效（会话 token 与密码无关），
   旧密码不能再建立新会话；不提供"踢出所有设备"。
+
+启动边界：
+- 导入本模块与 create_api_app(runtime) 都不启动服务、备份线程、隧道或浏览器，
+  配套任务只由 main() 通过 LaunchSupport 显式接上（旧 Gradio 走 app.py，不经过这里）；
+- LaunchSupport 是本次启动配套资源的唯一持有者：备份停止信号与线程、隧道 watcher、
+  浏览器等待线程与落盘文件都按 runtime.data_dir + 实际端口归属，
+  退出、Ctrl+C、端口占用与启动中途失败都只回收自己创建的那些；
+- 公网隧道是显式开关（--tunnel），缺省不对外开放；地址信息文件只记录地址与更新时间，
+  不含账号、密码或 API Key。
+- 静态服务只暴露 frontend/dist：备份 zip、访问地址文件与临时图片都在 data_dir 内，
+  不经任何 HTTP 路径公开。
+- Windows 的控制台 Ctrl+Break 默认直接结束进程、绕过 finally，因此 main() 在启动入口
+  登记 SIGBREAK 保护：处理器只把它变成 KeyboardInterrupt，不拿锁、不结束子进程，
+  清理仍走 finally 与 close()，退出时恢复原处理器；导入本模块与应用工厂都不改信号处置。
 """
 
 from __future__ import annotations
@@ -77,12 +91,17 @@ import argparse
 import datetime
 import io
 import json
+import os
 import secrets
+import signal
+import socket
 import threading
 import time
 import urllib.parse
+import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import anyio
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
@@ -94,13 +113,23 @@ from starlette.concurrency import iterate_in_threadpool
 # 与旧界面共用：登录副作用与文案/格式化来自 core，本层不依赖 app/gradio
 from core import chat_service
 from core import dialogue_state
-from core.access import is_owner_host
+from core.access import (
+    address_entries,
+    browse_host,
+    build_url,
+    get_lan_ipv6,
+    is_ipv6_wildcard_bind,
+    is_owner_host,
+    save_address_info,
+)
 from core.accounts import load_accounts, reset_password
+from core.backup import BackupResult, daily_backup_loop, run_backup
 from core.login import verify_login
 from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
 from core.providers import get_provider_supports_thinking
 from core.runtime import AppRuntime, build_runtime
 from core.storage import HistoryReadError, safe_account_name
+from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.ui_text import (
     DAILY_FAILED_MSG,
     DAILY_STATS_FAILED_MSG,
@@ -1331,7 +1360,327 @@ def enable_fake_clients(runtime: AppRuntime, *, piece_delay: float = 0.02) -> No
         runtime.client = next(iter(clients.values()))
 
 
+# ===================== 启动配套任务（只由启动入口使用） =====================
+
+
+ADDRESS_FILE_NAME = "访问地址.txt"
+TUNNEL_PID_FILE_NAME = "cloudflared-{port}.pid"
+BROWSER_READY_TIMEOUT_SECONDS = 20.0
+CLEANUP_JOIN_TIMEOUT_SECONDS = 5.0
+
+# IPv6 局域网地址"还没探测过"的标记（探测结果可能是 None，不能拿 None 当未探测）
+_UNRESOLVED = object()
+
+
+def _port_is_listening(host: str, port: int, timeout: float = 0.2) -> bool:
+    """TCP 探测服务是否已开始接受连接。
+
+    uvicorn 先完成应用启动再绑定监听端口，因此端口可连即表示已在服务。
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        return probe.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+
+
+def _sigbreak_handler(signum: int, frame: object) -> None:
+    """把控制台 Ctrl+Break 变成与 Ctrl+C 相同的中断。
+
+    只抛异常：不拿锁、不结束子进程，真正的资源清理由启动入口的 finally
+    与 LaunchSupport.close 执行。
+    """
+    raise KeyboardInterrupt("收到 Ctrl+Break，正在退出")
+
+
+def install_sigbreak_guard() -> Callable[[], None]:
+    """登记主线程的 SIGBREAK 保护，返回恢复原处理器的方式（Windows 控制台 Break 键）。
+
+    Windows 上 SIGBREAK 的默认处置是直接结束进程，会绕过启动入口的 finally，
+    把已创建的隧道进程与 PID 记录留在原地。登记后 Break 走与 Ctrl+C 相同的中断路径；
+    Uvicorn 收尾时会把本处理器当作"原处理器"恢复并重发它捕获到的信号，
+    于是服务运行期间按 Break 也能进到 finally。
+
+    非 Windows、系统没有 SIGBREAK、或不在主线程时返回空操作：
+    导入本模块与应用工厂都不改动进程的信号处置。
+    """
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is None:
+        return lambda: None
+    if threading.current_thread() is not threading.main_thread():
+        print("⚠️ 不在主线程启动，未登记 Ctrl+Break 保护（只影响控制台 Break 键）")
+        return lambda: None
+    try:
+        previous = signal.signal(sigbreak, _sigbreak_handler)
+    except (ValueError, OSError) as exc:
+        print(f"⚠️ 未能登记 Ctrl+Break 保护：{exc}")
+        return lambda: None
+
+    def restore() -> None:
+        try:
+            signal.signal(sigbreak, previous)
+        except BaseException as exc:
+            # 只提示：恢复失败不能顶掉正在传播的启动异常
+            print(f"⚠️ 恢复 Ctrl+Break 原处理器失败：{exc}")
+
+    return restore
+
+
+class LaunchSupport:
+    """新版 API 的启动配套：每日备份、可选公网隧道、访问地址文件与自动开浏览器。
+
+    归属明确，close() 只回收本次实际创建的对象：
+    - 备份线程与停止信号记在实例上，备份目录取 runtime.data_dir，不改全局常量；
+    - 隧道 PID 文件按 data_dir + 端口命名，不读写旧 Gradio 的 data/cloudflared.pid，
+      清理只按自己记录的 PID，绝不按进程名批量结束 Python 或 cloudflared；
+    - 地址文件写在 data_dir 内，只含地址与更新时间；旧 Gradio 的
+      data/当前访问密码.txt 由 app.py 自己维护，这里不读不写。
+    """
+
+    def __init__(
+        self,
+        runtime: AppRuntime,
+        *,
+        host: str,
+        port: int,
+        tunnel: bool = False,
+        open_browser: bool = False,
+        backup_interval_seconds: int = 3600,
+    ) -> None:
+        self.data_dir = Path(runtime.data_dir)
+        self.host = host
+        self.port = port
+        self.tunnel = tunnel
+        self.open_browser = open_browser
+        self.backup_interval_seconds = backup_interval_seconds
+        # 隧道与浏览器都不能用通配监听写法：按地址族归一到本机可达的回环地址，
+        # 具体监听地址（如 127.0.0.2、::1）保持原地址；URL 里 IPv6 由 build_url 加方括号，
+        # socket 探测与端口预检仍用不带方括号的原始主机地址
+        self.reachable_host = browse_host(host)
+        self.browse_url = build_url(self.reachable_host, port)
+        # cloudflared 的 --url 指向同一个本机可达地址
+        self.tunnel_url = self.browse_url
+        self.address_file = self.data_dir / ADDRESS_FILE_NAME
+        self.tunnel_pid_file = self.data_dir / TUNNEL_PID_FILE_NAME.format(port=port)
+        self.public_url: str | None = None
+        self._lan_ipv6: object = _UNRESOLVED
+        self._backup_stop: threading.Event | None = None
+        self._backup_thread: threading.Thread | None = None
+        self._watcher: TunnelWatcher | None = None
+        self._browser_stop: threading.Event | None = None
+        self._browser_thread: threading.Thread | None = None
+        self._closed = False
+
+    # ---- 每日备份 ----
+
+    @staticmethod
+    def report_backup(result: BackupResult) -> None:
+        """备份结局提示：失败必须明确说出，不能与"今天已备份过"一样沉默。"""
+        if result.status == "created":
+            print(f"数据备份：已生成 {result.path}")
+        elif result.status == "failed":
+            print(
+                "⚠️ 数据备份失败（磁盘空间或权限问题），今日数据未打包；"
+                "服务仍可正常使用，可稍后手动备份 data 目录。"
+            )
+
+    def start_backup(self) -> None:
+        """先补一次今日备份，再起跨天检查线程（目录来自 runtime.data_dir）。"""
+        self.report_backup(run_backup(data_dir=self.data_dir))
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=daily_backup_loop,
+            kwargs={
+                "interval_seconds": self.backup_interval_seconds,
+                "stop_event": stop_event,
+                "data_dir": self.data_dir,
+                "on_result": self.report_backup,
+            },
+            daemon=True,
+            name="maa-api-backup",
+        )
+        # 先登记再启动：启动过程中收到退出信号时 close() 也能收尾
+        self._backup_stop = stop_event
+        self._backup_thread = thread
+        thread.start()
+
+    # ---- 监听端口预检 ----
+
+    def ensure_port_free(self) -> None:
+        """绑定前确认端口可用：占用时立即失败，不创建隧道与浏览器任务。
+
+        uvicorn 自身绑定失败同样会走到 close() 收尾，这里只是把最常见的
+        "端口已被占用"提前说清楚，避免先建立公网隧道再白等一次启动失败。
+        """
+        family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+        probe = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            probe.bind((self.host, self.port))
+        except OSError as exc:
+            raise OSError(
+                f"端口 {self.host}:{self.port} 无法监听（{exc}），"
+                "请改用其他端口，或先关闭正在占用该端口的程序。"
+            ) from exc
+        finally:
+            try:
+                probe.close()
+            except OSError:
+                pass
+
+    # ---- 访问地址信息 ----
+
+    def _lan_ipv6_for_display(self) -> str | None:
+        """IPv6 通配监听时与手机同族的局域网地址：只在需要时探测一次。
+
+        返回空串表示"已确认没有可用地址"，控制台与地址文件共用同一份结果，
+        不会因为二次探测给出不同地址；非 IPv6 通配监听不探测（用不上）。
+        """
+        if not is_ipv6_wildcard_bind(self.host):
+            return None
+        if self._lan_ipv6 is _UNRESOLVED:
+            self._lan_ipv6 = get_lan_ipv6() or ""
+        return self._lan_ipv6  # type: ignore[return-value]
+
+    def address_info(self) -> dict[str, str]:
+        """本次启动的实际访问地址（与控制台输出、地址文件同一口径）。"""
+        return address_entries(
+            self.host,
+            self.port,
+            public_url=self.public_url,
+            lan_ipv6=self._lan_ipv6_for_display(),
+        )
+
+    def write_address_info(self) -> Path:
+        """写地址文件（不含账号密码）；公网 URL 变化后由隧道回调再写一次。"""
+        return save_address_info(
+            self.host,
+            self.port,
+            target=self.address_file,
+            public_url=self.public_url,
+            lan_ipv6=self._lan_ipv6_for_display(),
+        )
+
+    # ---- 可选公网隧道 ----
+
+    def start_tunnel(self) -> None:
+        """--tunnel 时建立 Cloudflare 快速隧道；缺省不开公网，也不查找 cloudflared。
+
+        目标是本次启动的实际地址（不是写死的 7860）；缺少 cloudflared 或建立超时
+        都只提示，本地服务照常可用，本程序不下载任何工具。
+        """
+        if not self.tunnel:
+            return
+        cleanup_stale_tunnel(pid_file=self.tunnel_pid_file)
+        cloudflared_path = find_cloudflared()
+        if cloudflared_path is None:
+            print(
+                "未找到 cloudflared.exe，公网隧道未启动（请把 cloudflared.exe 放到项目根目录，"
+                "本程序不会自动下载）。仍可通过本机或局域网地址访问。"
+            )
+            return
+        print(f"正在建立 Cloudflare 公网隧道（目标 {self.tunnel_url}）…")
+        watcher = TunnelWatcher(
+            cloudflared_path,
+            local_url=self.tunnel_url,
+            on_url=self._on_public_url,
+            pid_file=self.tunnel_pid_file,
+        )
+        self._watcher = watcher  # 先登记：建立过程中被中断也能收尾
+        watcher.start()
+        self.public_url = watcher.url
+        if watcher.url:
+            print(f"公网链接：{watcher.url}")
+        else:
+            print("公网隧道建立失败（连接 Cloudflare 超时），本地服务仍可正常使用。")
+
+    def _on_public_url(self, url: str) -> None:
+        """隧道重连换了公网地址：同步更新地址文件（后台线程内，写失败只提示）。"""
+        self.public_url = url
+        try:
+            self.write_address_info()
+        except OSError as exc:
+            print(f"⚠️ 访问地址文件更新失败：{exc}，请手动记录公网地址：{url}")
+        print(f"公网链接已更新：{url}")
+
+    # ---- 自动打开浏览器 ----
+
+    def open_browser_when_ready(self) -> None:
+        """等服务开始接受连接后打开本机地址；不可用则超时提示，不阻塞启动。"""
+        if not self.open_browser:
+            return
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._wait_and_open_browser,
+            args=(stop_event,),
+            daemon=True,
+            name="maa-api-browser",
+        )
+        self._browser_stop = stop_event
+        self._browser_thread = thread
+        thread.start()
+
+    def _wait_and_open_browser(self, stop_event: threading.Event) -> None:
+        deadline = time.monotonic() + BROWSER_READY_TIMEOUT_SECONDS
+        while True:
+            if stop_event.is_set():
+                return  # 服务已在收尾，不再打开浏览器
+            if _port_is_listening(self.reachable_host, self.port):
+                try:
+                    webbrowser.open(self.browse_url)
+                except Exception as exc:
+                    print(f"⚠️ 自动打开浏览器失败：{exc}，请手动访问 {self.browse_url}")
+                return
+            if time.monotonic() >= deadline:
+                print(f"⚠️ 服务在 {BROWSER_READY_TIMEOUT_SECONDS:.0f} 秒内未就绪，"
+                      f"未自动打开浏览器，请手动访问 {self.browse_url}")
+                return
+            stop_event.wait(0.2)
+
+    # ---- 收尾 ----
+
+    def close(self) -> None:
+        """回收本次创建的配套资源：先置停止信号，再停隧道，最后等待线程。
+
+        每一步失败都只提示、不抛出：清理错误不能掩盖原始启动错误，失败退出码要保留。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._backup_stop is not None:
+            self._backup_stop.set()
+        if self._browser_stop is not None:
+            self._browser_stop.set()
+        try:
+            if self._watcher is not None:
+                self._watcher.stop()
+        except Exception as exc:
+            print(f"⚠️ 公网隧道清理失败，请手动关闭本次启动的 cloudflared 进程：{exc}")
+        try:
+            if self._browser_thread is not None:
+                self._browser_thread.join(timeout=CLEANUP_JOIN_TIMEOUT_SECONDS)
+        except Exception as exc:
+            print(f"⚠️ 浏览器等待任务收尾失败：{exc}")
+        try:
+            if self._backup_thread is not None:
+                self._backup_thread.join(timeout=CLEANUP_JOIN_TIMEOUT_SECONDS)
+        except Exception as exc:
+            print(f"⚠️ 备份线程收尾失败（正在写盘的备份可能未完成）：{exc}")
+
+
 def main() -> None:
+    """新版 API 启动入口：组装依赖 → 配套任务 → 单进程服务 → 退出清理。
+
+    启动异常（Ctrl+C、端口占用、写盘失败）原样向外传播以保留失败退出码，
+    finally 只回收 LaunchSupport 本次实际创建的配套资源。
+    旧 Gradio 的启动方式（app.py 与 启动数学助手.bat）不受这里影响。
+    """
     parser = argparse.ArgumentParser(description="数学学习 AI 助手（FastAPI 版）")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -1344,6 +1693,16 @@ def main() -> None:
         "--isolated",
         action="store_true",
         help="自动验证用：配置/账号/数据全部落在临时目录，不读写真实 data 与 .env",
+    )
+    parser.add_argument(
+        "--tunnel",
+        action="store_true",
+        help="可选：建立 Cloudflare 公网隧道（需已有 cloudflared.exe，不会自动下载）；缺省不开公网",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="启动后不自动打开浏览器（等同环境变量 AUTO_OPEN_BROWSER=false）",
     )
     args = parser.parse_args()
 
@@ -1371,9 +1730,41 @@ def main() -> None:
         for account in runtime.accounts:
             print(f"[隔离账号] {account['username']} / {account['password']}")
 
-    import uvicorn
+    # 自动开浏览器沿用旧界面的 AUTO_OPEN_BROWSER 开关；
+    # 隔离验证默认既不打开浏览器，也不建立公网隧道
+    auto_open_browser = (
+        not args.no_browser
+        and not args.isolated
+        and os.getenv("AUTO_OPEN_BROWSER", "true").strip().lower() != "false"
+    )
+    support = LaunchSupport(
+        runtime,
+        host=args.host,
+        port=args.port,
+        tunnel=args.tunnel,
+        open_browser=auto_open_browser,
+    )
+    # Windows 控制台 Break 默认直接结束进程，会绕过下面的 finally：先在主线程登记保护
+    restore_sigbreak = install_sigbreak_guard()
+    print("数学学习 AI 助手（新版 API）启动中…")
+    try:
+        support.start_backup()
+        support.ensure_port_free()
+        support.start_tunnel()
+        support.write_address_info()
+        for label, value in support.address_info().items():
+            print(f"{label}：{value}")
+        print(f"访问地址信息已保存到：{support.address_file}")
+        support.open_browser_when_ready()
+        import uvicorn
 
-    uvicorn.run(create_api_app(runtime), host=args.host, port=args.port)
+        # 单进程运行：不启用 reload 与多 worker
+        uvicorn.run(create_api_app(runtime), host=args.host, port=args.port)
+    finally:
+        try:
+            support.close()
+        finally:
+            restore_sigbreak()
 
 
 if __name__ == "__main__":
