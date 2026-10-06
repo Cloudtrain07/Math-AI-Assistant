@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""新版 API 的启动配套测试：每日备份、可选公网隧道、访问地址信息与退出清理。
+"""新版 API 的启动配套测试：每日备份、访问地址信息与退出清理。
 
-替身策略（本轮禁止建立真实公网隧道）：
-- cloudflared 查找、残留清理与 TunnelWatcher 全部换成记录型替身；
+替身策略（不起真实服务器）：
 - uvicorn.run 打桩，由替身决定"服务运行期间"发生什么、以何种方式退出；
 - webbrowser.open 与端口就绪探测打桩，浏览器等待线程可确定性验证。
 文件一律落在临时目录：不读写真实 data、.env、providers.json，不调用收费 API。
@@ -32,7 +31,6 @@ from core.runtime import build_runtime
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # 非默认端口：任何把 7860/8000 写死的实现都会在这里暴露
 PORT = 8123
-PUBLIC_URL = "https://fake-words.trycloudflare.com"
 FAKE_LAN_IP = "192.0.2.7"
 
 
@@ -50,62 +48,16 @@ def make_runtime(tmp_path: Path, *, accounts=None, data_dir: Path | None = None)
     )
 
 
-class FakeWatcher:
-    """隧道替身：start 按配置产出或产不出公网 URL，并可模拟建立中途被打断。"""
-
-    def __init__(self, cloudflared_path, local_url, *, on_url, pid_file, env):
-        self.cloudflared_path = cloudflared_path
-        self.local_url = local_url
-        self.on_url = on_url
-        self.pid_file = pid_file
-        self.env = env
-        self.url = None
-        self.start_calls = 0
-        self.stop_calls = 0
-        self.stop_error: Exception | None = None
-
-    def start(self) -> None:
-        self.start_calls += 1
-        if self.env.watcher_start_error is not None:
-            # 真实实现里子进程已创建、还没交接就收到 Ctrl+C
-            raise self.env.watcher_start_error
-        if self.env.watcher_fail:
-            return
-        self.url = self.env.watcher_url
-        if self.on_url is not None:
-            # 与真实实现一致：建立成功即回调公网地址
-            self.on_url(self.url)
-
-    def reconnect(self, url: str) -> None:
-        """模拟断线重连后换到新的公网地址。"""
-        self.url = url
-        if self.on_url is not None:
-            self.on_url(url)
-
-    def stop(self) -> None:
-        self.stop_calls += 1
-        if self.stop_error is not None:
-            raise self.stop_error
-
-
 class StartupEnv:
     """LaunchSupport / main() 触达的全部外部动作替身，并记录调用。"""
 
     def __init__(self, tmp_path, monkeypatch):
-        self.watchers: list[FakeWatcher] = []
-        self.stale_cleanups: list[Path] = []
         self.browser_opened: list[str] = []
         self.browser_ready = threading.Event()
         self.readiness_probes: list[tuple[str, int]] = []
-        # None 表示环境里没有 cloudflared.exe（本程序不下载、不安装）
-        self.cloudflared: Path | None = tmp_path / "cloudflared.exe"
-        self.watcher_url = PUBLIC_URL
-        self.watcher_fail = False
-        # 非 None 时 watcher.start() 抛出该异常：模拟"子进程已创建、还没交接就被打断"
-        self.watcher_start_error: BaseException | None = None
-        # 非 None 时在"查找 cloudflared"这一步向主线程投递该信号：
-        # 模拟控制台 Ctrl+Break 正好落在隧道启动阶段（信号总是在主线程被处理）
-        self.signal_at_find_cloudflared: int | None = None
+        # 非 None 时在"写地址文件"这一步向主线程投递该信号：
+        # 模拟控制台 Ctrl+C / Ctrl+Break 正好落在启动配套阶段（信号总在主线程被处理）
+        self.signal_at_address_write: int | None = None
         # 非 None 时在 uvicorn 收尾（恢复原处理器并重发信号）之后投递该信号
         self.signal_after_uvicorn_exit: int | None = None
         # IPv6 局域网探测结果：None 表示拿不到；probes 记录探测次数
@@ -116,13 +68,17 @@ class StartupEnv:
         self.uvicorn_error: BaseException | None = None
         # True 时替身等到浏览器打开才返回，模拟"服务正在运行的这段时间"
         self.uvicorn_blocks_until_browser = False
-        # 在"服务运行期间"执行的钩子（用于安排清理报错等状态）
-        self.on_serve = None
 
-        monkeypatch.setattr(api, "find_cloudflared", self._find_cloudflared)
-        monkeypatch.setattr(api, "cleanup_stale_tunnel", self._cleanup_stale)
-        monkeypatch.setattr(api, "TunnelWatcher", self._watcher)
+        real_save_address_info = api.save_address_info
+
+        def save_address_info(*args, **kwargs):
+            if self.signal_at_address_write is not None:
+                # 主线程正停在启动配套阶段，此刻控制台按下 Break/Ctrl+C
+                signal.raise_signal(self.signal_at_address_write)
+            return real_save_address_info(*args, **kwargs)
+
         monkeypatch.setattr(api, "_port_is_listening", self._port_is_listening)
+        monkeypatch.setattr(api, "save_address_info", save_address_info)
         monkeypatch.setattr("webbrowser.open", self._open_browser)
         # 局域网探测不打真网络：地址文件里的局域网 IP 固定可断言
         monkeypatch.setattr("core.access.get_lan_ip", lambda: FAKE_LAN_IP)
@@ -138,22 +94,6 @@ class StartupEnv:
         self.lan_ipv6_probes += 1
         return self.lan_ipv6
 
-    def _find_cloudflared(self, search_dirs=None):
-        if self.signal_at_find_cloudflared is not None:
-            # 主线程正停在隧道启动阶段，此刻控制台按下 Break
-            signal.raise_signal(self.signal_at_find_cloudflared)
-        return self.cloudflared
-
-    def _cleanup_stale(self, pid_file=None):
-        self.stale_cleanups.append(Path(pid_file) if pid_file is not None else None)
-
-    def _watcher(self, cloudflared_path, local_url, on_url=None, pid_file=None, **kwargs):
-        watcher = FakeWatcher(
-            cloudflared_path, local_url, on_url=on_url, pid_file=pid_file, env=self
-        )
-        self.watchers.append(watcher)
-        return watcher
-
     def _port_is_listening(self, host, port, timeout=0.2):
         self.readiness_probes.append((host, port))
         return self.serving
@@ -167,8 +107,6 @@ class StartupEnv:
         self.uvicorn_calls.append((app, kwargs))
         if self.uvicorn_blocks_until_browser:
             assert self.browser_ready.wait(5), "服务运行期间没有打开浏览器"
-        if self.on_serve is not None:
-            self.on_serve(self)
         if self.signal_after_uvicorn_exit is not None:
             # 与 uvicorn capture_signals 一致：把进来时的处理器当作"原处理器"保存，
             # 运行期间换成自己的，退出时先恢复、再重发捕获到的信号
@@ -285,10 +223,10 @@ print(json.dumps({
 
 
 def test_import_and_factory_start_no_side_effects():
-    """导入 api 与 create_api_app 都不启动备份线程/隧道/浏览器/服务器，也不写配套文件。
+    """导入 api 与 create_api_app 都不启动备份线程/浏览器/服务器，也不写配套文件。
 
     防住的独立风险：配套任务被挂到模块导入或应用工厂上，接口测试与多实例启动
-    会被隐式带着起线程、建隧道；同时确认新增的 core.backup/tunnel/access 导入
+    会被隐式带着起线程；同时确认新增的 core.backup/access 导入
     没有把 Gradio 依赖带回 API 层。
     """
     proc = subprocess.run(
@@ -303,7 +241,7 @@ def test_import_and_factory_start_no_side_effects():
     )
     assert proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
     result = json.loads(proc.stdout.strip().splitlines()[-1])
-    # 没有新线程、没有子进程（cloudflared）、没有浏览器调用
+    # 没有新线程、没有子进程、没有浏览器调用
     assert [e for e in result["events"] if e[0] == "thread"] == []
     assert [e for e in result["events"] if e[0] == "subprocess"] == []
     assert [e for e in result["events"] if e[0] == "browser"] == []
@@ -331,9 +269,6 @@ def test_create_api_app_does_not_call_companion_entries(tmp_path, monkeypatch):
     for name in (
         "run_backup",
         "daily_backup_loop",
-        "find_cloudflared",
-        "cleanup_stale_tunnel",
-        "TunnelWatcher",
         "save_address_info",
     ):
         monkeypatch.setattr(api, name, _fail_on_call(name))
@@ -404,57 +339,7 @@ def test_backup_thread_is_stopped_and_joined(tmp_path, env):
     assert backup_threads() == []
 
 
-# ===================== 可选公网隧道 =====================
-
-
-def test_tunnel_is_off_by_default(tmp_path, env, capsys):
-    """缺省不开公网：不查 cloudflared、不清残留、不建隧道。
-
-    防住的独立风险：新界面把公网暴露当成默认行为。
-    """
-    support = env.support(make_runtime(tmp_path), tunnel=False)
-    support.start_tunnel()
-    out = capsys.readouterr().out
-
-    assert env.cloudflared is not None  # 环境里"有"工具，但仍然没被查找
-    assert env.watchers == []
-    assert env.stale_cleanups == []
-    assert support.public_url is None
-    assert "隧道" not in out
-
-
-def test_tunnel_target_pid_and_address_use_actual_port(tmp_path, env):
-    """非默认端口下：隧道目标、进程记录归属与地址文件三者一致。
-
-    防住的独立风险：隧道继续连写死的 7860，或进程记录写到共享的全局路径。
-    """
-    support = env.support(make_runtime(tmp_path), tunnel=True)
-    support.start_tunnel()
-    watcher = env.watchers[0]
-    support.write_address_info()
-    out_file = support.address_file.read_text(encoding="utf-8")
-    support.close()
-
-    assert watcher.local_url == f"http://127.0.0.1:{PORT}"
-    assert watcher.pid_file == tmp_path / "data" / f"cloudflared-{PORT}.pid"
-    assert env.stale_cleanups == [watcher.pid_file]  # 清理只针对自己那份记录
-    assert watcher.stop_calls == 1
-    assert f"本机地址：http://127.0.0.1:{PORT}" in out_file
-    assert PUBLIC_URL in out_file
-    assert "7860" not in out_file
-
-
-def test_tunnel_uses_loopback_target_for_wildcard_bind(tmp_path, env):
-    """监听 0.0.0.0 时隧道目标仍是本机可达地址，不是 0.0.0.0。
-
-    防住的独立风险：把通配监听写法直接当 cloudflared --url，隧道连不上本地服务。
-    """
-    support = env.support(make_runtime(tmp_path), host="0.0.0.0", tunnel=True)
-    support.start_tunnel()
-
-    assert env.watchers[0].local_url == f"http://127.0.0.1:{PORT}"
-    assert support.browse_url == f"http://127.0.0.1:{PORT}"
-    support.close()
+# ===================== 浏览器与地址跟随监听地址族 =====================
 
 
 @pytest.mark.parametrize(
@@ -467,22 +352,18 @@ def test_tunnel_uses_loopback_target_for_wildcard_bind(tmp_path, env):
         ("127.0.0.1", f"http://127.0.0.1:{PORT}", "127.0.0.1"),
     ],
 )
-def test_browser_tunnel_and_address_follow_listen_family(
+def test_browser_and_address_follow_listen_family(
     tmp_path, env, bind_host, expected_url, expected_probe_host
 ):
-    """隧道目标、浏览器地址、就绪探测与地址文件对同一监听地址给出一致结果。
+    """浏览器地址、就绪探测与地址文件对同一监听地址给出一致结果。
 
     防住的独立风险：IPv6 监听被换成 127.0.0.1（本机实测连不上）、
     127.0.0.2 被统一改成 127.0.0.1，或把带方括号的 [::1] 交给 socket 探测
     （探测永远失败，浏览器永远不打开）。
     """
-    support = env.support(
-        make_runtime(tmp_path), host=bind_host, tunnel=True, open_browser=True
-    )
-    support.start_tunnel()
+    support = env.support(make_runtime(tmp_path), host=bind_host, open_browser=True)
     support.write_address_info()
 
-    assert env.watchers[-1].local_url == expected_url
     assert support.browse_url == expected_url
     assert f"本机地址：{expected_url}" in support.address_file.read_text(encoding="utf-8")
 
@@ -530,118 +411,25 @@ def free_ipv6_port() -> int:
     return port
 
 
-def test_main_tunnel_interrupt_propagates_and_cleans_up(tmp_path, env, monkeypatch):
-    """隧道建立中途被 Ctrl+C 打断：异常照原样传出，本次资源仍被收尾。
+def test_main_interrupt_during_startup_propagates_and_cleans_up(
+    tmp_path, env, monkeypatch
+):
+    """启动配套阶段（写地址文件时）被 Ctrl+C 打断：异常照原样传出，本次资源仍被收尾。
 
     防住的独立风险：中断被吞掉导致退出码变成成功，或异常路径下
-    备份线程与隧道记录留在原地。
+    备份线程等配套资源留在原地。
     """
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
     monkeypatch.delenv("AUTO_OPEN_BROWSER", raising=False)
-    env.watcher_start_error = KeyboardInterrupt()
+    env.signal_at_address_write = signal.SIGINT
 
     with pytest.raises(KeyboardInterrupt):
-        env.run_main(["--port", PORT, "--tunnel"], monkeypatch)
+        env.run_main(["--port", PORT], monkeypatch)
 
     assert env.uvicorn_calls == [], "被打断后仍然启动了服务"
-    assert env.watchers[0].start_calls == 1
-    assert env.watchers[0].stop_calls == 1, "异常路径没有收尾本次 watcher"
     assert backup_threads() == []
     assert not (runtime.data_dir / "访问地址.txt").exists()
-
-
-def test_launch_support_tunnel_interrupt_reclaims_real_child_process(
-    tmp_path, monkeypatch
-):
-    """按上报路径做两层拼接验证：真实 TunnelWatcher + 真实建立逻辑，只把 Popen 换成假进程。
-
-    防住的独立风险：core 层与 api 层各自用替身都通过，但拼起来后
-    "子进程已创建、尚未交接"期间被打断仍然漏掉 terminate/kill 与 PID 文件。
-    """
-    from core.tunnel import TunnelWatcher as RealTunnelWatcher
-    from test_tunnel import _BlockingProc  # 复用同一套假进程替身
-
-    monkeypatch.setattr(api, "TunnelWatcher", RealTunnelWatcher)
-    monkeypatch.setattr(api, "find_cloudflared", lambda search_dirs=None: Path("cloudflared.exe"))
-    monkeypatch.setattr(api, "cleanup_stale_tunnel", lambda pid_file=None: None)
-    procs: list[_BlockingProc] = []
-
-    def fake_popen(args, **kwargs):
-        proc = _BlockingProc(KeyboardInterrupt())
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr("core.tunnel.subprocess.Popen", fake_popen)
-
-    runtime = make_runtime(tmp_path)
-    support = api.LaunchSupport(runtime, host="127.0.0.1", port=PORT, tunnel=True)
-    support.start_backup()
-    with pytest.raises(KeyboardInterrupt):
-        support.start_tunnel()
-
-    assert len(procs) == 1
-    assert procs[0].terminated == 1, "子进程没有被终止（上报的漏点）"
-    assert not support.tunnel_pid_file.exists(), "PID 记录仍然留着"
-    # close() 是异常路径下真正的收尾入口：不能报错，也不能再动别的进程
-    support.close()
-    assert procs[0].terminated == 1
-    assert backup_threads() == []
-    assert support.public_url is None
-
-
-def test_missing_cloudflared_keeps_service_usable(tmp_path, env, capsys):
-    """环境里没有 cloudflared：只提示，不异常、不下载，本地服务照常启动。
-
-    防住的独立风险：缺工具时启动直接崩溃，用户连本机都用不上。
-    """
-    env.cloudflared = None
-    support = env.support(make_runtime(tmp_path), tunnel=True)
-    support.start_tunnel()
-    support.write_address_info()
-    out = capsys.readouterr().out
-
-    assert env.watchers == []
-    assert "未找到 cloudflared" in out and "不会自动下载" in out
-    assert "未开启（本次启动未建立公网隧道）" in support.address_file.read_text(
-        encoding="utf-8"
-    )
-    support.close()
-
-
-def test_tunnel_failure_reports_no_public_url(tmp_path, env, capsys):
-    """隧道建立失败：明确提示，地址文件不留无效的公网条目。
-
-    防住的独立风险：失败被写成"公网链接：None"，用户以为已经开了公网。
-    """
-    env.watcher_fail = True
-    support = env.support(make_runtime(tmp_path), tunnel=True)
-    support.start_tunnel()
-    support.write_address_info()
-    out = capsys.readouterr().out
-
-    assert support.public_url is None
-    assert "建立失败" in out
-    assert "未开启" in support.address_file.read_text(encoding="utf-8")
-    support.close()
-
-
-def test_public_url_update_rewrites_address_file(tmp_path, env):
-    """公网地址变化（断线重连）后，地址文件同步更新为新地址。
-
-    防住的独立风险：地址文件只在启动时写一次，重连后用户拿到的仍是失效链接。
-    """
-    support = env.support(make_runtime(tmp_path), tunnel=True)
-    support.start_tunnel()
-    support.write_address_info()
-
-    new_url = "https://other-words.trycloudflare.com"
-    env.watchers[0].reconnect(new_url)
-    text = support.address_file.read_text(encoding="utf-8")
-
-    assert new_url in text and PUBLIC_URL not in text
-    assert list(support.data_dir.glob("访问地址*")) == [support.address_file]
-    support.close()
 
 
 # ===================== 访问信息与浏览器 =====================
@@ -680,7 +468,7 @@ def test_wildcard_bind_publishes_actual_lan_address(tmp_path, env):
 def test_address_info_holds_no_credentials(tmp_path, env):
     """地址文件不落任何凭据，也不会退回去写旧 Gradio 那份含密码的文件。
 
-    防住的独立风险：新版沿用含账号密码的本地文件，公网隧道一开就把密码外泄。
+    防住的独立风险：新版沿用含账号密码的本地文件，地址一旦对外发布就把密码外泄。
     """
     runtime = make_runtime(tmp_path)
     support = env.support(runtime)
@@ -735,25 +523,22 @@ def test_browser_can_be_disabled_and_stops_on_exit(tmp_path, env):
 # ===================== 两份运行状态互不串台 =====================
 
 
-def test_two_runtimes_keep_backup_address_and_pid_apart(tmp_path, env):
+def test_two_runtimes_keep_backup_and_address_apart(tmp_path, env):
     """两个 runtime（不同目录、不同端口）互不写对方的配套文件。
 
-    防住的独立风险：备份、地址文件与进程记录共用全局路径，两份运行状态互相覆盖，
-    退出时还会停掉别人的隧道进程。
+    防住的独立风险：备份与地址文件共用全局路径，两份运行状态互相覆盖。
     """
     first_dir, second_dir = tmp_path / "first", tmp_path / "second"
     first = env.support(
-        make_runtime(tmp_path / "a", data_dir=first_dir), port=8123, tunnel=True
+        make_runtime(tmp_path / "a", data_dir=first_dir), port=8123
     )
     second = env.support(
         make_runtime(tmp_path / "b", data_dir=second_dir),
         host="0.0.0.0",
         port=9000,
-        tunnel=True,
     )
     for support in (first, second):
         support.start_backup()
-        support.start_tunnel()
         support.write_address_info()
     first_text = first.address_file.read_text(encoding="utf-8")
     second_text = second.address_file.read_text(encoding="utf-8")
@@ -761,43 +546,33 @@ def test_two_runtimes_keep_backup_address_and_pid_apart(tmp_path, env):
     second.close()
 
     assert first.address_file != second.address_file
-    assert first.tunnel_pid_file != second.tunnel_pid_file
     assert first.address_file.parent == first_dir and second.address_file.parent == second_dir
     assert ":8123" in first_text and "9000" not in first_text
     assert ":9000" in second_text and FAKE_LAN_IP in second_text
-    assert {w.local_url for w in env.watchers} == {
-        "http://127.0.0.1:8123",
-        "http://127.0.0.1:9000",
-    }
-    pid_by_watcher = {w.local_url: w.pid_file for w in env.watchers}
-    assert pid_by_watcher["http://127.0.0.1:9000"] == second_dir / "cloudflared-9000.pid"
     for dir_ in (first_dir, second_dir):
         assert list((dir_ / "backups").glob("math-backup-*.zip"))
-    assert {w.stop_calls for w in env.watchers} == {1}
 
 
 # ===================== 启动入口与退出清理 =====================
 
 
-def test_main_port_occupied_creates_no_tunnel(tmp_path, env, monkeypatch):
-    """端口被占用：绑定前就失败，不建隧道、不开浏览器，备份线程已收尾。
+def test_main_port_occupied_fails_before_serving(tmp_path, env, monkeypatch):
+    """端口被占用：绑定前就失败，不开浏览器，备份线程已收尾。
 
-    防住的独立风险：端口占用后仍先建立公网隧道再启动失败，
-    留下无人认领的 cloudflared 进程；或备份线程随异常一起泄漏。
+    防住的独立风险：端口占用后仍继续启动或留下无人收尾的备份线程，
+    失败被吞掉后退出码变成成功。
     """
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
     port, blocker = occupied_socket()
     try:
         with pytest.raises(OSError, match="无法监听") as exc_info:
-            env.run_main(["--port", port, "--tunnel"], monkeypatch)
+            env.run_main(["--port", port], monkeypatch)
     finally:
         blocker.close()
 
     assert "请改用其他端口" in str(exc_info.value)
     assert env.uvicorn_calls == []
-    assert env.watchers == []
-    assert env.stale_cleanups == []  # 还没走到隧道残留清理
     assert env.browser_opened == []
     assert not (runtime.data_dir / "访问地址.txt").exists()
     assert backup_threads() == []
@@ -813,76 +588,56 @@ def test_main_startup_failure_propagates_and_cleans_up(tmp_path, env, monkeypatc
     env.uvicorn_error = RuntimeError("模拟启动失败")
 
     with pytest.raises(RuntimeError, match="模拟启动失败"):
-        env.run_main(["--port", PORT, "--tunnel"], monkeypatch)
+        env.run_main(["--port", PORT], monkeypatch)
 
     assert env.uvicorn_calls and env.uvicorn_calls[0][1] == {"host": "127.0.0.1", "port": PORT}
-    assert env.watchers[0].stop_calls == 1
-    assert backup_threads() == []
-
-
-def test_main_cleanup_error_does_not_mask_startup_error(tmp_path, env, monkeypatch, capsys):
-    """隧道清理报错：只提示，不顶掉 uvicorn 的原始失败（端口占用的真实退出码 3）。
-
-    防住的独立风险：finally 里的清理异常顶掉启动异常，退出码与诊断都不对。
-    """
-    runtime = make_runtime(tmp_path)
-    monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
-    env.uvicorn_error = SystemExit(3)  # uvicorn 绑定失败时的真实行为
-
-    def break_tunnel(env_obj):
-        env_obj.watchers[0].stop_error = RuntimeError("模拟停止隧道失败")
-
-    env.on_serve = break_tunnel
-    with pytest.raises(SystemExit) as exc_info:
-        env.run_main(["--port", PORT, "--tunnel"], monkeypatch)
-    out = capsys.readouterr().out
-
-    assert exc_info.value.code == 3
-    assert "公网隧道清理失败" in out
     assert backup_threads() == []
 
 
 def test_main_keyboard_interrupt_cleans_up(tmp_path, env, monkeypatch):
-    """Ctrl+C：KeyboardInterrupt 原样传播，隧道与备份线程都收尾。
+    """Ctrl+C：KeyboardInterrupt 原样传播，备份线程与浏览器任务都收尾。
 
-    防住的独立风险：中断退出留下 cloudflared 子进程或备份线程。
+    防住的独立风险：中断退出留下后台线程没有收尾。
     """
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
     env.uvicorn_error = KeyboardInterrupt()
 
     with pytest.raises(KeyboardInterrupt):
-        env.run_main(["--port", PORT, "--tunnel"], monkeypatch)
+        env.run_main(["--port", PORT], monkeypatch)
 
-    assert env.watchers[0].stop_calls == 1
     assert backup_threads() == []
     assert [t for t in threading.enumerate() if t.name == "maa-api-browser"] == []
 
 
 def test_close_keeps_going_after_a_failed_step(tmp_path, env, capsys):
-    """一处清理失败不影响后续：隧道停止报错后备份线程照样收到信号并结束。
+    """一处清理失败不影响后续：浏览器任务收尾报错后备份线程照样收到信号并结束。
 
     防住的独立风险：清理串行执行且无隔离，第一步抛错就跳过了线程收尾。
     """
-    support = env.support(make_runtime(tmp_path), tunnel=True)
+    support = env.support(make_runtime(tmp_path), open_browser=True)
     support.start_backup()
-    support.start_tunnel()
+    support.open_browser_when_ready()
     thread = support._backup_thread
-    env.watchers[0].stop_error = RuntimeError("模拟停止隧道失败")
+
+    def failing_join(timeout=None):
+        raise RuntimeError("模拟浏览器任务收尾失败")
+
+    support._browser_thread.join = failing_join
 
     support.close()  # 不抛出
     out = capsys.readouterr().out
 
-    assert "公网隧道清理失败" in out
+    assert "浏览器等待任务收尾失败" in out
     assert support._backup_stop.is_set()
     assert not thread.is_alive()
 
 
-def test_main_writes_no_passwords_and_no_public_exposure(tmp_path, env, monkeypatch, capsys):
-    """常规启动：不打印账号密码、不开公网、--no-browser 时不开浏览器。
+def test_main_writes_no_passwords(tmp_path, env, monkeypatch, capsys):
+    """常规启动：不打印账号密码；--no-browser 时不开浏览器。
 
     防住的独立风险：新版沿用旧界面"把所有账号密码打到控制台"的做法，
-    一旦同时开了公网隧道或屏幕共享就直接泄露凭据。
+    屏幕共享或远程会话里直接泄露凭据。
     """
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
@@ -893,7 +648,6 @@ def test_main_writes_no_passwords_and_no_public_exposure(tmp_path, env, monkeypa
 
     for account in runtime.accounts:
         assert account["password"] not in out
-    assert env.watchers == []
     assert env.browser_opened == [] and env.readiness_probes == []
     assert env.uvicorn_calls[0][1] == {"host": "127.0.0.1", "port": PORT}
     assert "手机无法通过局域网连接" in out
@@ -924,10 +678,10 @@ def test_isolated_main_keeps_companions_in_temp_dir(tmp_path, env, monkeypatch, 
     """--isolated --fake：配套文件全在临时目录，仓库 data 一字不动。
 
     防住的独立风险：隔离验证读到真实 .env/账号，或把真实 data 的备份、
-    地址文件、隧道进程记录改掉。
+    地址文件改掉。
     """
     monkeypatch.delenv("AUTO_OPEN_BROWSER", raising=False)
-    watched_names = ("cloudflared.pid", "当前访问密码.txt", "访问地址.txt")
+    watched_names = ("当前访问密码.txt", "访问地址.txt")
     before = _snapshot_repo_data(watched_names)
 
     env.run_main(["--isolated", "--fake", "--port", PORT], monkeypatch)
@@ -944,11 +698,9 @@ def test_isolated_main_keeps_companions_in_temp_dir(tmp_path, env, monkeypatch, 
         address_file = temp_root / "data" / "访问地址.txt"
         assert address_file.exists()
         assert list((temp_root / "data" / "backups").glob("math-backup-*.zip"))
-        assert not list((temp_root / "data").glob("cloudflared*.pid"))
         assert not (temp_root / "data" / "当前访问密码.txt").exists()
 
-        # 隔离模式默认既不建公网隧道，也不自动开浏览器
-        assert env.watchers == [] and env.stale_cleanups == []
+        # 隔离模式默认不自动开浏览器
         assert env.browser_opened == [] and env.readiness_probes == []
 
         # --fake 替换了所有可被选中的客户端
@@ -1014,7 +766,7 @@ def _snapshot_repo_data(names: tuple[str, ...]) -> dict[str, str | None]:
 
 
 def test_companion_files_are_not_served(tmp_path, env):
-    """备份 zip、地址文件与进程记录都不在任何静态挂载可达的路径上。
+    """备份 zip 与地址文件都不在任何静态挂载可达的路径上。
 
     防住的独立风险：把 data 目录静态挂出去（备份 zip 内含明文密码文件），
     或日后有人把静态根改成数据目录。
@@ -1023,7 +775,6 @@ def test_companion_files_are_not_served(tmp_path, env):
     support = env.support(runtime)
     support.start_backup()
     support.write_address_info()
-    (support.data_dir / f"cloudflared-{PORT}.pid").write_text("1234", encoding="utf-8")
     support.close()
 
     dist = tmp_path / "dist"
@@ -1037,7 +788,6 @@ def test_companion_files_are_not_served(tmp_path, env):
         "/访问地址.txt",
         f"/backups/{backup_name}",
         f"/{backup_name}",
-        f"/cloudflared-{PORT}.pid",
         "/accounts.json",
         "/temp_images",
         "/usage_daily.json",
@@ -1059,7 +809,7 @@ def test_sigbreak_guard_turns_break_into_interrupt_and_restores_previous():
     """守卫把控制台 Break 变成 KeyboardInterrupt，退出时恢复原处理器。
 
     防住的独立风险：Windows 上 Break 的默认处置是直接结束进程，
-    启动入口的 finally 完全没机会跑，隧道进程与 PID 记录被留在原地。
+    启动入口的 finally 完全没机会跑，备份线程等后台任务被留在原地。
     """
     before = signal.getsignal(signal.SIGBREAK)
     restore = api.install_sigbreak_guard()
@@ -1075,20 +825,19 @@ def test_sigbreak_guard_turns_break_into_interrupt_and_restores_previous():
 
 
 @requires_sigbreak
-def test_main_break_during_tunnel_stage_still_cleans_up(tmp_path, env, monkeypatch):
-    """Break 落在隧道启动阶段：异常传出、启动入口的 finally 跑完、原处理器恢复。
+def test_main_break_during_startup_stage_still_cleans_up(tmp_path, env, monkeypatch):
+    """Break 落在启动配套阶段（写地址文件时）：异常传出、启动入口的 finally 跑完、原处理器恢复。
 
     防住的独立风险：这一阶段 uvicorn 还没接管信号，Break 直接结束进程。
     """
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
     before = signal.getsignal(signal.SIGBREAK)
-    env.signal_at_find_cloudflared = signal.SIGBREAK
+    env.signal_at_address_write = signal.SIGBREAK
 
     with pytest.raises(KeyboardInterrupt):
-        env.run_main(["--port", PORT, "--tunnel"], monkeypatch)
+        env.run_main(["--port", PORT], monkeypatch)
 
-    assert env.watchers == [], "Break 之后仍然建立了隧道"
     assert env.uvicorn_calls == [], "Break 之后仍然启动了服务"
     assert backup_threads() == [], "启动入口的 finally 没跑到"
     assert signal.getsignal(signal.SIGBREAK) is before
@@ -1099,7 +848,7 @@ def test_main_break_reraised_after_uvicorn_still_cleans_up(tmp_path, env, monkey
     """Uvicorn 收尾恢复并重发 Break 之后，仍能进入启动入口的 finally 完成清理。
 
     防住的独立风险：服务运行期间按 Break 时 ASGI 关闭流程走完了，
-    但配套资源（隧道进程、备份线程）没被回收。
+    但配套资源（备份线程、浏览器任务）没被回收。
     """
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
@@ -1107,11 +856,11 @@ def test_main_break_reraised_after_uvicorn_still_cleans_up(tmp_path, env, monkey
     env.signal_after_uvicorn_exit = signal.SIGBREAK
 
     with pytest.raises(KeyboardInterrupt):
-        env.run_main(["--port", PORT, "--tunnel"], monkeypatch)
+        env.run_main(["--port", PORT], monkeypatch)
 
     assert len(env.uvicorn_calls) == 1
-    assert env.watchers and env.watchers[0].stop_calls == 1, "隧道 watcher 未被收尾"
     assert backup_threads() == []
+    assert [t for t in threading.enumerate() if t.name == "maa-api-browser"] == []
     assert signal.getsignal(signal.SIGBREAK) is before
 
 
@@ -1282,23 +1031,21 @@ def test_ipv6_wildcard_without_usable_address_is_honest(tmp_path, env):
     assert entries["本机地址"] == f"http://[::1]:{PORT}"
 
 
-def test_main_reports_ipv6_hint_and_tunnel_target(tmp_path, env, monkeypatch, capsys):
-    """main() 以 :: 启动：打印与文件同口径，隧道目标用 IPv6 回环而不是 IPv4。
+def test_main_reports_ipv6_hint(tmp_path, env, monkeypatch, capsys):
+    """main() 以 :: 启动：打印与文件同口径。
 
-    防住的独立风险：手机地址栏给 IPv4，而 cloudflared 的目标又被换成 127.0.0.1，
-    IPv6 监听下两者都连不上本机服务。
+    防住的独立风险：手机地址栏给 IPv4，IPv6 监听下手机连不上本机服务。
     """
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(api, "build_runtime", lambda **kwargs: runtime)
     monkeypatch.delenv("AUTO_OPEN_BROWSER", raising=False)
     env.lan_ipv6 = None
 
-    env.run_main(["--host", "::", "--port", PORT, "--tunnel", "--no-browser"], monkeypatch)
+    env.run_main(["--host", "::", "--port", PORT, "--no-browser"], monkeypatch)
     out = capsys.readouterr().out
 
     assert "尚未取得可用的 IPv6 局域网地址" in out
     assert f"http://{FAKE_LAN_IP}:{PORT}" not in out
-    assert env.watchers[0].local_url == f"http://[::1]:{PORT}"
     file_text = (runtime.data_dir / "访问地址.txt").read_text(encoding="utf-8")
     assert "尚未取得可用的 IPv6 局域网地址" in file_text
     assert f"本机地址：http://[::1]:{PORT}" in file_text

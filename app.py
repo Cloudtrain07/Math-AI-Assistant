@@ -52,7 +52,6 @@ from core.prompts import (
 )
 from core.runtime import AppRuntime, build_runtime
 from core.storage import HistoryReadError
-from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.usage import (
     estimate_tokens,
     format_cumulative,
@@ -640,7 +639,7 @@ class _SafeBlocks(gr.Blocks):
 def create_app(runtime: AppRuntime) -> gr.Blocks:
     """显式创建界面：组装 Blocks、按运行对象取默认值并绑定全部事件。
 
-    只创建界面与事件绑定，不启动服务器、备份任务、隧道或写访问信息；
+    只创建界面与事件绑定，不启动服务器、备份任务或写访问信息；
     组件默认值与回调依赖全部来自传入的 runtime，不保留模块级状态。
     """
     with _SafeBlocks(
@@ -930,8 +929,8 @@ def main() -> None:
     """启动边界：组装依赖 → 创建界面 → 启动服务器与配套任务 → 等待退出 → 清理。
 
     启动异常原样向外传播（保留失败退出码与诊断信息）；
-    finally 只收尾本次启动实际拥有的资源：先置备份停止信号，再停隧道、
-    关闭界面服务器，最后等待备份线程（最多 5 秒，正在写盘的备份不保证完成）。
+    finally 只收尾本次启动实际拥有的资源：先置备份停止信号，再关闭界面服务器，
+    最后等待备份线程（最多 5 秒，正在写盘的备份不保证完成）。
     """
     runtime = build_runtime()
     demo = create_app(runtime)
@@ -949,7 +948,6 @@ def main() -> None:
         target=daily_backup_loop, kwargs={"stop_event": backup_stop}, daemon=True
     )
     backup_thread.start()
-    watcher = None
     try:
         demo.queue(default_concurrency_limit=4).launch(
             server_name=server_name,
@@ -959,40 +957,16 @@ def main() -> None:
             auth_message="请输入访问用户名与密码",
             prevent_thread_lock=True,
         )
-        cleanup_stale_tunnel()
-        cloudflared_path = find_cloudflared()
-        if cloudflared_path is None:
-            print(
-                "未找到 cloudflared.exe，公网隧道未启动"
-                "（请把 cloudflared.exe 放到项目根目录）。仍可通过局域网访问。"
-            )
-        else:
-            print("正在建立 Cloudflare 公网隧道…")
-
-            def _on_url(url: str) -> None:
-                save_access_info(url, runtime.accounts)
-                print(f"公网链接已更新：{url}（已写入访问信息文件）")
-
-            watcher = TunnelWatcher(cloudflared_path, on_url=_on_url)
-            watcher.start()
-            if watcher.url:
-                print(f"公网链接：{watcher.url}")
-            else:
-                print("公网隧道建立失败（连接 Cloudflare 超时），仍可通过局域网访问。")
-        access_file = save_access_info(watcher.url if watcher else None, runtime.accounts)
+        access_file = save_access_info(None, runtime.accounts)
         print(f"局域网地址：http://{get_lan_ip()}:{SERVER_PORT}")
         print(f"访问信息已保存到：{access_file}")
         demo.block_thread()
     finally:
         backup_stop.set()
         try:
-            if watcher is not None:
-                watcher.stop()
+            demo.close()
         finally:
-            try:
-                demo.close()
-            finally:
-                backup_thread.join(timeout=5)
+            backup_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

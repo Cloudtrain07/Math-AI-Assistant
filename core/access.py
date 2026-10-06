@@ -170,7 +170,7 @@ def browse_host(host: str | None) -> str:
 
     0.0.0.0（含空串）只覆盖 IPv4 → 127.0.0.1；:: 只覆盖 IPv6 → ::1；
     ::1 保持 IPv6；127.0.0.2 这类具体监听地址原样保留（换成 127.0.0.1 就连不上）。
-    返回值不带方括号，可直接用于 socket 探测与 cloudflared 的目标主机。
+    返回值不带方括号，可直接用于 socket 探测与浏览器地址。
     """
     normalized = normalize_bind_host(host)
     if normalized in _WILDCARD_V4_BINDS:

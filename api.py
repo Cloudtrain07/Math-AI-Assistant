@@ -71,13 +71,12 @@ core.login（校验+日志+登录计数唯一入口）与 core.ui_text（共用�
   旧密码不能再建立新会话；不提供"踢出所有设备"。
 
 启动边界：
-- 导入本模块与 create_api_app(runtime) 都不启动服务、备份线程、隧道或浏览器，
+- 导入本模块与 create_api_app(runtime) 都不启动服务、备份线程或浏览器，
   配套任务只由 main() 通过 LaunchSupport 显式接上（旧 Gradio 走 app.py，不经过这里）；
-- LaunchSupport 是本次启动配套资源的唯一持有者：备份停止信号与线程、隧道 watcher、
+- LaunchSupport 是本次启动配套资源的唯一持有者：备份停止信号与线程、
   浏览器等待线程与落盘文件都按 runtime.data_dir + 实际端口归属，
   退出、Ctrl+C、端口占用与启动中途失败都只回收自己创建的那些；
-- 公网隧道是显式开关（--tunnel），缺省不对外开放；地址信息文件只记录地址与更新时间，
-  不含账号、密码或 API Key。
+- 地址信息文件只记录地址与更新时间，不含账号、密码或 API Key。
 - 静态服务只暴露 frontend/dist：备份 zip、访问地址文件与临时图片都在 data_dir 内，
   不经任何 HTTP 路径公开。
 - Windows 的控制台 Ctrl+Break 默认直接结束进程、绕过 finally，因此 main() 在启动入口
@@ -129,7 +128,6 @@ from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
 from core.providers import get_model_thinking_capability, get_provider_supports_thinking
 from core.runtime import AppRuntime, build_runtime
 from core.storage import HistoryReadError, safe_account_name
-from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
 from core.ui_text import (
     DAILY_FAILED_MSG,
     DAILY_STATS_FAILED_MSG,
@@ -1388,7 +1386,6 @@ def enable_fake_clients(runtime: AppRuntime, *, piece_delay: float = 0.02) -> No
 
 
 ADDRESS_FILE_NAME = "访问地址.txt"
-TUNNEL_PID_FILE_NAME = "cloudflared-{port}.pid"
 BROWSER_READY_TIMEOUT_SECONDS = 20.0
 CLEANUP_JOIN_TIMEOUT_SECONDS = 5.0
 
@@ -1428,7 +1425,7 @@ def install_sigbreak_guard() -> Callable[[], None]:
     """登记主线程的 SIGBREAK 保护，返回恢复原处理器的方式（Windows 控制台 Break 键）。
 
     Windows 上 SIGBREAK 的默认处置是直接结束进程，会绕过启动入口的 finally，
-    把已创建的隧道进程与 PID 记录留在原地。登记后 Break 走与 Ctrl+C 相同的中断路径；
+    把已创建的备份线程等后台任务留在原地。登记后 Break 走与 Ctrl+C 相同的中断路径；
     Uvicorn 收尾时会把本处理器当作"原处理器"恢复并重发它捕获到的信号，
     于是服务运行期间按 Break 也能进到 finally。
 
@@ -1458,12 +1455,10 @@ def install_sigbreak_guard() -> Callable[[], None]:
 
 
 class LaunchSupport:
-    """新版 API 的启动配套：每日备份、可选公网隧道、访问地址文件与自动开浏览器。
+    """新版 API 的启动配套：每日备份、访问地址文件与自动开浏览器。
 
     归属明确，close() 只回收本次实际创建的对象：
     - 备份线程与停止信号记在实例上，备份目录取 runtime.data_dir，不改全局常量；
-    - 隧道 PID 文件按 data_dir + 端口命名，不读写旧 Gradio 的 data/cloudflared.pid，
-      清理只按自己记录的 PID，绝不按进程名批量结束 Python 或 cloudflared；
     - 地址文件写在 data_dir 内，只含地址与更新时间；旧 Gradio 的
       data/当前访问密码.txt 由 app.py 自己维护，这里不读不写。
     """
@@ -1474,30 +1469,23 @@ class LaunchSupport:
         *,
         host: str,
         port: int,
-        tunnel: bool = False,
         open_browser: bool = False,
         backup_interval_seconds: int = 3600,
     ) -> None:
         self.data_dir = Path(runtime.data_dir)
         self.host = host
         self.port = port
-        self.tunnel = tunnel
         self.open_browser = open_browser
         self.backup_interval_seconds = backup_interval_seconds
-        # 隧道与浏览器都不能用通配监听写法：按地址族归一到本机可达的回环地址，
+        # 浏览器不能用通配监听写法：按地址族归一到本机可达的回环地址，
         # 具体监听地址（如 127.0.0.2、::1）保持原地址；URL 里 IPv6 由 build_url 加方括号，
         # socket 探测与端口预检仍用不带方括号的原始主机地址
         self.reachable_host = browse_host(host)
         self.browse_url = build_url(self.reachable_host, port)
-        # cloudflared 的 --url 指向同一个本机可达地址
-        self.tunnel_url = self.browse_url
         self.address_file = self.data_dir / ADDRESS_FILE_NAME
-        self.tunnel_pid_file = self.data_dir / TUNNEL_PID_FILE_NAME.format(port=port)
-        self.public_url: str | None = None
         self._lan_ipv6: object = _UNRESOLVED
         self._backup_stop: threading.Event | None = None
         self._backup_thread: threading.Thread | None = None
-        self._watcher: TunnelWatcher | None = None
         self._browser_stop: threading.Event | None = None
         self._browser_thread: threading.Thread | None = None
         self._closed = False
@@ -1538,10 +1526,10 @@ class LaunchSupport:
     # ---- 监听端口预检 ----
 
     def ensure_port_free(self) -> None:
-        """绑定前确认端口可用：占用时立即失败，不创建隧道与浏览器任务。
+        """绑定前确认端口可用：占用时立即失败，不创建浏览器任务。
 
         uvicorn 自身绑定失败同样会走到 close() 收尾，这里只是把最常见的
-        "端口已被占用"提前说清楚，避免先建立公网隧道再白等一次启动失败。
+        "端口已被占用"提前说清楚，避免白等一次注定失败的启动。
         """
         family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
         probe = socket.socket(family, socket.SOCK_STREAM)
@@ -1577,61 +1565,17 @@ class LaunchSupport:
         return address_entries(
             self.host,
             self.port,
-            public_url=self.public_url,
             lan_ipv6=self._lan_ipv6_for_display(),
         )
 
     def write_address_info(self) -> Path:
-        """写地址文件（不含账号密码）；公网 URL 变化后由隧道回调再写一次。"""
+        """写地址文件（不含账号密码）。"""
         return save_address_info(
             self.host,
             self.port,
             target=self.address_file,
-            public_url=self.public_url,
             lan_ipv6=self._lan_ipv6_for_display(),
         )
-
-    # ---- 可选公网隧道 ----
-
-    def start_tunnel(self) -> None:
-        """--tunnel 时建立 Cloudflare 快速隧道；缺省不开公网，也不查找 cloudflared。
-
-        目标是本次启动的实际地址（不是写死的 7860）；缺少 cloudflared 或建立超时
-        都只提示，本地服务照常可用，本程序不下载任何工具。
-        """
-        if not self.tunnel:
-            return
-        cleanup_stale_tunnel(pid_file=self.tunnel_pid_file)
-        cloudflared_path = find_cloudflared()
-        if cloudflared_path is None:
-            print(
-                "未找到 cloudflared.exe，公网隧道未启动（请把 cloudflared.exe 放到项目根目录，"
-                "本程序不会自动下载）。仍可通过本机或局域网地址访问。"
-            )
-            return
-        print(f"正在建立 Cloudflare 公网隧道（目标 {self.tunnel_url}）…")
-        watcher = TunnelWatcher(
-            cloudflared_path,
-            local_url=self.tunnel_url,
-            on_url=self._on_public_url,
-            pid_file=self.tunnel_pid_file,
-        )
-        self._watcher = watcher  # 先登记：建立过程中被中断也能收尾
-        watcher.start()
-        self.public_url = watcher.url
-        if watcher.url:
-            print(f"公网链接：{watcher.url}")
-        else:
-            print("公网隧道建立失败（连接 Cloudflare 超时），本地服务仍可正常使用。")
-
-    def _on_public_url(self, url: str) -> None:
-        """隧道重连换了公网地址：同步更新地址文件（后台线程内，写失败只提示）。"""
-        self.public_url = url
-        try:
-            self.write_address_info()
-        except OSError as exc:
-            print(f"⚠️ 访问地址文件更新失败：{exc}，请手动记录公网地址：{url}")
-        print(f"公网链接已更新：{url}")
 
     # ---- 自动打开浏览器 ----
 
@@ -1670,7 +1614,7 @@ class LaunchSupport:
     # ---- 收尾 ----
 
     def close(self) -> None:
-        """回收本次创建的配套资源：先置停止信号，再停隧道，最后等待线程。
+        """回收本次创建的配套资源：先置停止信号，再等待线程收尾。
 
         每一步失败都只提示、不抛出：清理错误不能掩盖原始启动错误，失败退出码要保留。
         """
@@ -1681,11 +1625,6 @@ class LaunchSupport:
             self._backup_stop.set()
         if self._browser_stop is not None:
             self._browser_stop.set()
-        try:
-            if self._watcher is not None:
-                self._watcher.stop()
-        except Exception as exc:
-            print(f"⚠️ 公网隧道清理失败，请手动关闭本次启动的 cloudflared 进程：{exc}")
         try:
             if self._browser_thread is not None:
                 self._browser_thread.join(timeout=CLEANUP_JOIN_TIMEOUT_SECONDS)
@@ -1719,11 +1658,6 @@ def main() -> None:
         help="自动验证用：配置/账号/数据全部落在临时目录，不读写真实 data 与 .env",
     )
     parser.add_argument(
-        "--tunnel",
-        action="store_true",
-        help="可选：建立 Cloudflare 公网隧道（需已有 cloudflared.exe，不会自动下载）；缺省不开公网",
-    )
-    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="启动后不自动打开浏览器（等同环境变量 AUTO_OPEN_BROWSER=false）",
@@ -1755,7 +1689,7 @@ def main() -> None:
             print(f"[隔离账号] {account['username']} / {account['password']}")
 
     # 自动开浏览器沿用旧界面的 AUTO_OPEN_BROWSER 开关；
-    # 隔离验证默认既不打开浏览器，也不建立公网隧道
+    # 隔离验证默认不打开浏览器
     auto_open_browser = (
         not args.no_browser
         and not args.isolated
@@ -1765,7 +1699,6 @@ def main() -> None:
         runtime,
         host=args.host,
         port=args.port,
-        tunnel=args.tunnel,
         open_browser=auto_open_browser,
     )
     # Windows 控制台 Break 默认直接结束进程，会绕过下面的 finally：先在主线程登记保护
@@ -1774,7 +1707,6 @@ def main() -> None:
     try:
         support.start_backup()
         support.ensure_port_free()
-        support.start_tunnel()
         support.write_address_info()
         for label, value in support.address_info().items():
             print(f"{label}：{value}")
