@@ -3,8 +3,8 @@
 备份包含数据目录中的账号、聊天历史、用量、日志及其他文件（zip 内含明文密码文件，
 仅用于本地保存）。当天同名备份只生成一次；超出保留份数的旧备份自动删除。
 
-所有函数都可显式传入 data_dir（新版 API 用它绑定 runtime 的数据目录）；
-缺省时使用模块级 DATA_DIR，与旧 Gradio 启动的调用方式完全一致。
+所有函数都可显式传入 data_dir（启动方用它绑定 runtime 的数据目录）；
+缺省时使用模块级 DATA_DIR。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-# 旧 Gradio 启动的数据目录；显式传 data_dir 时不读取此常量
+# 缺省数据目录；显式传 data_dir 时不读取此常量
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 BACKUP_KEEP = 14
 BACKUP_PREFIX = "math-backup-"
@@ -38,7 +38,7 @@ class BackupResult(NamedTuple):
 
 
 def resolve_data_dir(data_dir: Path | str | None = None) -> Path:
-    """本次备份的数据目录：显式传入优先，否则沿用全局 DATA_DIR（旧调用行为）。"""
+    """本次备份的数据目录：显式传入优先，否则沿用全局 DATA_DIR。"""
     return Path(data_dir) if data_dir is not None else DATA_DIR
 
 
@@ -88,14 +88,6 @@ def run_backup(
     return BackupResult(BACKUP_CREATED, target)
 
 
-def backup_data(
-    path: Path | None = None, *, data_dir: Path | str | None = None
-) -> Path | None:
-    """把数据目录全量打包；当天同名已存在或写盘失败都返回 None（旧语义不变）。"""
-    result = run_backup(Path(path) if path is not None else None, data_dir=data_dir)
-    return result.path if result.status == BACKUP_CREATED else None
-
-
 def prune_backups(
     keep: int = BACKUP_KEEP,
     target_dir: Path | None = None,
@@ -124,12 +116,6 @@ def prune_backups(
         except Exception:
             pass
     return removed
-
-
-def ensure_today_backup(data_dir: Path | str | None = None) -> Path | None:
-    """今天尚未备份则备份一次；返回新生成的备份路径或 None。"""
-    source = resolve_data_dir(data_dir)
-    return backup_data(backup_path_for(data_dir=source), data_dir=source)
 
 
 def daily_backup_loop(

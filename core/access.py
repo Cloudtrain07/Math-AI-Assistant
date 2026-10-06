@@ -156,11 +156,10 @@ def address_entries(
     host: str,
     port: int,
     *,
-    public_url: str | None = None,
     lan_ip: str | None = None,
     lan_ipv6: str | None = None,
 ) -> dict[str, str]:
-    """按实际监听配置算出各项访问地址（新版 API 的控制台输出与文件共用）。
+    """按实际监听配置算出各项访问地址（控制台输出与地址文件共用）。
 
     仅监听回环时明确说明手机无法通过局域网访问，不给出误导性的局域网地址；
     IPv6 通配监听只给同地址族的地址，不把 IPv4 局域网地址当成手机可用入口。
@@ -181,7 +180,7 @@ def address_entries(
             entries["局域网地址"] = IPV6_LAN_UNAVAILABLE
     else:
         entries["局域网地址"] = build_url(lan_host(host, lan_ip), port)
-    entries["公网地址"] = public_url or "未开启（本次启动未建立公网隧道）"
+    entries["公网地址"] = "未开启（本次启动未建立公网隧道）"
     return entries
 
 
@@ -189,7 +188,6 @@ def format_access_lines(
     host: str,
     port: int,
     *,
-    public_url: str | None = None,
     lan_ip: str | None = None,
     lan_ipv6: str | None = None,
 ) -> list[str]:
@@ -198,9 +196,7 @@ def format_access_lines(
         "数学学习 AI 助手（新版 API）- 访问地址",
         f"更新时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
-    entries = address_entries(
-        host, port, public_url=public_url, lan_ip=lan_ip, lan_ipv6=lan_ipv6
-    )
+    entries = address_entries(host, port, lan_ip=lan_ip, lan_ipv6=lan_ipv6)
     lines += [f"{label}：{value}" for label, value in entries.items()]
     return lines
 
@@ -210,16 +206,13 @@ def save_address_info(
     port: int,
     *,
     target: Path | str,
-    public_url: str | None = None,
     lan_ip: str | None = None,
     lan_ipv6: str | None = None,
 ) -> Path:
     """把本次启动的实际访问地址写入文件；只含地址与更新时间，不含任何凭据。"""
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    lines = format_access_lines(
-        host, port, public_url=public_url, lan_ip=lan_ip, lan_ipv6=lan_ipv6
-    )
+    lines = format_access_lines(host, port, lan_ip=lan_ip, lan_ipv6=lan_ipv6)
     lines.append("提示：本文件只记录访问地址，不含账号、密码或 API Key。")
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return target

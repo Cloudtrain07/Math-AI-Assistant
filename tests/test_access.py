@@ -320,12 +320,8 @@ def test_address_info_holds_no_credentials(tmp_path):
     password = generate_password()
     target = tmp_path / "data" / "访问地址.txt"
 
-    save_address_info(
-        "0.0.0.0", 8000, target=target, public_url="https://x.trycloudflare.com",
-        lan_ip="192.0.2.7",
-    )
+    save_address_info("0.0.0.0", 8000, target=target, lan_ip="192.0.2.7")
     text = target.read_text(encoding="utf-8")
     assert password not in text
     assert "sk-" not in text
     assert "更新时间：" in text
-    assert "https://x.trycloudflare.com" in text

@@ -4,8 +4,7 @@
  * 像素处理全部交给 Cropper.js（getCroppedCanvas 按原图自然分辨率导出），
  * 这里只做与 UI 无关的可测试计算：
  * - 服务端与本地共用 10MB 上限；
- * - 导出前按画布安全上限收边（超出浏览器画布可靠范围时主动缩小并提示，
- *   不静默）；
+ * - 画布安全上限收边由组件直接通过 Cropper 的 maxWidth/maxHeight 完成；
  * - 超过 10MB 时按固定步长缩边重编码，同样提示。
  */
 
@@ -89,23 +88,6 @@ export function expectedExportSize(
 }
 
 /**
- * 导出前的画布收边决策：超过 MAX_EXPORT_EDGE 时等比缩小并标记需要提示。
- */
-export function clampCanvasSize(
-  width: number,
-  height: number,
-): { width: number; height: number; scaled: boolean } {
-  const maxEdge = Math.max(width, height)
-  if (maxEdge <= MAX_EXPORT_EDGE) return { width, height, scaled: false }
-  const ratio = MAX_EXPORT_EDGE / maxEdge
-  return {
-    width: Math.max(1, Math.round(width * ratio)),
-    height: Math.max(1, Math.round(height * ratio)),
-    scaled: true,
-  }
-}
-
-/**
  * 压缩循环的下一次缩边尺寸；返回 null 表示已到最小（1px）无法继续。
  */
 export function nextDownscale(
@@ -117,12 +99,6 @@ export function nextDownscale(
     width: Math.max(1, Math.round(width * DOWNSCALE_FACTOR)),
     height: Math.max(1, Math.round(height * DOWNSCALE_FACTOR)),
   }
-}
-
-export function formatBytes(bytes: number): string {
-  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`
-  return `${bytes} B`
 }
 
 /** 画布 → JPEG Blob；浏览器不支持 toBlob 时拒绝（理论上不会发生）。 */

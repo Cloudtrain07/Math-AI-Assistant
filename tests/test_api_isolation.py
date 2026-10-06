@@ -33,55 +33,56 @@ class ImportBlocker:
 sys.meta_path.insert(0, ImportBlocker())
 sys.path.insert(0, sys.argv[1])
 
-tmp = Path(tempfile.mkdtemp(prefix="maa-api-isolation-"))
-accounts_path = tmp / "accounts.json"
-accounts_path.write_text(json.dumps([
-    {"username": "iso_user", "password": "iso-pw-1", "display_name": "隔离",
-     "level": "高中", "enabled": True},
-], ensure_ascii=False), encoding="utf-8")
+with tempfile.TemporaryDirectory(prefix="maa-api-isolation-") as _tmp:
+    tmp = Path(_tmp)
+    accounts_path = tmp / "accounts.json"
+    accounts_path.write_text(json.dumps([
+        {"username": "iso_user", "password": "iso-pw-1", "display_name": "隔离",
+         "level": "高中", "enabled": True},
+    ], ensure_ascii=False), encoding="utf-8")
 
-from core.runtime import build_runtime
-runtime = build_runtime(
-    env_file=tmp / "missing.env",
-    providers_file=tmp / "missing.providers.json",
-    accounts_path=accounts_path,
-    data_dir=tmp / "data",
-)
+    from core.runtime import build_runtime
+    runtime = build_runtime(
+        env_file=tmp / "missing.env",
+        providers_file=tmp / "missing.providers.json",
+        accounts_path=accounts_path,
+        data_dir=tmp / "data",
+    )
 
-import api  # 若间接依赖 app/gradio 会在此抛 ImportError
-app = api.create_api_app(runtime, frontend_dir=None)
+    import api  # 若间接依赖 app/gradio 会在此抛 ImportError
+    app = api.create_api_app(runtime, frontend_dir=None)
 
-from fastapi.testclient import TestClient
-client = TestClient(app, base_url="http://127.0.0.1:8000")
+    from fastapi.testclient import TestClient
+    client = TestClient(app, base_url="http://127.0.0.1:8000")
 
-# 关键路径：登录 → 会话 → 历史 → 远程形态的管理员拒绝 → 空消息被拒（SSE）
-login = client.post(
-    "/api/login",
-    json={"username": "iso_user", "password": "iso-pw-1"},
-    headers={"Origin": "http://127.0.0.1:8000"},
-)
-assert login.status_code == 200, login.text
-me = client.get("/api/me")
-assert me.status_code == 200 and me.json()["username"] == "iso_user", me.text
-history = client.get("/api/history")
-assert history.status_code == 200, history.text
-admin = client.get("/api/admin/stats")
-assert admin.status_code == 403, admin.text  # TestClient 来源非回环 → 默认拒绝
-stream = client.post(
-    "/api/chat",
-    json={"message": " ", "mode": "互动模式"},
-    headers={"Origin": "http://127.0.0.1:8000"},
-)
-assert stream.status_code == 200 and "rejected" in stream.text, stream.text
+    # 关键路径：登录 → 会话 → 历史 → 远程形态的管理员拒绝 → 空消息被拒（SSE）
+    login = client.post(
+        "/api/login",
+        json={"username": "iso_user", "password": "iso-pw-1"},
+        headers={"Origin": "http://127.0.0.1:8000"},
+    )
+    assert login.status_code == 200, login.text
+    me = client.get("/api/me")
+    assert me.status_code == 200 and me.json()["username"] == "iso_user", me.text
+    history = client.get("/api/history")
+    assert history.status_code == 200, history.text
+    admin = client.get("/api/admin/stats")
+    assert admin.status_code == 403, admin.text  # TestClient 来源非回环 → 默认拒绝
+    stream = client.post(
+        "/api/chat",
+        json={"message": " ", "mode": "互动模式"},
+        headers={"Origin": "http://127.0.0.1:8000"},
+    )
+    assert stream.status_code == 200 and "rejected" in stream.text, stream.text
 
-print(json.dumps({
-    "gradio_loaded": "gradio" in sys.modules,
-    "app_loaded": "app" in sys.modules,
-    "login": login.status_code,
-    "me": me.json()["username"],
-    "admin_status": admin.status_code,
-    "stream_rejected": "rejected" in stream.text,
-}, ensure_ascii=False))
+    print(json.dumps({
+        "gradio_loaded": "gradio" in sys.modules,
+        "app_loaded": "app" in sys.modules,
+        "login": login.status_code,
+        "me": me.json()["username"],
+        "admin_status": admin.status_code,
+        "stream_rejected": "rejected" in stream.text,
+    }, ensure_ascii=False))
 """
 
 

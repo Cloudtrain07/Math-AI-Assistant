@@ -190,35 +190,36 @@ def spy_start(self, *args, **kwargs):
 threading.Thread.start = spy_start
 webbrowser.open = lambda *a, **k: events.append(("browser", "webbrowser.open", ""))
 
-tmp = Path(tempfile.mkdtemp(prefix="maa-api-boundary-"))
-accounts_path = tmp / "accounts.json"
-accounts_path.write_text(json.dumps([
-    {"username": "iso", "password": "iso-pw", "display_name": "隔离",
-     "level": "高中", "enabled": True},
-], ensure_ascii=False), encoding="utf-8")
+with tempfile.TemporaryDirectory(prefix="maa-api-boundary-") as _tmp:
+    tmp = Path(_tmp)
+    accounts_path = tmp / "accounts.json"
+    accounts_path.write_text(json.dumps([
+        {"username": "iso", "password": "iso-pw", "display_name": "隔离",
+         "level": "高中", "enabled": True},
+    ], ensure_ascii=False), encoding="utf-8")
 
-import api
-from core.runtime import build_runtime
-runtime = build_runtime(
-    env_file=tmp / "missing.env",
-    providers_file=tmp / "missing.providers.json",
-    accounts_path=accounts_path,
-    data_dir=tmp / "data",
-)
-app = api.create_api_app(runtime, frontend_dir=None)
+    import api
+    from core.runtime import build_runtime
+    runtime = build_runtime(
+        env_file=tmp / "missing.env",
+        providers_file=tmp / "missing.providers.json",
+        accounts_path=accounts_path,
+        data_dir=tmp / "data",
+    )
+    app = api.create_api_app(runtime, frontend_dir=None)
 
-data_dir = tmp / "data"
-created = sorted(p.name for p in data_dir.iterdir()) if data_dir.exists() else []
+    data_dir = tmp / "data"
+    created = sorted(p.name for p in data_dir.iterdir()) if data_dir.exists() else []
 
-print(json.dumps({
-    "events": events,
-    "gradio_loaded": "gradio" in sys.modules,
-    "app_loaded": "app" in sys.modules,
-    "uvicorn_loaded": "uvicorn" in sys.modules,
-    "data_dir_exists": data_dir.exists(),
-    "data_files": created,
-    "has_app": app is not None,
-}))
+    print(json.dumps({
+        "events": events,
+        "gradio_loaded": "gradio" in sys.modules,
+        "app_loaded": "app" in sys.modules,
+        "uvicorn_loaded": "uvicorn" in sys.modules,
+        "data_dir_exists": data_dir.exists(),
+        "data_files": created,
+        "has_app": app is not None,
+    }))
 """
 
 

@@ -1,9 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  clampCanvasSize,
   defaultEditParams,
   expectedExportSize,
-  formatBytes,
   isOverSize,
   isSupportedImageFile,
   MAX_IMAGE_BYTES,
@@ -69,32 +67,9 @@ describe('expectedExportSize', () => {
   })
 })
 
-describe('clampCanvasSize', () => {
-  it('不超过上限时原样返回', () => {
-    expect(clampCanvasSize(4000, 3000)).toEqual({
-      width: 4000,
-      height: 3000,
-      scaled: false,
-    })
-  })
-
-  it('超上限等比收边并标记', () => {
-    const r = clampCanvasSize(16384, 8192)
-    expect(r).toEqual({ width: 8192, height: 4096, scaled: true })
-  })
-})
-
 describe('nextDownscale', () => {
   it('按固定步长缩边，到 1px 停止', () => {
     expect(nextDownscale(1000, 800)).toEqual({ width: 750, height: 600 })
     expect(nextDownscale(1, 800)).toBeNull()
-  })
-})
-
-describe('formatBytes', () => {
-  it('人类可读', () => {
-    expect(formatBytes(512)).toBe('512 B')
-    expect(formatBytes(2048)).toBe('2 KB')
-    expect(formatBytes(3 * 1024 * 1024)).toBe('3.0 MB')
   })
 })
