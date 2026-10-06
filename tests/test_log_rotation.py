@@ -150,3 +150,24 @@ def test_error_log_trim_keeps_latest(tmp_path):
     assert len(lines) == 5
     assert json.loads(lines[-1])["message"] == "n=6"
     assert all(json.loads(line)["message"] != "n=0" for line in lines)
+
+
+# ---------- 写入失败静默：日志故障不传播给业务 ----------
+
+
+def test_write_failure_is_silent(tmp_path):
+    """data_dir 被普通文件占用时写入必然失败：调用不抛异常，也不产生日志文件。"""
+    blocked = tmp_path / "被占用"
+    blocked.write_text("普通文件，不能当目录用", encoding="utf-8")
+    logger = FileEventLogger(blocked)
+
+    logger.log_chat_event("发送", "内容")
+    logger.log_access_event("提问", "账号=user1")
+    logger.log_error(
+        RuntimeError("模拟异常"), account="user1", turn_total=1, partial=False
+    )
+    logger.log_empty_reply(account="user1", turn_total=None, truncated=False)
+
+    assert not (tmp_path / "chat.log").exists()
+    assert not (tmp_path / "access.log").exists()
+    assert not (tmp_path / "error.log").exists()

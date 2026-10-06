@@ -966,6 +966,7 @@ def test_generate_reply_composes_stream_and_finalization(
 def test_prepare_chat_turn_preserves_rejection_order(
     scenario, expected_status, expected_questions, added_user
 ):
+
     class QuotaReadFailStore(CountingDailyUsageStore):
         def get_used(self, date, account):
             raise DailyUsageReadError("模拟额度读取失败")
@@ -1201,3 +1202,47 @@ def test_run_chat_turn_without_gradio(scenario):
     )
     assert daily_store.get_questions(date) == 1
     assert daily_store.add_usage_calls == [(date, username, 40)]
+
+
+def test_prepare_chat_turn_survives_question_count_failure():
+    """提问次数写盘失败不阻断聊天：回合照常就绪，并留下明确失败信息。"""
+
+    class FailingQuestionStore(CountingDailyUsageStore):
+        def add_question(self, date):
+            raise OSError("模拟提问次数写盘失败")
+
+    daily_store = FailingQuestionStore()
+    history_store = MemoryHistoryStore()
+    logger = MemoryEventLogger()
+    client = Mock(supports_vision=False)
+
+    result = chat_service.prepare_chat_turn(
+        message="1+1=?",
+        history=[],
+        mode="互动模式",
+        stage_state={
+            "stage": "full_solution",
+            "hints": 2,
+            "last_mode": "互动模式",
+        },
+        image_state=None,
+        username="user1",
+        ip="127.0.0.1",
+        date="2026-10-01",
+        active_client=client,
+        history_store=history_store,
+        daily_usage_store=daily_store,
+        event_logger=logger,
+        max_message_len=2000,
+        daily_limit=1000,
+        global_daily_limit=3000,
+        image_only_prompt="请解答图中的题目。",
+        image_note="[附图]",
+    )
+
+    assert result["status"] == "ready"
+    assert result["turn_token"] == 0
+    assert daily_store.get_questions("2026-10-01") == 0
+    assert any(
+        "提问次数记录失败" in str(parts) for parts in logger.access_events
+    )

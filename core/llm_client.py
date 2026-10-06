@@ -200,19 +200,3 @@ class LLMClient:
         response = self._client.chat.completions.create(**create_kwargs)
         return (response.choices[0].message.content or "").strip()
 
-
-# 兼容旧代码：DeepSeekClient 现在等价于一个 thinking_param=deepseek 的 LLMClient
-class DeepSeekClient(LLMClient):
-    """保留的 DeepSeek 兼容客户端。"""
-
-    def __init__(self, settings: Settings) -> None:
-        provider = {
-            "id": "deepseek",
-            "name": "DeepSeek",
-            "base_url": settings.base_url,
-            "api_key_env": "DEEPSEEK_API_KEY",
-            "models": [settings.model],
-            "default_model": settings.model,
-            "thinking_param": "deepseek",
-        }
-        super().__init__(provider, settings)

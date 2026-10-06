@@ -3,9 +3,9 @@
 本层只做协议适配：额度判断、阶段推进、上下文压缩、模型调用、历史保存、
 用量结算与日志全部留在 core.chat_service，不在 API 层复制。
 
-剩余耦合（已解除）：登录副作用与展示文案原从 app.py 导入，现下沉到
+剩余耦合（已解除）：登录副作用与展示文案已下沉到
 core.login（校验+日志+登录计数唯一入口）与 core.ui_text（共用文案与
-用量/错误格式化），由两界面共同引用；本层不再导入 app 或 gradio。
+用量/错误格式化）；旧 Gradio 界面已退役，本层不导入 app 或 gradio。
 
 身份与会话：
 - 复用 core.accounts.check_login（经 core.login.verify_login，
@@ -47,8 +47,8 @@ core.login（校验+日志+登录计数唯一入口）与 core.ui_text（共用�
 - 临时文件按账号存于 data_dir/temp_images/<账号>/，文件名随机，目录不
   对外静态服务；image_id 仅在本账号会话内可解析，跨账号引用查无此 id；
 - 图片状态（path/fresh）保存在 ChatState 上并随核心每轮返回值写回，
-  语义与旧界面 gr.State 一致：同题追问每轮重新附带原图，新题/读图失败
-  由核心置空；被替换或被丢弃的临时文件在写回时同步删除；
+  语义：同题追问每轮重新附带原图，新题/读图失败
+由核心置空；被替换或被丢弃的临时文件在写回时同步删除；
 - 图片挂载（mount_pending_image）在 begin_turn 之后、注册表锁内核验
   epoch 与文件存在性：挂载前发生清空或文件已被删除时拒绝本轮，
   不会把旧路径写回清空后的状态；
@@ -72,7 +72,7 @@ core.login（校验+日志+登录计数唯一入口）与 core.ui_text（共用�
 
 启动边界：
 - 导入本模块与 create_api_app(runtime) 都不启动服务、备份线程或浏览器，
-  配套任务只由 main() 通过 LaunchSupport 显式接上（旧 Gradio 走 app.py，不经过这里）；
+  配套任务只由 main() 通过 LaunchSupport 显式接上；
 - LaunchSupport 是本次启动配套资源的唯一持有者：备份停止信号与线程、
   浏览器等待线程与落盘文件都按 runtime.data_dir + 实际端口归属，
   退出、Ctrl+C、端口占用与启动中途失败都只回收自己创建的那些；
@@ -109,7 +109,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 
-# 与旧界面共用：登录副作用与文案/格式化来自 core，本层不依赖 app/gradio
+# 登录副作用与文案/格式化来自 core，本层不依赖任何界面层
 from core import chat_service
 from core import dialogue_state
 from core.access import (
@@ -159,8 +159,7 @@ ANSWER_STYLES = ("完整步骤+答案", "简略过程+答案", "只给答案和�
 # 上传图片的像素上限：只用于防解压炸弹，不做清晰度压缩。
 # 依据：主流手机照片 12–48MP，50MP 覆盖绝大多数真实照片；
 # 更大者（如 108MP 全尺寸直出）明确拒绝并提示先缩小，不静默处理。
-# 兼容影响：旧 Gradio 界面不走此校验，行为不变；Pillow 自带的
-# DecompressionBomb 保护（约 179MP）仍作为最终兜底。
+# Pillow 自带的 DecompressionBomb 保护（约 179MP）仍作为最终兜底。
 MAX_IMAGE_PIXELS = 50_000_000
 
 # 非目标模型 / thinking_param=none 的显式思考强度沿用原有全局档位校验；
@@ -338,7 +337,7 @@ class ChatState:
     """单个账号的服务端聊天状态；history 初值来自磁盘。
 
     epoch 为清空计数：清空时递增，旧轮次完成后凭它判断状态是否仍有效。
-    image_state 与旧界面 gr.State 语义一致：path 为服务端临时文件路径，
+    image_state 语义：path 为服务端临时文件路径，
     fresh 表示本回合刚上传（交给核心 route_image_for_turn 判定是否附图）。
     """
 
@@ -1459,8 +1458,7 @@ class LaunchSupport:
 
     归属明确，close() 只回收本次实际创建的对象：
     - 备份线程与停止信号记在实例上，备份目录取 runtime.data_dir，不改全局常量；
-    - 地址文件写在 data_dir 内，只含地址与更新时间；旧 Gradio 的
-      data/当前访问密码.txt 由 app.py 自己维护，这里不读不写。
+    - 地址文件写在 data_dir 内，只含地址与更新时间，不含密码等敏感信息。
     """
 
     def __init__(
@@ -1642,7 +1640,6 @@ def main() -> None:
 
     启动异常（Ctrl+C、端口占用、写盘失败）原样向外传播以保留失败退出码，
     finally 只回收 LaunchSupport 本次实际创建的配套资源。
-    旧 Gradio 的启动方式（app.py 与 启动数学助手.bat）不受这里影响。
     """
     parser = argparse.ArgumentParser(description="数学学习 AI 助手（FastAPI 版）")
     parser.add_argument("--host", default="127.0.0.1")

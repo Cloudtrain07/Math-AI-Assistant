@@ -1,7 +1,7 @@
 """启动入口批处理的行为验证。
 
-不运行真实服务：把仓库里的两个 .bat 复制进临时目录，
-用替身 api.py / app.py 记录被调用时的参数，用临时目录里拼装的
+不运行真实服务：把仓库里的新版 .bat 复制进临时目录，
+用替身 api.py 记录被调用时的参数，用临时目录里拼装的
 "真 python.exe"（复制现有解释器 + PYTHONHOME）充当系统 Python 回退，
 只验证批处理自身的调用契约（调谁、传什么参数、退出码是否保留），
 不连接真实配置与真实数据。
@@ -34,7 +34,6 @@ pytestmark = pytest.mark.skipif(
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NEW_BAT = "启动数学助手.bat"
-OLD_BAT = "启动数学助手_旧版.bat"
 
 STUB_ENTRY = """\
 import json, os, sys
@@ -87,15 +86,11 @@ def sandbox(tmp_path: Path) -> Path:
     root = tmp_path / "sandbox"
     root.mkdir()
     shutil.copy(REPO_ROOT / NEW_BAT, root / NEW_BAT)
-    shutil.copy(REPO_ROOT / OLD_BAT, root / OLD_BAT)
     (root / ".env").write_text("DEEPSEEK_API_KEY=stub\n", encoding="utf-8")
     dist = root / "frontend" / "dist"
     dist.mkdir(parents=True)
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
-    for entry in ("api.py", "app.py"):
-        (root / entry).write_text(
-            stub_source(entry.removesuffix(".py")), encoding="utf-8"
-        )
+    (root / "api.py").write_text(stub_source("api"), encoding="utf-8")
     return root
 
 
@@ -129,15 +124,6 @@ def test_new_entry_calls_api_with_expected_args(sandbox, fake_python_env):
     record = read_record(sandbox, "api")
     assert record["program"] == "api"
     assert record["argv"] == ["--host", "0.0.0.0", "--port", "8000"]
-
-
-def test_old_entry_still_calls_app(sandbox, fake_python_env):
-    result = run_bat(sandbox, OLD_BAT, fake_python_env)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    record = read_record(sandbox, "app")
-    assert record["program"] == "app"
-    assert "api.py" not in record["argv"]
 
 
 def test_new_entry_fails_without_frontend_build(sandbox, fake_python_env):

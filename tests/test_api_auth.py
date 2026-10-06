@@ -152,3 +152,20 @@ def test_login_body_trusts_no_client_identity_fields(client):
     me = tc.get("/api/me").json()
     assert me["username"] == account["username"]
     assert me["username"] != other["username"]
+
+
+def test_me_level_from_account_and_fallback(api_runtime):
+    """/api/me 的学段取自账号配置；会话有效但账号已不存在时回退默认学段。"""
+    tc = TestClient(create_api_app(api_runtime))
+    account = _first_account(api_runtime)
+    tc.post(
+        "/api/login",
+        json={"username": account["username"], "password": account["password"]},
+    )
+    me = tc.get("/api/me").json()
+    assert me["level"] == account["level"]
+
+    api_runtime.accounts = []
+    me = tc.get("/api/me").json()
+    assert me["level"] == "高中"
+    assert me["display_name"] == account["username"]

@@ -1,5 +1,10 @@
-gradio>=5.0.0,<6.0.0
 openai>=1.40.0,<2.0.0
 python-dotenv>=1.1.0
 fastapi>=0.110.0,<1.0.0
 uvicorn>=0.29.0,<1.0.0
+# 图片解码/校验（api.py、core/vision_client.py 直接使用）
+pillow>=11.0
+# FastAPI File/UploadFile 处理 multipart 上传的运行时依赖
+python-multipart>=0.0.20
+# core/llm_client.py 直接使用（此前靠 openai 传递安装）
+httpx>=0.28.0

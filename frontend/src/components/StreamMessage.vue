@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed } from 'vue'
 import { parseStreaming, type InlineItem, type Unit } from '../streaming/streamSplit'
 import { renderInlineHtml, renderMathHtml } from '../streaming/render'
 
@@ -10,12 +10,6 @@ const props = defineProps<{
   done: boolean
   /** 用于生成稳定的调试键（观测器追踪公式节点） */
   scope: string
-  /**
-   * 故障注入（仅对照验证用，正常播放不传）：
-   * - 'replace'：故意让每个公式每次更新都替换内部排版节点；
-   * - 'drop'：首个块级公式完成约 1.5 秒后故意从 DOM 中删除它。
-   */
-  fault?: 'replace' | 'drop'
 }>()
 
 const parsed = computed(() => parseStreaming(props.text, props.done))
@@ -41,7 +35,6 @@ const tree = computed<TreeNode[]>(() => {
     const unit = parsed.value.units[i]
     const gt = gtypeOf(unit)
     if (gt === null) {
-      if (dropArmed.value && unit.type === 'mathBlock' && i === dropKey.value) continue
       nodes.push({ type: 'unit', key: i, unit })
       continue
     }
@@ -55,42 +48,6 @@ const tree = computed<TreeNode[]>(() => {
   }
   return nodes
 })
-
-let nonce = 0
-
-function mathHtml(tex: string, display: boolean): string {
-  const html = renderMathHtml(tex, display)
-  if (props.fault !== 'replace') return html
-  // 故意让 v-html 字符串每次变化 → 内部 KaTeX 节点被整体替换（注入的故障）
-  return `${html}<!--unstable-${nonce++}-->`
-}
-
-// 'drop' 故障：首个块级公式出现后计时，到点后把它从渲染树中剔除（DOM 删除）
-const dropKey = ref<number | null>(null)
-const dropArmed = ref(false)
-let dropTimer: ReturnType<typeof setTimeout> | null = null
-
-watch(
-  () => props.text,
-  (text) => {
-    if (props.fault !== 'drop') return
-    if (text === '') {
-      dropKey.value = null
-      dropArmed.value = false
-      if (dropTimer !== null) clearTimeout(dropTimer)
-      dropTimer = null
-      return
-    }
-    if (dropKey.value !== null) return
-    const idx = parsed.value.units.findIndex((u) => u.type === 'mathBlock')
-    if (idx >= 0) {
-      dropKey.value = idx
-      dropTimer = setTimeout(() => {
-        dropArmed.value = true
-      }, 1500)
-    }
-  },
-)
 
 function fragKey(unitKey: number, itemIndex: number): string {
   return `${props.scope}-${unitKey}-${itemIndex}`
@@ -113,7 +70,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
         v-if="node.type === 'unit' && node.unit.type === 'mathBlock'"
         class="math-block"
         :data-stream-math="blockMathKey(node.key)"
-        v-html="mathHtml(node.unit.tex, true)"
+        v-html="renderMathHtml(node.unit.tex, true)"
       ></div>
       <pre v-else-if="node.type === 'unit' && node.unit.type === 'code'" class="code-block"><code>{{ node.unit.text }}</code></pre>
 
@@ -126,7 +83,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
               v-else
               class="math-inline"
               :data-stream-math="fragKey(child.key, ii)"
-              v-html="mathHtml(it.tex, false)"
+              v-html="renderMathHtml(it.tex, false)"
             ></span>
           </template>
         </span>
@@ -140,7 +97,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
                 v-else
                 class="math-inline"
                 :data-stream-math="fragKey(child.key, ii)"
-                v-html="mathHtml(it.tex, false)"
+                v-html="renderMathHtml(it.tex, false)"
               ></span>
             </template>
           </span>
@@ -154,7 +111,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
               v-else
               class="math-inline"
               :data-stream-math="fragKey(child.key, ii)"
-              v-html="mathHtml(it.tex, false)"
+              v-html="renderMathHtml(it.tex, false)"
             ></span>
           </template>
         </li>
@@ -167,7 +124,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
               v-else
               class="math-inline"
               :data-stream-math="fragKey(child.key, ii)"
-              v-html="mathHtml(it.tex, false)"
+              v-html="renderMathHtml(it.tex, false)"
             ></span>
           </template>
         </li>
@@ -185,7 +142,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
             v-else
             class="math-inline"
             :data-stream-math="fragKey(node.key, ii)"
-            v-html="mathHtml(it.tex, false)"
+            v-html="renderMathHtml(it.tex, false)"
           ></span>
         </template>
       </component>

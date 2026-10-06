@@ -490,3 +490,30 @@ def test_history_endpoint_initial_load(api_runtime):
     login(tc, api_runtime.accounts[0])
     data = tc.get("/api/history").json()
     assert [m["content"] for m in data["history"]] == ["旧问题", "旧回答"]
+
+
+def test_history_corrupt_file_serves_empty_with_notice(api_runtime):
+    """历史文件损坏时如实下发空历史与 notice，不伪装成功、不覆盖原文件。"""
+    api_runtime.client = FakeStreamClient()
+    # 走文件实现（data_dir 已隔离到临时目录）
+    from core.storage import get_history_store
+
+    api_runtime.history_store = get_history_store(api_runtime.data_dir)
+    username = api_runtime.accounts[0]["username"]
+    bad = (
+        api_runtime.data_dir
+        / "history"
+        / f"{username}.json"
+    )
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("{损坏的历史", encoding="utf-8")
+
+    tc = TestClient(create_api_app(api_runtime))
+    login(tc, api_runtime.accounts[0])
+    data = tc.get("/api/history").json()
+
+    assert data["history"] == []
+    assert data["notice"] != ""
+    assert "读取失败" in data["notice"]
+    # 损坏文件未被覆盖：后续诊断仍能看到原文
+    assert bad.read_text(encoding="utf-8") == "{损坏的历史"

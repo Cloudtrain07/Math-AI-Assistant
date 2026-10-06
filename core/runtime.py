@@ -23,7 +23,7 @@ from core.providers import (
 from core.storage import get_history_store
 from core.usage_store import DailyUsageStore
 
-# app.py 位于项目根目录，data 目录就在同级；测试可在收集前替换此常量隔离路径
+# data 目录位于项目根目录；测试可在收集前替换此常量隔离路径
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 # 区分"未提供 settings（需要读取配置）"与"显式注入 settings=None（无配置回退）"
@@ -67,7 +67,7 @@ def build_runtime(
     daily_usage_store=None,
     event_logger=None,
 ) -> AppRuntime:
-    """按 app.py 原有语义组装运行状态。
+    """组装运行状态（账号、存储、日志、模型客户端）。
 
     - env_file/providers_file/accounts_path/data_dir 缺省时在调用时读取各模块
       的路径常量（与此前各模块自取默认值的行为一致）；

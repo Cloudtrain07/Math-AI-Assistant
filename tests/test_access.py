@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""公网访问密码与信息文件测试。
+"""访问地址与随机密码测试。
 
-新版 API 用的是 save_address_info（只写地址与更新时间）；
-旧 Gradio 的 save_access_info 行为在此一并锁定，不被新函数改写。
+覆盖 generate_password、地址族归一/连通性与 save_address_info
+（新版 API 的地址文件，只写地址与更新时间，不含凭据）。
 """
 
 import socket
@@ -25,7 +25,6 @@ from core.access import (
     is_loopback_bind,
     is_owner_host,
     is_usable_lan_ipv6,
-    save_access_info,
     save_address_info,
     url_host,
 )
@@ -45,48 +44,12 @@ def test_password_random_different():
     assert generate_password() != generate_password()
 
 
-def test_save_access_info_writes_file(tmp_path):
-    target = tmp_path / "当前访问密码.txt"
-    result = save_access_info(
-        "https://abc.gradio.live",
-        [
-            {
-                "username": "user1",
-                "password": "Ab3dEf9k",
-                "display_name": "小明",
-            }
-        ],
-        lan_url="http://192.168.1.5:7860",
-        target=target,
-    )
-    assert result == target
-    text = target.read_text(encoding="utf-8")
-    assert "user1" in text
-    assert "Ab3dEf9k" in text
-    assert "小明" in text
-    assert "https://abc.gradio.live" in text
-    assert "http://192.168.1.5:7860" in text
-
-
 def test_is_owner_host():
     assert is_owner_host("127.0.0.1")
     assert is_owner_host("::1")
     assert is_owner_host("localhost")
     assert not is_owner_host("192.168.3.83")
     assert not is_owner_host(None)
-
-
-def test_legacy_access_info_file_behaviour_unchanged(tmp_path):
-    """旧 Gradio 的访问信息文件照旧写账号密码、缺省局域网地址照旧是 7860。
-
-    防住的独立风险：新增地址信息函数时顺手改了 save_access_info，
-    旧启动方式落到"文件里没有密码"的行为变化上（用户依赖这份文件）。
-    """
-    target = tmp_path / "当前访问密码.txt"
-    save_access_info(None, [{"username": "u1", "password": "pw1"}], target=target)
-    text = target.read_text(encoding="utf-8")
-    assert "u1 / pw1" in text
-    assert ":7860" in text
 
 
 def test_browse_host_maps_by_address_family():
@@ -352,10 +315,8 @@ def test_address_info_uses_actual_host_and_port():
     assert address_entries("192.168.3.83", 8000)["局域网地址"] == "http://192.168.3.83:8000"
 
 
-def test_address_info_holds_no_credentials(tmp_path, monkeypatch):
-    """地址文件不含密码与密钥，也不会退回去写旧 Gradio 那份含密码的文件。"""
-    legacy = tmp_path / "data" / "当前访问密码.txt"
-    monkeypatch.setattr("core.access.ACCESS_FILE", legacy)
+def test_address_info_holds_no_credentials(tmp_path):
+    """地址文件只含地址与更新时间：随机密码、密钥形态的字符串都不出现。"""
     password = generate_password()
     target = tmp_path / "data" / "访问地址.txt"
 
@@ -368,4 +329,3 @@ def test_address_info_holds_no_credentials(tmp_path, monkeypatch):
     assert "sk-" not in text
     assert "更新时间：" in text
     assert "https://x.trycloudflare.com" in text
-    assert not legacy.exists()

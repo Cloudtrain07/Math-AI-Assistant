@@ -1,7 +1,6 @@
-"""公网访问与随机密码：生成访问密码、获取局域网 IP、写入访问信息文件。
+"""访问地址与随机密码：生成访问密码、获取局域网地址、写入访问地址文件。
 
-save_access_info 是旧 Gradio 的本地访问信息文件（含账号密码），行为保持不变；
-新版 API 用 save_address_info 写地址文件，只含地址与更新时间。
+save_address_info 供新版 API 启动时写地址文件，只含地址与更新时间，不含凭据。
 """
 
 from __future__ import annotations
@@ -10,10 +9,6 @@ import datetime
 import secrets
 import socket
 from pathlib import Path
-
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-# 旧 Gradio 的访问信息文件（含账号密码）；新版 API 不写这个文件
-ACCESS_FILE = DATA_DIR / "当前访问密码.txt"
 
 # 排除易混淆字符（0/O、1/I/l）
 _PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
@@ -94,36 +89,6 @@ def is_usable_lan_ipv6(address: str | None) -> bool:
     if _is_link_local_ipv6(value):
         return False
     return True
-
-
-def save_access_info(
-    url: str | None,
-    accounts: list[dict],
-    lan_url: str | None = None,
-    target: Path | None = None,
-) -> Path:
-    """把公网/局域网地址与全部访问账号写入访问信息文件，返回文件路径。"""
-    target = Path(target) if target is not None else ACCESS_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    lan_url = lan_url or f"http://{get_lan_ip()}:7860"
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [
-        "数学学习 AI 助手 - 访问信息",
-        f"生成时间：{now}",
-        f"公网地址：{url if url else '（暂不可用，请检查网络后重启程序）'}",
-        f"局域网地址：{lan_url}",
-        "访问账号（用户名 / 密码）：",
-    ]
-    for account in accounts:
-        display = account.get("display_name") or account.get("username")
-        suffix = f"（{display}）" if display and display != account.get("username") else ""
-        lines.append(f"  {account.get('username')} / {account.get('password')}{suffix}")
-    lines += [
-        "提示：密码固定，请妥善保管，只分享给信任的人。",
-        "",
-    ]
-    target.write_text("\n".join(lines), encoding="utf-8")
-    return target
 
 
 def is_owner_host(ip: str | None) -> bool:

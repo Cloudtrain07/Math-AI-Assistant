@@ -104,6 +104,23 @@ function discardPendingImage() {
   }
 }
 
+/**
+ * 已发送消息的缩略图地址：为每条消息创建独立 blob URL。
+ * 与待发送预览的 editedUrl 不共享，预览的重新编辑/移除不会让历史缩略图失效；
+ * 消息 URL 由消息持有，在清空、退出、恢复历史和组件卸载时统一释放。
+ */
+function createSentImageUrl(): string | undefined {
+  const blob = pendingImage.value?.editedBlob
+  return blob ? URL.createObjectURL(blob) : undefined
+}
+
+/** 释放所有已发送消息持有的图片地址（messages 即将被整体替换或组件销毁时） */
+function releaseMessageImages() {
+  for (const m of messages.value) {
+    if (m.imageUrl) URL.revokeObjectURL(m.imageUrl)
+  }
+}
+
 function openFilePicker() {
   fileInput.value?.click()
 }
@@ -243,6 +260,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (elapsedTimer !== null) clearInterval(elapsedTimer)
   window.removeEventListener('paste', onPaste)
+  releaseMessageImages()
 })
 
 async function loadSettings() {
@@ -259,6 +277,7 @@ async function loadSettings() {
 }
 
 async function restoreHistory() {
+  releaseMessageImages()
   const data = await fetchHistory()
   messages.value = data.history.map((m) => ({
     role: m.role,
@@ -291,6 +310,7 @@ async function doLogout() {
   stopStreaming()
   await apiLogout()
   me.value = null
+  releaseMessageImages()
   messages.value = []
   setStatus('')
   usageText.value = ''
@@ -459,7 +479,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
             signal: controller.signal,
             imageId,
             // 纯图片发送时文本为服务端默认题目提示，气泡同时展示所发图片
-            onStart: (payload) => showBubbles(text || payload.message, imageId ? pendingImage.value?.editedUrl : undefined),
+            onStart: (payload) => showBubbles(text || payload.message, imageId ? createSentImageUrl() : undefined),
             onDelta,
           })
         : await continueChat(requestSettings, {
@@ -542,6 +562,7 @@ async function onClearClick() {
   clearArmed.value = false
   const result = await clearConversation()
   if (result.ok) {
+    releaseMessageImages()
     messages.value = []
     setStatus(result.message, 'success')
     usageText.value = ''
