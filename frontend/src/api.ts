@@ -50,7 +50,8 @@ export interface StartPayload {
   message: string
 }
 
-/** 单轮界面设置：随聊天/继续生成请求提交，后端验证后选择对应客户端 */
+/** 单轮界面设置：随聊天/继续生成请求提交，后端验证后选择对应客户端。
+ * reasoning_effort 为 null 表示当前模型不提供思考强度（后端按缺省处理） */
 export interface TurnSettings {
   mode: string
   level: string
@@ -58,7 +59,15 @@ export interface TurnSettings {
   provider_id: string | null
   model: string
   answer_style: string
-  reasoning_effort: string
+  reasoning_effort: string | null
+}
+
+/** 单个模型的思考档位信息（来自后端共享能力规则，前端不自行维护） */
+export interface ModelThinking {
+  /** 可选档位；空数组表示该模型不提供思考强度选择 */
+  effort_levels: string[]
+  /** 切换到该模型时同步的默认档位；无档位时为 null */
+  default_effort: string | null
 }
 
 /** /api/settings 返回的界面设置清单：只含展示字段，无任何内部配置 */
@@ -68,6 +77,8 @@ export interface ProviderOption {
   models: string[]
   default_model: string | null
   supports_thinking: boolean
+  /** 模型名 → 思考档位；覆盖该服务商的全部模型 */
+  model_thinking: Record<string, ModelThinking>
 }
 
 export interface SettingsInfo {

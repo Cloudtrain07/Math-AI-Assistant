@@ -126,7 +126,7 @@ from core.accounts import load_accounts, reset_password
 from core.backup import BackupResult, daily_backup_loop, run_backup
 from core.login import verify_login
 from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
-from core.providers import get_provider_supports_thinking
+from core.providers import get_model_thinking_capability, get_provider_supports_thinking
 from core.runtime import AppRuntime, build_runtime
 from core.storage import HistoryReadError, safe_account_name
 from core.tunnel import TunnelWatcher, cleanup_stale_tunnel, find_cloudflared
@@ -157,7 +157,6 @@ LEVELS = ("小学", "初中", "高中", "大学")
 MODES = (MODE_INTERACTIVE, MODE_ANSWER)
 DEFAULT_ANSWER_STYLE = "完整步骤+答案"
 ANSWER_STYLES = ("完整步骤+答案", "简略过程+答案", "只给答案和结论")
-REASONING_EFFORTS = ("low", "high", "max")
 
 # 上传图片的像素上限：只用于防解压炸弹，不做清晰度压缩。
 # 依据：主流手机照片 12–48MP，50MP 覆盖绝大多数真实照片；
@@ -165,6 +164,10 @@ REASONING_EFFORTS = ("low", "high", "max")
 # 兼容影响：旧 Gradio 界面不走此校验，行为不变；Pillow 自带的
 # DecompressionBomb 保护（约 179MP）仍作为最终兜底。
 MAX_IMAGE_PIXELS = 50_000_000
+
+# 非目标模型 / thinking_param=none 的显式思考强度沿用原有全局档位校验；
+# 已核实目标模型（DeepSeek/Qwen3.7/Qwen3.8/MiMo）按模型级 accepted_efforts 校验
+REASONING_EFFORTS = ("low", "high", "max")
 
 
 # ===================== 会话与账号聊天状态 =====================
@@ -777,7 +780,18 @@ def _resolve_turn_settings(runtime: AppRuntime, username: str, body: TurnSetting
 
     if body.reasoning_effort is not None:
         effort = body.reasoning_effort
-        if effort not in REASONING_EFFORTS:
+        # 模型级校验只用于已核实的适配目标（accepted_efforts 非 None）：
+        # 该模型不提供档位（如 Qwen3.7、MiMo）或取值非法时明确拒绝，不调用模型。
+        # 非目标模型与 thinking_param=none 保持原有全局档位校验，行为不变。
+        accepted = get_model_thinking_capability(provider, model)["accepted_efforts"]
+        if accepted is None:
+            if effort not in REASONING_EFFORTS:
+                raise HTTPException(status_code=400, detail="无效的思考强度")
+        elif not accepted:
+            raise HTTPException(
+                status_code=400, detail="该模型不提供思考强度设置"
+            )
+        elif effort not in accepted:
             raise HTTPException(status_code=400, detail="无效的思考强度")
     else:
         effort = settings.reasoning_effort if settings is not None else "high"
@@ -1140,6 +1154,8 @@ def create_api_app(
             (a for a in rt.accounts if a["username"] == username), None
         )
         level = account.get("level") if account else None
+        # 每个模型的思考档位由共享的纯能力函数给出，前端不自行维护规则；
+        # effort_levels 为空表示该模型不显示强度选择（如 Qwen3.7、MiMo）
         return {
             "providers": [
                 {
@@ -1148,6 +1164,14 @@ def create_api_app(
                     "models": list(p.get("models") or []),
                     "default_model": p.get("default_model"),
                     "supports_thinking": get_provider_supports_thinking(p),
+                    "model_thinking": {
+                        m: {
+                            "effort_levels": list(cap["effort_levels"]),
+                            "default_effort": cap["default_effort"],
+                        }
+                        for m in (p.get("models") or [])
+                        for cap in [get_model_thinking_capability(p, m)]
+                    },
                 }
                 for p in rt.ui_providers
             ],

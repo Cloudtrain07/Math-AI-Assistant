@@ -28,7 +28,7 @@ import {
 import { shouldSendOnEnter } from './ime'
 import { classifyDone, composeDaily, composeNotice } from './notice'
 import { isFollowingBottom, shouldShowJumpToBottom } from './scrollFollow'
-import { providerView } from './settings'
+import { modelThinking, providerView, syncEffort } from './settings'
 
 interface ChatEntry {
   role: 'user' | 'assistant'
@@ -194,14 +194,18 @@ const level = ref('高中')
 const providerId = ref<string | null>(null)
 const model = ref('')
 const thinking = ref(false)
-const effort = ref('high')
+/** 当前模型的思考强度；null 表示该模型不提供强度选择（不随请求发送） */
+const effort = ref<string | null>('high')
 const answerStyle = ref('完整步骤+答案')
 
 const currentProvider = computed(
   () => settings.value?.providers.find((p) => p.id === providerId.value) ?? null,
 )
-// 深度思考开关与思考强度只在服务商支持时显示（与旧界面一致）
+// 深度思考开关只在服务商支持时显示（与旧界面一致）；
+// 思考强度按当前模型的档位元数据显隐（Qwen3.7、MiMo 无强度选择）
 const supportsThinking = computed(() => currentProvider.value?.supports_thinking ?? false)
+const modelCapability = computed(() => modelThinking(currentProvider.value, model.value))
+const effortLevels = computed(() => modelCapability.value.effort_levels)
 // 解答风格只在解答模式下显示（与旧界面一致）
 const showAnswerStyle = computed(() => mode.value === '解答模式')
 const modes = computed(() => settings.value?.modes ?? ['互动模式', '解答模式'])
@@ -209,6 +213,12 @@ const modes = computed(() => settings.value?.modes ?? ['互动模式', '解答�
 // 切换服务商：模型列表与选中值同步为新服务商配置，避免残留无效模型
 watch(providerId, () => {
   model.value = providerView(settings.value?.providers ?? [], providerId.value).model
+})
+
+// 切换服务商或模型后同步思考强度：合法值保留，非法值换成新模型的默认档位，
+// 无档位的模型清空（不发送强度参数），不残留上一模型的档位
+watch([providerId, model], () => {
+  effort.value = syncEffort(modelCapability.value, effort.value)
 })
 
 // .page 是唯一滚动容器：页头与输入卡为玻璃悬浮层，消息从其下方穿过
@@ -362,6 +372,7 @@ function stopStreaming() {
 }
 
 function currentTurnSettings(): TurnSettings {
+  const levels = effortLevels.value
   return {
     mode: mode.value,
     level: level.value,
@@ -369,7 +380,9 @@ function currentTurnSettings(): TurnSettings {
     provider_id: providerId.value,
     model: model.value,
     answer_style: answerStyle.value,
-    reasoning_effort: effort.value,
+    // 仅当前模型提供档位且选中值合法时发送强度；否则发 null（后端按缺省处理）
+    reasoning_effort:
+      effort.value !== null && levels.includes(effort.value) ? effort.value : null,
   }
 }
 
@@ -662,12 +675,10 @@ async function onClearClick() {
               <input v-model="thinking" type="checkbox" :disabled="sending" />
               深度思考模式（更严谨，稍慢）
             </label>
-            <label>
+            <label v-if="effortLevels.length > 0">
               思考强度
               <select v-model="effort" :disabled="sending">
-                <option value="low">low</option>
-                <option value="high">high</option>
-                <option value="max">max</option>
+                <option v-for="l in effortLevels" :key="l" :value="l">{{ l }}</option>
               </select>
             </label>
           </template>

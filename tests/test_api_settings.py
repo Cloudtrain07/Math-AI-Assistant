@@ -180,6 +180,10 @@ def test_settings_lists_display_fields_only(two_provider_env):
             "models": ["alpha-a", "alpha-b"],
             "default_model": "alpha-a",
             "supports_thinking": True,
+            "model_thinking": {
+                "alpha-a": {"effort_levels": ["low", "high", "max"], "default_effort": "high"},
+                "alpha-b": {"effort_levels": ["low", "high", "max"], "default_effort": "high"},
+            },
         },
         {
             "id": "beta",
@@ -187,6 +191,9 @@ def test_settings_lists_display_fields_only(two_provider_env):
             "models": ["beta-a"],
             "default_model": "beta-a",
             "supports_thinking": False,
+            "model_thinking": {
+                "beta-a": {"effort_levels": [], "default_effort": None},
+            },
         },
     ]
     assert body["levels"] == ["小学", "初中", "高中", "大学"]
@@ -253,7 +260,11 @@ def test_two_runtimes_providers_do_not_cross(monkeypatch, tmp_path):
 
 
 def test_provider_switch_routes_client_model_and_settings(two_provider_env):
-    """指定服务商后：对应客户端被调用，模型与思考设置原样传给核心。"""
+    """指定服务商后：对应客户端被调用，模型与思考设置原样传给核心。
+
+    beta（thinking_param=none）是非目标服务商：显式 low 保持原有兼容，
+    客户端必须原样收到 low，不得被模型级校验拒绝。
+    """
     tc, _, clients = two_provider_env
     resp = tc.post(
         "/api/chat",
@@ -302,6 +313,7 @@ def test_default_settings_use_default_provider(two_provider_env):
         {"model": "alpha-c"},
         {"provider_id": "alpha", "model": "beta-a"},  # 跨服务商的模型
         {"reasoning_effort": "turbo"},
+        {"provider_id": "beta", "reasoning_effort": "turbo"},  # 非目标：非法值仍拒绝
         {"answer_style": "随便写"},
         {"mode": "闲聊模式"},
     ],
@@ -313,6 +325,233 @@ def test_invalid_settings_rejected_without_model_call(two_provider_env, extra):
     assert resp.status_code == 400
     assert resp.json()["detail"]
     assert all(len(c.calls) == 0 for c in clients.values())
+
+
+# ===================== 目标模型（DeepSeek / Qwen / MiMo）的强度校验 =====================
+
+TARGET_PROVIDERS = [
+    {
+        "id": "dashscope",
+        "name": "百炼",
+        "base_url": "https://dashscope.invalid/compatible-mode/v1",
+        "api_key_env": "DASH_API_KEY",
+        "models": ["qwen3.7-flash", "qwen3.8-flash", "qwen3.8-max", "kimi-k3",
+                   "qwen3.80-unverified"],
+        "default_model": "qwen3.7-flash",
+        "thinking_param": "qwen",
+    },
+    {
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "base_url": "https://deepseek.invalid",
+        "api_key_env": "DS_API_KEY",
+        "models": ["deepseek-flash", "deepseek-v4-pro"],
+        "default_model": "deepseek-flash",
+        "thinking_param": "deepseek",
+    },
+    {
+        "id": "xiaomi-mimo",
+        "name": "小米mimo",
+        "base_url": "https://mimo.invalid/v1",
+        "api_key_env": "MIMO_API_KEY",
+        "models": ["mimo-v2.6-flash", "mimo-v2.6-pro"],
+        "default_model": "mimo-v2.6-flash",
+        "thinking_param": "mimo",
+    },
+]
+
+
+@pytest.fixture
+def target_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DASH_API_KEY", "key-dash")
+    monkeypatch.setenv("DS_API_KEY", "key-ds")
+    monkeypatch.setenv("MIMO_API_KEY", "key-mimo")
+    runtime, clients = build_two_provider_runtime(tmp_path, providers=TARGET_PROVIDERS)
+    api = create_api_app(runtime)
+    tc = TestClient(api)
+    login(tc, API_TEST_ACCOUNTS[0])
+    return tc, clients
+
+
+def test_settings_metadata_reports_per_model_levels(target_env):
+    """设置元数据按模型给出档位：Qwen3.7/MiMo 无强度，Qwen3.8 原生档位，
+    DeepSeek 与 kimi-k3（非 Qwen 规则）保持既有档位；
+    近似前缀的未核实模型不进目标规则，保持 legacy 档位。"""
+    tc, _ = target_env
+    providers = {p["id"]: p for p in tc.get("/api/settings").json()["providers"]}
+    thinking = providers["dashscope"]["model_thinking"]
+    assert thinking["qwen3.7-flash"] == {"effort_levels": [], "default_effort": None}
+    assert thinking["qwen3.8-flash"] == {
+        "effort_levels": ["low", "medium", "xhigh"],
+        "default_effort": "xhigh",
+    }
+    assert thinking["qwen3.8-max"] == thinking["qwen3.8-flash"]
+    # kimi-k3 与百炼共用平台标记，但不套用 Qwen 规则
+    assert thinking["kimi-k3"] == {
+        "effort_levels": ["low", "high", "max"],
+        "default_effort": "high",
+    }
+    # 近似前缀（qwen3.80-…）不在已核实名单内，不误匹配 Qwen3.8 规则
+    assert thinking["qwen3.80-unverified"] == {
+        "effort_levels": ["low", "high", "max"],
+        "default_effort": "high",
+    }
+    assert providers["deepseek"]["model_thinking"]["deepseek-flash"] == {
+        "effort_levels": ["low", "high", "max"],
+        "default_effort": "high",
+    }
+    assert providers["xiaomi-mimo"]["model_thinking"]["mimo-v2.6-flash"] == {
+        "effort_levels": [],
+        "default_effort": None,
+    }
+    for p in providers.values():
+        assert p["supports_thinking"] is True
+
+
+def test_unverified_model_keeps_legacy_effort_validation(target_env):
+    """近似前缀的未核实模型显式 low 走原有全局校验（接受），非法值仍拒绝。"""
+    tc, clients = target_env
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "dashscope",
+            "model": "qwen3.80-unverified",
+            "reasoning_effort": "low",
+        },
+    )
+    assert resp.status_code == 200
+    assert clients["dashscope"].calls[-1]["reasoning_effort"] == "low"
+
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "dashscope",
+            "model": "qwen3.80-unverified",
+            "reasoning_effort": "turbo",
+        },
+    )
+    assert resp.status_code == 400
+    assert "思考强度" in resp.json()["detail"]
+
+
+def test_qwen38_accepts_native_and_official_alias(target_env):
+    """Qwen3.8 接受原生档位与官方映射别名（high/max→xhigh），并路由到所选模型。"""
+    tc, clients = target_env
+    for effort in ("xhigh", "medium", "low", "high", "max"):
+        resp = tc.post(
+            "/api/chat",
+            json={
+                "message": "你好",
+                "provider_id": "dashscope",
+                "model": "qwen3.8-flash",
+                "thinking": True,
+                "reasoning_effort": effort,
+            },
+        )
+        assert resp.status_code == 200, (effort, resp.text)
+    call = clients["dashscope"].calls[-1]
+    assert call["model"] == "qwen3.8-flash"       # 本轮选中模型 ≠ 客户端默认模型
+    assert call["reasoning_effort"] == "max"
+
+
+def test_qwen38_rejects_unknown_effort(target_env):
+    tc, clients = target_env
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "dashscope",
+            "model": "qwen3.8-flash",
+            "reasoning_effort": "turbo",
+        },
+    )
+    assert resp.status_code == 400
+    assert "思考强度" in resp.json()["detail"]
+    assert all(len(c.calls) == 0 for c in clients.values())
+
+
+def test_qwen37_rejects_explicit_effort_but_default_works(target_env):
+    """Qwen3.7 不提供强度：显式提交明确拒绝；缺省请求可用。"""
+    tc, clients = target_env
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "dashscope",
+            "model": "qwen3.7-flash",
+            "reasoning_effort": "high",
+        },
+    )
+    assert resp.status_code == 400
+    assert "思考强度" in resp.json()["detail"]
+    assert all(len(c.calls) == 0 for c in clients.values())
+
+    resp = tc.post(
+        "/api/chat",
+        json={"message": "你好", "provider_id": "dashscope", "model": "qwen3.7-flash"},
+    )
+    assert resp.status_code == 200
+    assert clients["dashscope"].calls[-1]["model"] == "qwen3.7-flash"
+
+
+def test_mimo_rejects_explicit_effort_but_default_works(target_env):
+    tc, clients = target_env
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "xiaomi-mimo",
+            "model": "mimo-v2.6-flash",
+            "reasoning_effort": "low",
+        },
+    )
+    assert resp.status_code == 400
+    assert "思考强度" in resp.json()["detail"]
+    assert all(len(c.calls) == 0 for c in clients.values())
+
+    resp = tc.post(
+        "/api/chat",
+        json={"message": "你好", "provider_id": "xiaomi-mimo"},
+    )
+    assert resp.status_code == 200
+    assert clients["xiaomi-mimo"].calls[-1]["model"] == "mimo-v2.6-flash"
+
+
+def test_kimi_keeps_legacy_efforts(target_env):
+    """kimi-k3 不套用 Qwen 规则：既有档位照常接受。"""
+    tc, clients = target_env
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "dashscope",
+            "model": "kimi-k3",
+            "reasoning_effort": "max",
+        },
+    )
+    assert resp.status_code == 200
+    assert clients["dashscope"].calls[-1]["model"] == "kimi-k3"
+
+
+def test_deepseek_default_request_usable(target_env):
+    """缺省请求（缺省服务商/模型/强度）仍然可用。"""
+    tc, clients = target_env
+    resp = tc.post("/api/chat", json={"message": "你好"})
+    assert resp.status_code == 200
+    call = clients["dashscope"].calls[-1]  # 默认服务商为清单第一项
+    assert call["model"] == "qwen3.7-flash"
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "deepseek",
+            "reasoning_effort": "max",
+        },
+    )
+    assert resp.status_code == 200
+    assert clients["deepseek"].calls[-1]["reasoning_effort"] == "max"
 
 
 # ===================== 校验边界（第二轮补齐） =====================
