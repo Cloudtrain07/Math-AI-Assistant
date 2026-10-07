@@ -122,7 +122,7 @@ from core.access import (
     save_address_info,
 )
 from core.accounts import load_accounts, reset_password
-from core.backup import BackupResult, daily_backup_loop, run_backup
+from core.backup import BACKUP_FAILED, BackupResult, daily_backup_loop, prune_backups, run_backup
 from core.login import verify_login
 from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
 from core.providers import get_model_thinking_capability, get_provider_supports_thinking
@@ -1502,8 +1502,13 @@ class LaunchSupport:
             )
 
     def start_backup(self) -> None:
-        """先补一次今日备份，再起跨天检查线程（目录来自 runtime.data_dir）。"""
-        self.report_backup(run_backup(data_dir=self.data_dir))
+        """先补一次今日备份并按保留份数收敛旧备份，再起跨天检查线程（目录来自 runtime.data_dir）。"""
+        result = run_backup(data_dir=self.data_dir)
+        self.report_backup(result)
+        # 备份写盘失败时旧备份是仅存的完整数据，不参与本次清理；
+        # 成功或当天已存在都按保留份数收敛，每天启动几次也不积累
+        if result.status != BACKUP_FAILED:
+            prune_backups(data_dir=self.data_dir)
         stop_event = threading.Event()
         thread = threading.Thread(
             target=daily_backup_loop,

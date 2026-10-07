@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -131,6 +132,20 @@ class StartupEnv:
 def backup_threads() -> list[threading.Thread]:
     """当前还活着的 API 备份线程（清理是否彻底的唯一外部可见证据）。"""
     return [t for t in threading.enumerate() if t.name == "maa-api-backup"]
+
+
+def make_backup_zips(backups_dir: Path, days: list[date]) -> list[str]:
+    """按备份命名规则造一批旧备份，返回写入的文件名。"""
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    names = [f"math-backup-{day.isoformat()}.zip" for day in days]
+    for name in names:
+        (backups_dir / name).write_text("x", encoding="utf-8")
+    return names
+
+
+def old_days(count: int) -> list[date]:
+    """与今天错开的 count 个历史日期（避免与当天备份同名）。"""
+    return [date(2026, 1, 1) + timedelta(days=offset) for offset in range(count)]
 
 
 @pytest.fixture
@@ -338,6 +353,105 @@ def test_backup_thread_is_stopped_and_joined(tmp_path, env):
     assert support._backup_stop.is_set()
     assert not thread.is_alive()
     assert backup_threads() == []
+
+
+def test_startup_backup_prunes_after_creating_today(tmp_path, env):
+    """启动新建当天备份后按保留份数收敛：超出 14 份的最旧备份被清掉。
+
+    防住的独立风险：清理只挂在跨天分支上，每天启动几次、当天关闭的
+    使用方式会让旧备份无限积累。
+    """
+    runtime = make_runtime(tmp_path)
+    backups = runtime.data_dir / "backups"
+    make_backup_zips(backups, old_days(15))
+
+    support = env.support(runtime)
+    support.start_backup()
+    support.close()
+
+    remaining = sorted(p.name for p in backups.iterdir())
+    assert len(remaining) == 14
+    assert f"math-backup-{date.today().isoformat()}.zip" in remaining
+    assert "math-backup-2026-01-01.zip" not in remaining  # 最旧的被清掉
+
+
+def test_startup_backup_prunes_when_today_already_exists(tmp_path, env):
+    """当天备份已存在（run_backup 返回 exists）时启动同样收敛旧备份。
+
+    防住的独立风险：只在"新建成功"分支清理，同一天第二次启动不收敛。
+    """
+    runtime = make_runtime(tmp_path)
+    backups = runtime.data_dir / "backups"
+    make_backup_zips(backups, old_days(15) + [date.today()])
+
+    support = env.support(runtime)
+    support.start_backup()
+    support.close()
+
+    remaining = sorted(p.name for p in backups.iterdir())
+    assert len(remaining) == 14
+    assert f"math-backup-{date.today().isoformat()}.zip" in remaining
+
+
+def test_startup_prune_only_touches_backup_names_in_own_dir(tmp_path, env):
+    """清理只认备份命名规则、只动本次 runtime 的目录。
+
+    防住的独立风险：实现为了凑够保留份数删掉手动放的文件，
+    或从另一份运行目录（乃至全局 data）取路径误删别人的备份。
+    """
+    runtime = make_runtime(tmp_path)
+    backups = runtime.data_dir / "backups"
+    days = old_days(16)
+    make_backup_zips(backups, days)
+    (backups / "manual-notes.txt").write_text("keep", encoding="utf-8")
+    (backups / "math-backup-not-a-date.zip").write_text("keep", encoding="utf-8")
+
+    other_backups = tmp_path / "其他运行目录" / "data" / "backups"
+    make_backup_zips(other_backups, days)
+
+    support = env.support(runtime)
+    support.start_backup()
+    support.close()
+
+    remaining = sorted(p.name for p in backups.iterdir())
+    kept = [n for n in remaining if n.startswith("math-backup-") and n != "math-backup-not-a-date.zip"]
+    assert len(kept) == 14
+    # 不符合命名规则的文件原样保留
+    assert "manual-notes.txt" in remaining
+    assert "math-backup-not-a-date.zip" in remaining
+    # 其他运行目录的备份一个不少
+    assert sorted(p.name for p in other_backups.iterdir()) == sorted(
+        f"math-backup-{day.isoformat()}.zip" for day in days
+    )
+
+
+def test_startup_backup_failure_keeps_old_backups_and_message(
+    tmp_path, monkeypatch, env, capsys
+):
+    """备份写盘失败：保留明确失败提示，且不为凑份数清掉仅存的旧备份。
+
+    防住的独立风险：失败当天旧备份是仅存的完整数据，
+    清理照跑会把用户最后的数据也删掉。
+    """
+    runtime = make_runtime(tmp_path)
+    backups = runtime.data_dir / "backups"
+    days = old_days(20)
+    make_backup_zips(backups, days)
+    monkeypatch.setattr(
+        api,
+        "run_backup",
+        lambda path=None, data_dir=None: BackupResult(BACKUP_FAILED, None),
+    )
+
+    support = env.support(runtime)
+    support.start_backup()
+    support.close()
+
+    out = capsys.readouterr().out
+    assert "备份失败" in out and "今日数据未打包" in out
+    assert sorted(p.name for p in backups.iterdir()) == sorted(
+        f"math-backup-{day.isoformat()}.zip" for day in days
+    )
 
 
 # ===================== 浏览器与地址跟随监听地址族 =====================
