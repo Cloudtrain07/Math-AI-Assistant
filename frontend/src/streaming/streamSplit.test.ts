@@ -183,3 +183,97 @@ describe('streamSplit 前缀稳定性', () => {
     expect(firstItem.kind === 'text' ? firstItem.text : '').toBe('项一 ')
   })
 })
+
+describe('段落边界与列表起始编号', () => {
+  it('单换行不产生空行标记，空行的第二个段落带 blankBefore（渲染层据此分段）', () => {
+    const single = parseStreaming('第一段\n第二段', true)
+    expect(single.units.length).toBe(2)
+    for (const u of single.units) {
+      expect(u.type === 'text' && u.blankBefore === true).toBe(false)
+    }
+    const blank = parseStreaming('第一段\n\n第二段', true)
+    expect(blank.units.length).toBe(2)
+    expect(blank.units[0]).toMatchObject({ type: 'text', flavor: 'para', blankBefore: undefined })
+    expect(blank.units[1]).toMatchObject({ type: 'text', flavor: 'para', blankBefore: true })
+    // 单换行与空行的解析结构必须可区分
+    expect(blank.units[1]).not.toEqual(single.units[1])
+  })
+
+  it('空行标记在流式分批到达时保持前缀稳定（含恰好在两个换行之间切分）', () => {
+    const full = '第一段\n\n第二段\n\n第三段'
+    const results = feed(full, [4, 5, 6, 8, 9, 10])
+    for (let k = 1; k < results.length; k++) assertStable(results[k - 1], results[k])
+    const final = results[results.length - 1]
+    expect(final.units.map((u) => (u.type === 'text' ? u.blankBefore ?? false : null))).toEqual([
+      false,
+      true,
+      true,
+    ])
+  })
+
+  it('行内公式后的单个换行不被误判为空行', () => {
+    const r = parseStreaming('$x$ 是值\n$y$ 也是', true)
+    const paras = r.units.filter((u): u is Extract<Unit, { type: 'text' }> => u.type === 'text')
+    expect(paras.length).toBe(2)
+    expect(paras.every((u) => u.blankBefore !== true)).toBe(true)
+    // 中间的空行（跨 token）则正确标记
+    const blank = parseStreaming('$x$ 是值\n\n$y$ 也是', true)
+    const paras2 = blank.units.filter((u): u is Extract<Unit, { type: 'text' }> => u.type === 'text')
+    expect(paras2.map((u) => u.blankBefore === true)).toEqual([false, true])
+  })
+
+  it('有序列表起始编号保留在 start 上，无序列表没有 start', () => {
+    const r = parseStreaming('5. 第一项\n6. 第二项', true)
+    const items = r.units.filter((u): u is Extract<Unit, { type: 'listItem' }> => u.type === 'listItem')
+    expect(items.length).toBe(2)
+    expect(items.map((u) => u.start)).toEqual([5, 6])
+    expect(items.every((u) => u.blankBefore !== true)).toBe(true)
+
+    const ul = parseStreaming('- 甲\n- 乙', true)
+    const ulItems = ul.units.filter((u): u is Extract<Unit, { type: 'listItem' }> => u.type === 'listItem')
+    expect(ulItems.map((u) => u.start)).toEqual([undefined, undefined])
+  })
+
+  it('空行分隔两个独立有序列表：后一列表带 blankBefore 且用自己的起始编号', () => {
+    const r = parseStreaming('1. 第一项\n2. 第二项\n\n5. 后续项\n6. 再续项', true)
+    const items = r.units.filter((u): u is Extract<Unit, { type: 'listItem' }> => u.type === 'listItem')
+    expect(items.length).toBe(4)
+    expect(items.map((u) => u.start)).toEqual([1, 2, 5, 6])
+    expect(items.map((u) => u.blankBefore === true)).toEqual([false, false, true, false])
+  })
+
+  it('含空行、列表与公式的文本分批到达：既有单元（含标记与编号）逐字节稳定', () => {
+    const full = [
+      '开头段落，行内公式 $a^2 + b^2$。',
+      '',
+      '5. 第一项 $x_1$',
+      '6. 第二项',
+      '',
+      '$$E = mc^2$$',
+      '',
+      '- 无序项一',
+      '- 无序项二 $y$',
+      '',
+      '结尾段落。',
+    ].join('\n')
+    const cuts: number[] = []
+    for (const pat of ['\n\n', '5.', '6.', '- ', '$$', '$x_1$', '$y$']) {
+      let from = 0
+      for (;;) {
+        const idx = full.indexOf(pat, from)
+        if (idx === -1) break
+        cuts.push(idx + Math.min(pat.length, 2))
+        from = idx + pat.length
+      }
+    }
+    cuts.sort((a, b) => a - b)
+    const results = feed(full, cuts)
+    for (let k = 1; k < results.length; k++) assertStable(results[k - 1], results[k])
+    const final = results[results.length - 1]
+    const items = final.units.filter((u): u is Extract<Unit, { type: 'listItem' }> => u.type === 'listItem')
+    expect(items.map((u) => u.start)).toEqual([5, 6, undefined, undefined])
+    expect(final.units.some((u) => u.type === 'mathBlock' && u.tex === 'E = mc^2')).toBe(true)
+    // 行内公式 3 个（mathOf 不含块级公式单元）
+    expect(final.units.flatMap(mathOf).length).toBe(3)
+  })
+})

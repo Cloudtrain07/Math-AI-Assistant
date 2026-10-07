@@ -27,9 +27,9 @@ export interface MathItem {
 export type InlineItem = TextItem | MathItem
 
 export type Unit =
-  | { type: 'text'; flavor: 'para' | 'quote'; items: InlineItem[] }
+  | { type: 'text'; flavor: 'para' | 'quote'; blankBefore?: boolean; items: InlineItem[] }
   | { type: 'heading'; level: number; items: InlineItem[] }
-  | { type: 'listItem'; ordered: boolean; items: InlineItem[] }
+  | { type: 'listItem'; ordered: boolean; start?: number; blankBefore?: boolean; items: InlineItem[] }
   | { type: 'mathBlock'; tex: string }
   | { type: 'code'; lang: string; text: string; closed: boolean }
 
@@ -256,6 +256,8 @@ interface LineClass {
   kind: LineKind
   level?: number
   ordered?: boolean
+  /** 有序列表的起始编号（ordered 时由行首标记捕获） */
+  num?: number
   stripLen: number
 }
 
@@ -276,8 +278,8 @@ function classifyLine(raw: string): LineClass {
   }
   const ul = /^[-*+]\s+/.exec(rest)
   if (ul) return { kind: 'list', ordered: false, stripLen: base + ul[0].length }
-  const ol = /^\d{1,9}[.)]\s+/.exec(rest)
-  if (ol) return { kind: 'list', ordered: true, stripLen: base + ol[0].length }
+  const ol = /^(\d{1,9})[.)]\s+/.exec(rest)
+  if (ol) return { kind: 'list', ordered: true, num: parseInt(ol[1], 10), stripLen: base + ol[0].length }
   return { kind: 'para', stripLen: 0 }
 }
 
@@ -286,7 +288,7 @@ interface LineBuf {
   items: InlineItem[]
 }
 
-function closeLine(buf: LineBuf, units: Unit[]): void {
+function closeLine(buf: LineBuf, units: Unit[], afterBlank: boolean): void {
   const cls = classifyLine(buf.raw)
   if (cls.kind === 'blank') return
   let items = buf.items
@@ -300,21 +302,32 @@ function closeLine(buf: LineBuf, units: Unit[]): void {
   if (cls.kind === 'heading' && cls.level) {
     units.push({ type: 'heading', level: cls.level, items })
   } else if (cls.kind === 'list') {
-    units.push({ type: 'listItem', ordered: cls.ordered === true, items })
+    units.push({
+      type: 'listItem',
+      ordered: cls.ordered === true,
+      start: cls.ordered ? cls.num : undefined,
+      blankBefore: afterBlank || undefined,
+      items,
+    })
   } else if (cls.kind === 'quote') {
-    units.push({ type: 'text', flavor: 'quote', items })
+    units.push({ type: 'text', flavor: 'quote', blankBefore: afterBlank || undefined, items })
   } else {
-    units.push({ type: 'text', flavor: 'para', items })
+    units.push({ type: 'text', flavor: 'para', blankBefore: afterBlank || undefined, items })
   }
 }
 
 function buildUnits(tokens: RawToken[]): Unit[] {
   const units: Unit[] = []
   let cur: LineBuf | null = null
+  // 空行标记：置位后，下一个真正产出单元的行携带 blankBefore；
+  // 只在内容行实际产出单元时复位（纯空白行本身不产出，标记继续生效）。
+  let afterBlank = false
 
   const flush = () => {
     if (cur) {
-      closeLine(cur, units)
+      const before = units.length
+      closeLine(cur, units, afterBlank)
+      if (units.length > before) afterBlank = false
       cur = null
     }
   }
@@ -349,7 +362,13 @@ function buildUnits(tokens: RawToken[]): Unit[] {
     const parts = tok.s.split('\n')
     parts.forEach((part, idx) => {
       if (idx > 0) flush()
-      if (part !== '') appendText(part)
+      // idx>0 且非末位的空/纯空白片段 = 夹在两个换行之间 → 空行；
+      // 末位空片段只是行尾换行符，idx=0 的空片段是上一 token 所在行的收尾，都不是空行。
+      if (idx > 0 && idx < parts.length - 1 && part.trim() === '') {
+        afterBlank = true
+      } else if (part !== '') {
+        appendText(part)
+      }
     })
   }
   flush()

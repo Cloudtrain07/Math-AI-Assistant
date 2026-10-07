@@ -17,12 +17,19 @@ const parsed = computed(() => parseStreaming(props.text, props.done))
 type InlineUnit = Extract<Unit, { items: InlineItem[] }>
 type Child = { key: number; unit: InlineUnit }
 type TreeNode =
-  | { type: 'block'; gtype: 'p' | 'quote' | 'ul' | 'ol'; key: number; children: Child[] }
+  | { type: 'block'; gtype: 'p' | 'quote' | 'ul' | 'ol'; key: number; start?: number; children: Child[] }
   | { type: 'unit'; key: number; unit: Unit }
+
+/** 该单元前面出现过空行 → 渲染层不得把它并入上一个同类型块（段落边界） */
+function startsAfterBlank(u: Unit): boolean {
+  return (u.type === 'text' || u.type === 'listItem') && u.blankBefore === true
+}
 
 /**
  * 把行级单元聚合成块级结构（段落/引用/列表）。
  * 只在末尾追加，既有组的 key 与子项 key 不变 → Vue 复用 DOM，公式节点不重建。
+ * 空行标记的单元不并入上一组，而是新起一个块：段落间距由 .para/.list 的 margin 产生，
+ * 有序列表也因此保留自己的起始编号。
  */
 const tree = computed<TreeNode[]>(() => {
   const nodes: TreeNode[] = []
@@ -40,10 +47,16 @@ const tree = computed<TreeNode[]>(() => {
     }
     const inline = unit as InlineUnit
     const last = nodes[nodes.length - 1]
-    if (last && last.type === 'block' && last.gtype === gt) {
+    if (last && last.type === 'block' && last.gtype === gt && !startsAfterBlank(unit)) {
       last.children.push({ key: i, unit: inline })
     } else {
-      nodes.push({ type: 'block', gtype: gt, key: i, children: [{ key: i, unit: inline }] })
+      nodes.push({
+        type: 'block',
+        gtype: gt,
+        key: i,
+        start: gt === 'ol' && unit.type === 'listItem' ? unit.start : undefined,
+        children: [{ key: i, unit: inline }],
+      })
     }
   }
   return nodes
@@ -116,7 +129,7 @@ function isText(it: InlineItem): it is Extract<InlineItem, { kind: 'text' }> {
           </template>
         </li>
       </ul>
-      <ol v-else-if="node.type === 'block' && node.gtype === 'ol'" class="list">
+      <ol v-else-if="node.type === 'block' && node.gtype === 'ol'" class="list" :start="node.start">
         <li v-for="child in node.children" :key="child.key">
           <template v-for="(it, ii) in child.unit.items" :key="ii">
             <span v-if="isText(it)" class="frag" v-html="renderInlineHtml(it.text)"></span>
