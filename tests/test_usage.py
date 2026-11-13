@@ -21,6 +21,7 @@ from core.usage import (
     is_over_limit,
     new_usage_state,
     record_usage,
+    turn_speed_fields,
 )
 
 
@@ -189,4 +190,56 @@ def test_get_usage_part_zero_is_preserved():
         prompt_tokens = 0
 
     assert get_usage_part(Usage(), "prompt_tokens") == 0
+
+
+def test_turn_speed_fields_real_usage():
+    class Usage:
+        completion_tokens = 100
+
+    reply = {"usage": Usage(), "answer": "答", "reasoning_text": "想"}
+    assert turn_speed_fields(reply, t0=0.0, t_first=1.0, t_final=11.0) == {
+        "completion_tokens": 100,
+        "gen_seconds": 10.0,
+        "first_token_seconds": 1.0,
+        "tok_s": 10.0,
+        "tok_s_estimated": False,
+    }
+
+
+def test_turn_speed_fields_estimates_without_usage():
+    reply = {"usage": None, "answer": "a" * 10, "reasoning_text": "数学" * 4}
+    fields = turn_speed_fields(reply, t0=0.0, t_first=2.0, t_final=7.0)
+    # 10 + 8 = 18 字符 → 9 tokens；生成 5 秒 → 1.8 tok/s
+    assert fields["completion_tokens"] == 9
+    assert fields["tok_s_estimated"] is True
+    assert fields["gen_seconds"] == 5.0
+    assert fields["first_token_seconds"] == 2.0
+    assert fields["tok_s"] == 1.8
+
+
+def test_turn_speed_fields_empty_text_estimates_zero():
+    fields = turn_speed_fields({}, t0=0.0, t_first=1.0, t_final=2.0)
+    assert fields["completion_tokens"] == 0
+    assert fields["tok_s"] == 0.0
+    assert fields["tok_s_estimated"] is True
+
+
+def test_turn_speed_fields_no_output_all_none():
+    fields = turn_speed_fields({"usage": None}, t0=0.0, t_first=None, t_final=5.0)
+    assert fields == {
+        "completion_tokens": 0,
+        "gen_seconds": None,
+        "first_token_seconds": None,
+        "tok_s": None,
+        "tok_s_estimated": True,
+    }
+
+
+def test_turn_speed_fields_zero_seconds_guard():
+    class Usage:
+        completion_tokens = 50
+
+    fields = turn_speed_fields({"usage": Usage()}, t0=0.0, t_first=3.0, t_final=3.0)
+    assert fields["gen_seconds"] == 0.0
+    assert fields["tok_s"] is None
 

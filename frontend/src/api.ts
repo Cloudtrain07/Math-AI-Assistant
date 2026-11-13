@@ -38,6 +38,11 @@ export interface DonePayload {
   image_status: string
   /** 本轮结束后核心是否仍保留图片状态（false 表示已被消费或按新题丢弃） */
   image_kept: boolean
+  completion_tokens?: number | null
+  gen_seconds?: number | null
+  first_token_seconds?: number | null
+  tok_s?: number | null
+  tok_s_estimated?: boolean
 }
 
 export interface RejectedPayload {
@@ -98,6 +103,7 @@ export interface SettingsInfo {
 export interface StreamHandlers {
   onStart?: (payload: StartPayload) => void
   onDelta?: (delta: { answer: string; reasoning: string }) => void
+  onUsage?: (tokens: number) => void
   onPing?: () => void
   /** 返回 done 载荷；被拒（rejected）时返回 null */
   onDone?: (payload: DonePayload | null, rejected?: RejectedPayload) => void
@@ -199,6 +205,9 @@ async function consumeTurnStream(
         else if (ev.event === 'delta') {
           const d = JSON.parse(ev.data)
           handlers.onDelta?.({ answer: d.answer || '', reasoning: d.reasoning || '' })
+        } else if (ev.event === 'usage') {
+          const d = JSON.parse(ev.data)
+          if (Number.isInteger(d.completion_tokens) && d.completion_tokens >= 0) handlers.onUsage?.(d.completion_tokens)
         } else if (ev.event === 'ping') handlers.onPing?.()
         else if (ev.event === 'rejected') rejected = JSON.parse(ev.data)
         else if (ev.event === 'done') done = JSON.parse(ev.data)

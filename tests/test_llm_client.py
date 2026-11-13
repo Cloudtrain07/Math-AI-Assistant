@@ -201,6 +201,28 @@ def test_qwen38_native_effort_and_off(monkeypatch):
         assert captured[-1]["reasoning_effort"] == "none"  # 官方关闭方式
 
 
+# ---- NInfer（本地引擎）：顶层 reasoning_effort（none 即关闭） ----
+
+
+def test_ninfer_bonsai_effort_and_off(monkeypatch):
+    client, captured = _make_client(
+        monkeypatch,
+        thinking_param="ninfer",
+        models=["Bonsai-2-27B-Vision"],
+        default_model="Bonsai-2-27B-Vision",
+    )
+    _run_stream(client, thinking=True, effort="xhigh")
+    body = captured[-1]
+    assert body["model"] == "Bonsai-2-27B-Vision"
+    assert body["reasoning_effort"] == "xhigh"    # 顶层字段，引擎按模板解释档位
+    assert "thinking" not in body and "enable_thinking" not in body
+    assert body["max_tokens"] == 30000            # 输出上限用 max_tokens
+    assert "max_completion_tokens" not in body
+
+    _run_stream(client, thinking=False)
+    assert captured[-1]["reasoning_effort"] == "none"  # 引擎的关闭方式
+
+
 def test_selected_model_differs_from_default(monkeypatch):
     """本轮选中模型决定参数：默认 qwen3.7-flash，显式选择 qwen3.8-flash。"""
     client, captured = _make_client(

@@ -82,6 +82,36 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text or "") // 2)
 
 
+def turn_speed_fields(
+    reply: dict, t0: float, t_first: float | None, t_final: float
+) -> dict:
+    """由本轮回复与三个时间点算出速度展示字段（纯函数）。
+
+    t0=请求开始，t_first=首个非空增量（None 表示没有任何输出），
+    t_final=流结束（不含落盘耗时）。completion_tokens 缺失时按
+    字符数//2 估算并标记 tok_s_estimated，空文本估 0。
+    """
+    completion = get_usage_part(reply.get("usage"), "completion_tokens")
+    estimated = completion is None
+    if estimated:
+        text = (reply.get("answer") or "") + (reply.get("reasoning_text") or "")
+        completion = len(text) // 2
+    gen_seconds = (t_final - t_first) if t_first is not None else None
+    first_token_seconds = (t_first - t0) if t_first is not None else None
+    tok_s = (
+        round(completion / gen_seconds, 1)
+        if gen_seconds is not None and gen_seconds > 0
+        else None
+    )
+    return {
+        "completion_tokens": completion,
+        "gen_seconds": gen_seconds,
+        "first_token_seconds": first_token_seconds,
+        "tok_s": tok_s,
+        "tok_s_estimated": estimated,
+    }
+
+
 def check_daily_quota(
     daily_used: int, global_used: int, daily_limit: int, global_limit: int
 ) -> str | None:

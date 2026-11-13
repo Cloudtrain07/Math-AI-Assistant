@@ -358,6 +358,15 @@ TARGET_PROVIDERS = [
         "default_model": "mimo-v2.6-flash",
         "thinking_param": "mimo",
     },
+    {
+        "id": "bonsai",
+        "name": "Bonsai-2-27B",
+        "base_url": "https://bonsai.invalid/v1",
+        "api_key_env": "BONSAI_API_KEY",
+        "models": ["Bonsai-2-27B-Vision"],
+        "default_model": "Bonsai-2-27B-Vision",
+        "thinking_param": "ninfer",
+    },
 ]
 
 
@@ -366,6 +375,7 @@ def target_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DASH_API_KEY", "key-dash")
     monkeypatch.setenv("DS_API_KEY", "key-ds")
     monkeypatch.setenv("MIMO_API_KEY", "key-mimo")
+    monkeypatch.setenv("BONSAI_API_KEY", "key-bonsai")
     runtime, clients = build_two_provider_runtime(tmp_path, providers=TARGET_PROVIDERS)
     api = create_api_app(runtime)
     tc = TestClient(api)
@@ -403,6 +413,10 @@ def test_settings_metadata_reports_per_model_levels(target_env):
     assert providers["xiaomi-mimo"]["model_thinking"]["mimo-v2.6-flash"] == {
         "effort_levels": [],
         "default_effort": None,
+    }
+    assert providers["bonsai"]["model_thinking"]["Bonsai-2-27B-Vision"] == {
+        "effort_levels": ["minimal", "low", "medium", "high", "xhigh", "max"],
+        "default_effort": "xhigh",
     }
     for p in providers.values():
         assert p["supports_thinking"] is True
@@ -533,6 +547,42 @@ def test_kimi_keeps_legacy_efforts(target_env):
     )
     assert resp.status_code == 200
     assert clients["dashscope"].calls[-1]["model"] == "kimi-k3"
+
+
+def test_bonsai_ninfer_accepts_engine_levels(target_env):
+    """Bonsai（NInfer）接受引擎控制台六档，并路由到所选模型。"""
+    tc, clients = target_env
+    for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
+        resp = tc.post(
+            "/api/chat",
+            json={
+                "message": "你好",
+                "provider_id": "bonsai",
+                "model": "Bonsai-2-27B-Vision",
+                "thinking": True,
+                "reasoning_effort": effort,
+            },
+        )
+        assert resp.status_code == 200, (effort, resp.text)
+    call = clients["bonsai"].calls[-1]
+    assert call["model"] == "Bonsai-2-27B-Vision"
+    assert call["reasoning_effort"] == "max"
+
+
+def test_bonsai_ninfer_rejects_unknown_effort(target_env):
+    tc, clients = target_env
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "你好",
+            "provider_id": "bonsai",
+            "model": "Bonsai-2-27B-Vision",
+            "reasoning_effort": "turbo",
+        },
+    )
+    assert resp.status_code == 400
+    assert "思考强度" in resp.json()["detail"]
+    assert all(len(c.calls) == 0 for c in clients.values())
 
 
 def test_deepseek_default_request_usable(target_env):

@@ -29,6 +29,8 @@ import { shouldSendOnEnter } from './ime'
 import { classifyDone, composeDaily, composeNotice } from './notice'
 import { isFollowingBottom, shouldShowJumpToBottom } from './scrollFollow'
 import { modelThinking, providerView, syncEffort } from './settings'
+import { copyText } from './clipboard'
+import { formatAvgSpeed } from './speed'
 
 interface ChatEntry {
   role: 'user' | 'assistant'
@@ -37,6 +39,8 @@ interface ChatEntry {
   done: boolean
   /** 本会话内随消息发送的图片（仅当前页面内存，恢复历史没有此项） */
   imageUrl?: string
+  copied?: boolean
+  speedSummary?: string
 }
 
 /** 待发送图片：始终保留原始文件，重新编辑从原图+参数恢复 */
@@ -67,6 +71,10 @@ const statusText = ref('')
 const statusKind = ref<StatusKind>('info')
 const usageText = ref('')
 const elapsedSeconds = ref(0)
+const genSeconds = ref(0)
+const liveTokens = ref<number | null>(null)
+const activeAssistant = ref<ChatEntry | null>(null)
+let firstDeltaAt: number | null = null
 const restoreNotice = ref('')
 const mode = ref('互动模式')
 const clearArmed = ref(false)
@@ -377,8 +385,14 @@ function jumpToBottom() {
 
 function startElapsedTimer() {
   elapsedSeconds.value = 0
+  genSeconds.value = 0
+  liveTokens.value = null
+  firstDeltaAt = null
   elapsedTimer = setInterval(() => {
     elapsedSeconds.value += 1
+    if (firstDeltaAt !== null) {
+      genSeconds.value = (performance.now() - firstDeltaAt) / 1000
+    }
   }, 1000)
 }
 
@@ -389,6 +403,25 @@ function stopElapsedTimer() {
 
 function stopStreaming() {
   if (controller !== null) controller.abort()
+}
+
+async function onCopy(msg: ChatEntry, text: string) {
+  if (!(await copyText(text))) {
+    setStatus('复制失败，请手动选择文本复制。', 'warn')
+    return
+  }
+  msg.copied = true
+  setTimeout(() => {
+    msg.copied = false
+  }, 1500)
+}
+
+function liveSummary(msg: ChatEntry): string {
+  const actual = liveTokens.value
+  const count = actual ?? Math.floor((msg.content.length + msg.reasoning.length) / 2)
+  const label = actual === null ? '约 ' : ''
+  const speed = genSeconds.value >= 1 ? ` · 平均${label}${(count / genSeconds.value).toFixed(1)} tok/s` : ''
+  return `已输出${label}${count} tokens${speed}${actual === null ? '（按已收到文字估算）' : ''}`
 }
 
 function currentTurnSettings(): TurnSettings {
@@ -420,6 +453,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
     done: false,
   })
   // 气泡在 start 事件后才显示：被拒（含无可继续题目）时不显示任何气泡
+  activeAssistant.value = assistant
   let assistantShown = false
   const showBubbles = (userContent: string, imageUrl?: string) => {
     messages.value.push({
@@ -467,6 +501,9 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
 
   const requestSettings = currentTurnSettings()
   const onDelta = (d: { answer: string; reasoning: string }) => {
+    if (firstDeltaAt === null && (d.answer || d.reasoning)) {
+      firstDeltaAt = performance.now()
+    }
     assistant.content += d.answer
     assistant.reasoning += d.reasoning
     void nextTick(scrollToBottom)
@@ -481,12 +518,14 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
             // 纯图片发送时文本为服务端默认题目提示，气泡同时展示所发图片
             onStart: (payload) => showBubbles(text || payload.message, imageId ? createSentImageUrl() : undefined),
             onDelta,
+            onUsage: (tokens) => { liveTokens.value = tokens },
           })
         : await continueChat(requestSettings, {
             signal: controller.signal,
             // 继续指令由服务端构造，start 事件带回原文仅供展示
             onStart: (payload) => showBubbles(payload.message),
             onDelta,
+            onUsage: (tokens) => { liveTokens.value = tokens },
           })
     if (result.kind === 'rejected') {
       // 被拒：移除占位的助手气泡（如有），保留提示文字；待发送图片保留供重试
@@ -499,6 +538,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
       assistant.content = d.answer
       assistant.reasoning = d.reasoning_text
       assistant.done = true
+      assistant.speedSummary = (d.error ? '未完成 · ' : '') + (formatAvgSpeed(d) || (d.completion_tokens != null ? `输出${d.tok_s_estimated ? '约 ' : ' '}${d.completion_tokens} tokens` : ''))
       // done ≠ 全部成功：状态种类由结构化字段判定（模型错误/空回答/截断/保存失败/stale/用量失败）
       setStatus(composeNotice(d), classifyDone(d))
       usageText.value = [d.cumulative_usage, composeDaily(d)]
@@ -512,6 +552,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
       await nextTick(scrollToBottom)
     }
   } catch (err) {
+    if (assistant.content || assistant.reasoning) assistant.speedSummary = `未完成 · ${liveSummary(assistant)}`
     assistant.done = true
     if (controller?.signal.aborted) {
       setStatus('已停止接收。未完成的回答不会写入历史。', 'stopped')
@@ -523,6 +564,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   } finally {
     stopElapsedTimer()
     sending.value = false
+    activeAssistant.value = null
     controller = null
     // 收尾时状态行/用量行会改变内容高度：布局完成后再核对一次按钮显隐
     void nextTick(refreshJumpState)
@@ -725,6 +767,10 @@ async function onClearClick() {
         </div>
         <template v-for="(msg, i) in messages" :key="i">
           <div v-if="msg.role === 'user'" class="msg user">
+            <button class="chip copy-chip" type="button" @click="onCopy(msg, msg.content)">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 7V4h9v9h-3M4 7h9v9H4z" /></svg>
+              {{ msg.copied ? '已复制' : '复制' }}
+            </button>
             <div class="bubble">
               <img v-if="msg.imageUrl" :src="msg.imageUrl" class="sent-image" alt="发送的题目图片" />
               <span>{{ msg.content }}</span>
@@ -752,6 +798,13 @@ async function onClearClick() {
                 <span class="spinner" aria-hidden="true"></span>
                 正在思考… 已用时 {{ elapsedSeconds }} 秒
               </span>
+            </div>
+            <div v-if="msg.speedSummary" class="gen-speed">{{ msg.speedSummary }}</div>
+            <div v-if="msg.content" class="msg-actions">
+              <button class="chip copy-chip" type="button" @click="onCopy(msg, msg.content)">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 7V4h9v9h-3M4 7h9v9H4z" /></svg>
+                {{ msg.copied ? '已复制' : '复制' }}
+              </button>
             </div>
           </div>
         </template>
@@ -802,6 +855,11 @@ async function onClearClick() {
         </div>
       </div>
 
+      <div class="composer-dock">
+      <div v-if="sending && activeAssistant" class="live-stats" role="status">
+        <template v-if="firstDeltaAt === null">等待模型响应 · 已用时 {{ elapsedSeconds }} 秒</template>
+        <template v-else>{{ activeAssistant.content ? '正在回答' : '正在思考' }} · {{ liveSummary(activeAssistant) }}</template>
+      </div>
       <footer class="composer">
         <input
           ref="fileInput"
@@ -871,6 +929,7 @@ async function onClearClick() {
           回到底部
         </button>
       </footer>
+      </div>
 
       <ImageEditorDialog
         :open="editorOpen"
@@ -1310,6 +1369,20 @@ select {
   line-height: 1.8;
   color: var(--ink);
 }
+.msg.user .copy-chip {
+  align-self: center;
+  flex: none;
+  margin-right: 6px;
+}
+.msg-actions {
+  margin-top: 4px;
+}
+.gen-speed {
+  margin-top: 2px;
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
 .sent-image {
   display: block;
   max-width: min(240px, 100%);
@@ -1501,8 +1574,10 @@ select {
 }
 
 /* ===== 输入区：实心表面 + 细边框，专注但不厚重 ===== */
+.composer-dock { position: sticky; bottom: 0; z-index: 20; }
+.live-stats { padding: 7px 12px; background: var(--surface, #fff); color: var(--ink-2); font-size: 0.82rem; border-radius: 8px; }
 .composer {
-  position: sticky;
+  position: relative;
   bottom: 0;
   z-index: 20;
   display: flex;

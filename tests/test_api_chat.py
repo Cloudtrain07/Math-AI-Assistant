@@ -130,6 +130,55 @@ def test_event_order_and_mapping(env):
     assert done["empty_reply"] is False
     assert done["save_status"] == "saved"
     assert done["save_note"] == ""
+    # 速度字段：假客户端给出 completion_tokens=6，走真实用量路径
+    assert done["completion_tokens"] == 6
+    assert done["tok_s_estimated"] is False
+    assert done["gen_seconds"] is not None
+    assert done["first_token_seconds"] is not None
+    assert done["tok_s"] is None or done["tok_s"] > 0
+
+
+def test_streaming_usage_is_forwarded_before_done(env):
+    tc, _, fake, _, _ = env
+    def stream(*args, **kwargs):
+        yield None, "思考", None, None
+        yield None, None, SimpleNamespace(completion_tokens=2), None
+        yield "答案", None, None, None
+        yield None, None, SimpleNamespace(completion_tokens=5, total_tokens=9, prompt_tokens=4), "stop"
+    fake.chat_stream_with_usage = stream
+    status, events = _chat(tc, "测试")
+    assert status == 200
+    assert [data["completion_tokens"] for name, data in events if name == "usage"] == [2, 5]
+    assert events[-1][0] == "done"
+    assert events[-1][1]["completion_tokens"] == 5
+
+
+def test_done_speed_estimated_without_usage(env):
+    """引擎不回 usage 时按字符估算：回答4字+思考2字 → 3 tokens，标记估算。"""
+    tc, _, fake, _, _ = env
+    fake.script = [("回答文字", "思考", None, "stop")]
+    status, events = _chat(tc, "你好")
+    assert status == 200
+    done = events[-1][1]
+    assert done["tok_s_estimated"] is True
+    assert done["completion_tokens"] == 3
+    assert done["gen_seconds"] is not None
+    assert done["tok_s"] is None or done["tok_s"] > 0
+
+
+def test_done_speed_empty_reply_has_no_timing(env):
+    """没有任何输出：估算 0 tokens，首包/生成时长与速度均为 None。"""
+    tc, _, fake, _, _ = env
+    fake.script = [("", "", None, "stop")]
+    status, events = _chat(tc, "你好")
+    assert status == 200
+    done = events[-1][1]
+    assert done["empty_reply"] is True
+    assert done["completion_tokens"] == 0
+    assert done["tok_s_estimated"] is True
+    assert done["gen_seconds"] is None
+    assert done["first_token_seconds"] is None
+    assert done["tok_s"] is None
 
 
 def test_two_turns_use_previous_context(env):

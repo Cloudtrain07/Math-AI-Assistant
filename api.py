@@ -141,7 +141,7 @@ from core.ui_text import (
     format_usage,
     friendly_error,
 )
-from core.usage import format_cumulative, new_usage_state
+from core.usage import format_cumulative, new_usage_state, turn_speed_fields, get_usage_part
 from core.usage_store import DailyUsageReadError
 from core.vision_client import MAX_IMAGE_BYTES, SUPPORTED_EXTS
 
@@ -927,8 +927,11 @@ def chat_event_stream(
 
         level = resolved["level"]
 
+        last_live_tokens = None
         prev_answer = ""
         prev_reasoning = ""
+        t0 = time.monotonic()
+        t_first: float | None = None
         for event in chat_service.run_chat_turn(
             message=message,
             history=state.history,
@@ -993,8 +996,14 @@ def chat_event_stream(
                 else reasoning
             )
             prev_answer, prev_reasoning = answer, reasoning
+            if t_first is None and (delta_answer or delta_reasoning):
+                t_first = time.monotonic()
 
             if event_type == "stream":
+                tokens = get_usage_part(reply.get("usage"), "completion_tokens")
+                if tokens is not None and tokens >= 0 and (last_live_tokens is None or tokens > last_live_tokens):
+                    last_live_tokens = tokens
+                    yield _sse("usage", {"completion_tokens": tokens})
                 if delta_answer or delta_reasoning:
                     yield _sse(
                         "delta",
@@ -1011,6 +1020,7 @@ def chat_event_stream(
                     "delta",
                     {"answer": delta_answer, "reasoning": delta_reasoning},
                 )
+            t_final = time.monotonic()
             result = event["result"]
             persisted = registry.finish_turn(
                 username,
@@ -1024,6 +1034,7 @@ def chat_event_stream(
             if not persisted:
                 # 期间被清空：会话累计改按清空后的状态显示，不回填旧上下文
                 payload["cumulative_usage"] = format_cumulative(state.usage_state)
+            payload.update(turn_speed_fields(reply, t0, t_first, t_final))
             yield _sse("done", payload)
             return
     finally:

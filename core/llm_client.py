@@ -4,6 +4,7 @@
 - deepseek 系：extra_body={"thinking": {"type": ...}} 开关 + 顶层 reasoning_effort
 - qwen3.7 系：extra_body={"enable_thinking": ...} 开关，不带强度
 - qwen3.8 系：extra_body={"reasoning_effort": ...}（none 即关闭）
+- ninfer 系（本地 NInfer 引擎）：extra_body={"reasoning_effort": ...}（none 即关闭）
 - mimo 系：extra_body={"thinking": {"type": ...}} 开关，不带强度
 - 其余模型：保持原有统一格式（thinking 内联 reasoning_effort），不套用目标规则
 输出上限：qwen3.7/3.8 与 mimo 用 max_completion_tokens，其余仍用 max_tokens。
@@ -91,6 +92,9 @@ class LLMClient:
         if style == "qwen3.8":
             # qwen3.8 用 reasoning_effort 控制思考，none 是官方的关闭方式；
             # high/max 为官方映射别名（→xhigh），原样发送
+            return {"reasoning_effort": effort if use_thinking else "none"}
+        if style == "ninfer":
+            # 引擎只认顶层 reasoning_effort；不发 thinking 对象（文档未列该字段）
             return {"reasoning_effort": effort if use_thinking else "none"}
         if style == "mimo":
             return {"thinking": {"type": "enabled" if use_thinking else "disabled"}}

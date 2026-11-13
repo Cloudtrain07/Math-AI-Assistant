@@ -19,26 +19,13 @@ def to_api_messages(
     image_data_url 非空时，最后一条 user 消息以多模态 content 数组发送
     （原生视觉直传）；历史本身始终保持纯文本。
     """
-    messages: list[dict] = [
-        {
-            "role": "system",
-            "content": build_system_prompt(level, mode, answer_style, stage),
-        }
-    ]
+    # 本地模型模板只允许开头一条 system 消息，附加指令并入同一条
+    system_content = build_system_prompt(level, mode, answer_style, stage)
     if mode_changed:
-        messages.append(
-            {
-                "role": "system",
-                "content": "【模式切换】现在起按新模式作答，忽略此前对话中的旧模式行为。",
-            }
-        )
+        system_content += "\n\n【模式切换】现在起按新模式作答，忽略此前对话中的旧模式行为。"
     if summary:
-        messages.append(
-            {
-                "role": "system",
-                "content": f"【更早对话摘要】\n{summary}",
-            }
-        )
+        system_content += f"\n\n【更早对话摘要】\n{summary}"
+    messages: list[dict] = [{"role": "system", "content": system_content}]
     if max_history_messages is not None:
         history = history[-max_history_messages:]
     for item in history:

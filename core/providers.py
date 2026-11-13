@@ -168,11 +168,14 @@ def get_provider_supports_thinking(provider: dict) -> bool:
 #   仅用于兼容旧默认档位，不作为界面选项
 # - MiMo：thinking.type 开关，官方未提供强度档位；
 #   Qwen3.7/3.8 与 MiMo 的输出上限用 max_completion_tokens
+# - NInfer（本地引擎）：顶层 reasoning_effort（none 即关闭），
+#   档位镜像引擎控制台 ninfer 名单，默认 xhigh 与服务启动参数一致
 _THINKING_STYLE_NONE = "none"
 _THINKING_STYLE_DEEPSEEK = "deepseek"
 _THINKING_STYLE_QWEN37 = "qwen3.7"
 _THINKING_STYLE_QWEN38 = "qwen3.8"
 _THINKING_STYLE_MIMO = "mimo"
+_THINKING_STYLE_NINFER = "ninfer"
 _THINKING_STYLE_LEGACY = "legacy"
 
 _LEGACY_EFFORT_LEVELS = ("low", "high", "max")
@@ -188,6 +191,7 @@ _TARGET_MODELS: dict[str, str] = {
     "qwen3.8-max": _THINKING_STYLE_QWEN38,
     "mimo-v2.6-flash": _THINKING_STYLE_MIMO,
     "mimo-v2.6-pro": _THINKING_STYLE_MIMO,
+    "bonsai-2-27b-vision": _THINKING_STYLE_NINFER,
 }
 
 # 风格 → (强度档位, 显式提交可接受的值, 切换模型时的默认档位, 输出上限参数名)。
@@ -209,6 +213,12 @@ _THINKING_STYLES: dict[str, tuple[tuple[str, ...], frozenset | None, str | None,
         "max_completion_tokens",
     ),
     _THINKING_STYLE_MIMO: ((), frozenset(), None, "max_completion_tokens"),
+    _THINKING_STYLE_NINFER: (
+        ("minimal", "low", "medium", "high", "xhigh", "max"),
+        frozenset(("minimal", "low", "medium", "high", "xhigh", "max")),
+        "xhigh",
+        "max_tokens",
+    ),
     _THINKING_STYLE_LEGACY: (
         _LEGACY_EFFORT_LEVELS,
         None,
