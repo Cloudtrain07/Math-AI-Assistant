@@ -27,7 +27,9 @@ import {
 } from './imageEdit'
 import { shouldSendOnEnter } from './ime'
 import { classifyDone, composeDaily, composeNotice } from './notice'
+import { collapsedScrollAdjustment } from './collapseAnchor'
 import { isFollowingBottom, shouldShowJumpToBottom } from './scrollFollow'
+import { OUTPUT_TOKENS_BOUNDS, WAIT_SECONDS_BOUNDS, parseWebLimit } from './webLimits'
 import { modelThinking, providerView, syncEffort } from './settings'
 import { copyText } from './clipboard'
 import { formatAvgSpeed } from './speed'
@@ -222,6 +224,10 @@ const thinking = ref(false)
 /** 当前模型的思考强度；null 表示该模型不提供强度选择（不随请求发送） */
 const effort = ref<string | null>('high')
 const answerStyle = ref('完整步骤+答案')
+/** 网页覆盖的输出上限：v-model 对 type=number 输入会把填写值转成 number、
+ * 留空仍是空字符串，因此声明为 string | number；发送前统一解析校验 */
+const maxOutputTokensInput = ref<string | number>('')
+const maxWaitSecondsInput = ref<string | number>('')
 
 const currentProvider = computed(
   () => settings.value?.providers.find((p) => p.id === providerId.value) ?? null,
@@ -248,6 +254,32 @@ watch([providerId, model], () => {
 
 // .page 是唯一滚动容器：页头与输入卡为玻璃悬浮层，消息从其下方穿过
 const chatScroll = ref<HTMLElement | null>(null)
+/** 吸附用的页头实测高度：写入 CSS 变量供 .thinking[open] summary 的 sticky top 使用 */
+const headerEl = ref<HTMLElement | null>(null)
+let headerResize: ResizeObserver | null = null
+
+/** 把页头当前高度同步到 .page 的 --thinking-top（换行、旋转、键盘压缩都会变） */
+function syncStickyTop() {
+  const header = headerEl.value
+  const pageEl = chatScroll.value
+  if (!header || !pageEl) return
+  pageEl.style.setProperty('--thinking-top', `${header.offsetHeight}px`)
+}
+
+/** 页头在登录后才渲染：登录态变化后挂接观察器，卸载/登出时断开 */
+function attachHeaderObserver() {
+  headerResize?.disconnect()
+  headerResize = null
+  syncStickyTop()
+  const header = headerEl.value
+  if (header && typeof ResizeObserver !== 'undefined') {
+    headerResize = new ResizeObserver(syncStickyTop)
+    headerResize.observe(header)
+  }
+}
+
+watch([authChecked, me], () => void nextTick(attachHeaderObserver), { immediate: true })
+
 let stickToBottom = true
 /** 用户明显离开底部时的「回到底部」入口（流式输出不会把阅读位置拉回去） */
 const showJump = ref(false)
@@ -268,6 +300,8 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (elapsedTimer !== null) clearInterval(elapsedTimer)
   window.removeEventListener('paste', onPaste)
+  headerResize?.disconnect()
+  headerResize = null
   releaseMessageImages()
 })
 
@@ -381,6 +415,46 @@ function jumpToBottom() {
   void scrollToBottom()
 }
 
+// ---- 思考区折叠：吸附标题在折叠时校正滚动，让同一条消息留在视野内 ----
+
+/**
+ * 思考区标题点击（原生 details/summary 交互保持不变）：
+ * 仅折叠时先记录折叠前位置，等浏览器切换 open、新布局生效后重新测量并校正。
+ * 校正赋值会触发 onScroll：不在底部时停止自动跟随（流式不把视线拉回底部），
+ * 在底部时保持跟随——两种情况都符合「继续接收」的期望。
+ */
+function onThinkingSummaryClick(event: MouseEvent) {
+  const summary = event.currentTarget as HTMLElement | null
+  const details = summary?.closest('details')
+  const pageEl = chatScroll.value
+  if (!summary || !details || !pageEl || !details.open) return
+  const containerTop = pageEl.getBoundingClientRect().top
+  const topBefore = details.getBoundingClientRect().top - containerTop
+  // 浏览器在 click 默认动作里切换 open：定时器回调时布局已折叠，读取几何量
+  // 会强制同步排版。不用 rAF——部分内嵌/无头环境的帧回调不可靠，
+  // setTimeout(0) 在两种环境下都确定执行
+  setTimeout(() => {
+    if (details.open) return // 期间又被展开：不校正
+    // 吸附位与 CSS 的 sticky top 同口径：sticky 以滚动容器内容盒顶边为基准，
+    // 用页头的实时位置（含页内边距）+ 高度 + 8px 间距，与实测吸附位一致
+    const header = headerEl.value
+    const headerTop = header
+      ? header.getBoundingClientRect().top - pageEl.getBoundingClientRect().top
+      : 60
+    const stickyTop = headerTop + (header?.offsetHeight ?? 0) + 8
+    const topAfter = details.getBoundingClientRect().top - containerTop
+    const delta = collapsedScrollAdjustment({
+      topBefore,
+      topAfter,
+      stickyTop,
+      viewportHeight: pageEl.clientHeight,
+      blockHeightAfter: details.offsetHeight,
+      bottomReserve: 24,
+    })
+    if (delta !== 0) pageEl.scrollTop += delta
+  }, 0)
+}
+
 // ---- 发送与流式接收：普通发送与继续生成共享设置、busy 与收尾处理 ----
 
 function startElapsedTimer() {
@@ -424,7 +498,21 @@ function liveSummary(msg: ChatEntry): string {
   return `已输出${label}${count} tokens${speed}${actual === null ? '（按已收到文字估算）' : ''}`
 }
 
-function currentTurnSettings(): TurnSettings {
+interface ResolvedWebLimits {
+  maxOutputTokens: number | null
+  maxWaitSeconds: number | null
+}
+
+/** 发送前解析两个覆盖输入：空白=沿用服务器配置；非法值返回中文错误 */
+function resolveWebLimits(): ResolvedWebLimits | { error: string } {
+  const output = parseWebLimit(maxOutputTokensInput.value, OUTPUT_TOKENS_BOUNDS)
+  if (!output.ok) return { error: output.message }
+  const wait = parseWebLimit(maxWaitSecondsInput.value, WAIT_SECONDS_BOUNDS)
+  if (!wait.ok) return { error: wait.message }
+  return { maxOutputTokens: output.value, maxWaitSeconds: wait.value }
+}
+
+function currentTurnSettings(limits: ResolvedWebLimits): TurnSettings {
   const levels = effortLevels.value
   return {
     mode: mode.value,
@@ -436,6 +524,8 @@ function currentTurnSettings(): TurnSettings {
     // 仅当前模型提供档位且选中值合法时发送强度；否则发 null（后端按缺省处理）
     reasoning_effort:
       effort.value !== null && levels.includes(effort.value) ? effort.value : null,
+    max_output_tokens: limits.maxOutputTokens,
+    max_wait_seconds: limits.maxWaitSeconds,
   }
 }
 
@@ -443,6 +533,12 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   if (sending.value) return
   const pendingUnsent = kind === 'chat' && pendingImage.value && !pendingImage.value.sent
   if (kind === 'chat' && !text && !pendingUnsent) return
+  // 请求开始前验证覆盖值：无效时不进入发送流程、不清空输入草稿
+  const limits = resolveWebLimits()
+  if ('error' in limits) {
+    setStatus(limits.error, 'error')
+    return
+  }
   const originalText = text
   if (kind === 'chat') input.value = ''
   setStatus('')
@@ -499,7 +595,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
     }
   }
 
-  const requestSettings = currentTurnSettings()
+  const requestSettings = currentTurnSettings(limits)
   const onDelta = (d: { answer: string; reasoning: string }) => {
     if (firstDeltaAt === null && (d.answer || d.reasoning)) {
       firstDeltaAt = performance.now()
@@ -647,7 +743,7 @@ async function onClearClick() {
     </template>
 
     <template v-else-if="me">
-      <header class="header">
+      <header ref="headerEl" class="header">
         <div class="brand">
           <span class="mark" aria-hidden="true">∑</span>
           <h1>数学学习 AI 助手</h1>
@@ -753,6 +849,37 @@ async function onClearClick() {
               </option>
             </select>
           </label>
+          <label>
+            最大输出 token
+            <input
+              v-model="maxOutputTokensInput"
+              class="num-input"
+              type="number"
+              inputmode="numeric"
+              :min="OUTPUT_TOKENS_BOUNDS.min"
+              :max="OUTPUT_TOKENS_BOUNDS.max"
+              step="1"
+              :placeholder="`留空=${settings?.default_max_output_tokens ?? 30000}`"
+              :disabled="sending"
+            />
+          </label>
+          <label>
+            最大等待时间（秒）
+            <input
+              v-model="maxWaitSecondsInput"
+              class="num-input"
+              type="number"
+              inputmode="numeric"
+              :min="WAIT_SECONDS_BOUNDS.min"
+              :max="WAIT_SECONDS_BOUNDS.max"
+              step="1"
+              :placeholder="`留空=${settings?.default_max_wait_seconds ?? 600}`"
+              :disabled="sending"
+            />
+          </label>
+          <p class="panel-hint">
+            以上两项留空沿用服务器配置，只作用于接下来的发送与继续生成，刷新后复位；试用更长输出可填 48000。
+          </p>
         </div>
       </details>
 
@@ -778,7 +905,7 @@ async function onClearClick() {
           </div>
           <div v-else class="msg assistant">
             <details v-if="msg.reasoning" class="thinking" :class="{ streaming: !msg.done }" open>
-              <summary>
+              <summary @click="onThinkingSummaryClick">
                 <svg viewBox="0 0 20 20" aria-hidden="true">
                   <path d="M10 3.2 12.2 8l5.1.5-3.8 3.4 1.1 5-4.6-2.7L5.4 16.9l1.1-5L2.7 8.5 7.8 8z" />
                 </svg>
@@ -1322,6 +1449,16 @@ select {
   height: 16px;
   accent-color: var(--accent);
 }
+.panel-grid input[type='number'].num-input {
+  width: 150px;
+  font-variant-numeric: tabular-nums;
+}
+.panel-hint {
+  flex-basis: 100%;
+  margin: 2px 0 0;
+  color: var(--ink-3);
+  font-size: 0.78rem;
+}
 
 /* ===== 聊天区：回答直接呈现在页面背景上，无卡片 ===== */
 .chat {
@@ -1447,6 +1584,17 @@ select {
 }
 .thinking summary:hover {
   color: var(--ink);
+}
+/* 展开的思考区：标题吸附在页头下方，只跟随到本思考区末尾（sticky 的包含块
+   就是 details 自身，到块底自然随区滚出）。top 用实测页头高度（App 脚本把
+   offsetHeight 写入 .page 的 --thinking-top），+8px 与折叠校正的吸附位同口径；
+   实底背景遮挡从下方滚过的正文，z-index 低于页头的 20 */
+.thinking[open] > summary {
+  position: sticky;
+  top: calc(var(--thinking-top, 64px) + 8px);
+  z-index: 15;
+  background: var(--bg);
+  padding: 6px 0;
 }
 .thinking :deep(.stream-body) {
   color: var(--ink-2);

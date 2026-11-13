@@ -20,7 +20,7 @@ from core.runtime import build_runtime
 
 
 class RecordingClient:
-    """记录核心调用参数的假客户端：messages、model、thinking、effort。"""
+    """记录核心调用参数的假客户端：messages、model、thinking、effort、网页覆盖值。"""
 
     supports_vision = False
 
@@ -29,7 +29,13 @@ class RecordingClient:
         self.calls: list[dict] = []
 
     def chat_stream_with_usage(
-        self, messages, thinking=None, reasoning_effort=None, model=None
+        self,
+        messages,
+        thinking=None,
+        reasoning_effort=None,
+        model=None,
+        max_tokens=None,
+        max_wait_seconds=None,
     ):
         self.calls.append(
             {
@@ -37,6 +43,8 @@ class RecordingClient:
                 "thinking": thinking,
                 "reasoning_effort": reasoning_effort,
                 "model": model,
+                "max_tokens": max_tokens,
+                "max_wait_seconds": max_wait_seconds,
             }
         )
         answer = f"{self.tag} 的回答：$x=1$"
@@ -916,3 +924,100 @@ def test_clear_during_continue_discards_stale_state(monkeypatch, tmp_path):
     assert daily_store.get_used(
         __import__("datetime").date.today().isoformat(), username
     ) == 7
+
+
+# ===================== 网页覆盖：最大输出 token 与最大等待时间 =====================
+
+
+def test_settings_exposes_web_limit_defaults(two_provider_env):
+    """设置清单给出覆盖值的展示默认（来自注入 settings），供前端占位提示。"""
+    tc, _, _ = two_provider_env
+    data = tc.get("/api/settings").json()
+    assert data["default_max_output_tokens"] == 100
+    assert data["default_max_wait_seconds"] == 10
+
+
+def test_chat_sends_resolved_web_limits_to_client(two_provider_env):
+    """显式覆盖值经核心原样到达客户端调用参数（不做 token 反推）。"""
+    tc, _, clients = two_provider_env
+    resp = tc.post(
+        "/api/chat",
+        json={
+            "message": "1+1=?",
+            "max_output_tokens": 48000,
+            "max_wait_seconds": 900,
+        },
+    )
+    assert resp.status_code == 200
+    call = clients["alpha"].calls[-1]
+    assert call["max_tokens"] == 48000
+    assert call["max_wait_seconds"] == 900
+
+
+def test_chat_without_override_uses_injected_settings(two_provider_env):
+    """留空/缺省：沿用服务器配置值（注入 settings 的 100/10），不改共享客户端。"""
+    tc, _, clients = two_provider_env
+    resp = tc.post("/api/chat", json={"message": "1+1=?"})
+    assert resp.status_code == 200
+    call = clients["alpha"].calls[-1]
+    assert call["max_tokens"] == 100
+    assert call["max_wait_seconds"] == 10
+
+
+def test_continue_sends_resolved_web_limits(two_provider_env):
+    """继续生成与普通发送共用同一校验与解析：覆盖值同样生效。"""
+    tc, runtime, clients = two_provider_env
+    username = API_TEST_ACCOUNTS[0]["username"]
+    _save_history(runtime, username, [{"role": "user", "content": "解方程 x+1=2"}])
+    resp = tc.post(
+        "/api/continue",
+        json={"max_output_tokens": 48000, "max_wait_seconds": 900},
+    )
+    assert resp.status_code == 200
+    call = clients["alpha"].calls[-1]
+    assert call["max_tokens"] == 48000
+    assert call["max_wait_seconds"] == 900
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"max_output_tokens": True},
+        {"max_output_tokens": False},
+        {"max_output_tokens": 48000.5},
+        {"max_output_tokens": 48000.0},  # 整值小数同样拒绝，不静默收整
+        {"max_output_tokens": 50},
+        {"max_output_tokens": 200001},
+        {"max_wait_seconds": True},
+        {"max_wait_seconds": 1.5},
+        {"max_wait_seconds": 14},
+        {"max_wait_seconds": 7201},
+    ],
+)
+def test_invalid_web_limits_rejected_before_model_call(two_provider_env, payload):
+    """布尔/小数/越界值：400 中文报错，且绝不发起模型调用。"""
+    tc, _, clients = two_provider_env
+    resp = tc.post("/api/chat", json={"message": "你好", **payload})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert isinstance(detail, str)
+    assert ("整数" in detail) or ("之间" in detail)
+    assert all(len(c.calls) == 0 for c in clients.values())
+
+
+def test_invalid_limit_error_names_field(two_provider_env):
+    """中文错误带字段名，网页可直接展示。"""
+    tc, _, clients = two_provider_env
+    resp = tc.post("/api/chat", json={"message": "你好", "max_output_tokens": True})
+    assert "最大输出 token" in resp.json()["detail"]
+    resp = tc.post("/api/chat", json={"message": "你好", "max_wait_seconds": 9999})
+    assert "最大等待时间" in resp.json()["detail"]
+    assert all(len(c.calls) == 0 for c in clients.values())
+
+
+def test_blank_string_web_limit_rejected_not_default(two_provider_env):
+    """显式空字符串不是「留空」：pydantic StrictInt 联合直接拒绝（不静默沿用默认）。"""
+    tc, _, clients = two_provider_env
+    resp = tc.post("/api/chat", json={"message": "你好", "max_output_tokens": ""})
+    assert resp.status_code in (400, 422)
+    assert all(len(c.calls) == 0 for c in clients.values())

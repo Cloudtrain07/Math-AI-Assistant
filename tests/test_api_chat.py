@@ -15,21 +15,25 @@ from fastapi.testclient import TestClient
 
 from api import ChatRegistry, create_api_app
 from conftest import (
+    API_TEST_ACCOUNTS,
     CountingDailyUsageStore,
     FailingSaveStore,
+    MemoryDailyUsageStore,
     MemoryHistoryStore,
 )
 from core import dialogue_state
+from core.runtime import build_runtime
 
 
 class FakeStreamClient:
-    """可编程假客户端：记录收到的 messages，按脚本产出片段。"""
+    """可编程假客户端：记录收到的 messages 与网页覆盖值，按脚本产出片段。"""
 
     supports_vision = False
     model = "fake-model"
 
     def __init__(self, script: list[tuple] | None = None) -> None:
         self.calls: list[list[dict]] = []
+        self.limit_calls: list[dict] = []
         self.script = script or [
             (
                 "第一轮回答：$x=1$",
@@ -46,9 +50,18 @@ class FakeStreamClient:
         ]
 
     def chat_stream_with_usage(
-        self, messages, thinking=None, reasoning_effort=None, model=None
+        self,
+        messages,
+        thinking=None,
+        reasoning_effort=None,
+        model=None,
+        max_tokens=None,
+        max_wait_seconds=None,
     ):
         self.calls.append([dict(m) for m in messages])
+        self.limit_calls.append(
+            {"max_tokens": max_tokens, "max_wait_seconds": max_wait_seconds}
+        )
         answer, reasoning, usage, finish = self.script[
             min(len(self.calls) - 1, len(self.script) - 1)
         ]
@@ -566,3 +579,88 @@ def test_history_corrupt_file_serves_empty_with_notice(api_runtime):
     assert "读取失败" in data["notice"]
     # 损坏文件未被覆盖：后续诊断仍能看到原文
     assert bad.read_text(encoding="utf-8") == "{损坏的历史"
+
+
+# ===================== 网页覆盖：最大输出 token 与最大等待时间 =====================
+
+
+def test_web_limit_override_reaches_client(env):
+    """覆盖值随请求经核心原样到达客户端调用参数。"""
+    tc, _, fake, _, _ = env
+    status, events = _chat(
+        tc, "解方程 x+1=2", max_output_tokens=48000, max_wait_seconds=900
+    )
+    assert status == 200
+    assert events[-1][0] == "done"
+    assert fake.limit_calls[-1] == {"max_tokens": 48000, "max_wait_seconds": 900}
+
+
+def test_web_limit_absent_uses_runtime_settings(env):
+    """留空（缺省）：沿用 runtime.settings 的配置值，不改共享客户端默认。"""
+    tc, api_runtime, fake, _, _ = env
+    settings = api_runtime.settings
+    assert settings is not None
+    status, _ = _chat(tc, "解方程 x+1=2")
+    assert status == 200
+    assert fake.limit_calls[-1] == {
+        "max_tokens": settings.max_output_tokens,
+        "max_wait_seconds": settings.max_wait_seconds,
+    }
+
+
+def test_web_limit_blank_follows_env_values(monkeypatch, tmp_path):
+    """留空时按 .env 环境变量解析的 settings 生效（而非硬编码常量）。"""
+    monkeypatch.setenv("MAX_OUTPUT_TOKENS", "12345")
+    monkeypatch.setenv("MAX_WAIT_SECONDS", "77")
+    accounts_path = tmp_path / "accounts.json"
+    accounts_path.write_text(
+        json.dumps(API_TEST_ACCOUNTS, ensure_ascii=False), encoding="utf-8"
+    )
+    runtime = build_runtime(accounts_path=accounts_path)
+    fake = FakeStreamClient()
+    runtime.client = fake
+    runtime.history_store = MemoryHistoryStore()
+    runtime.daily_usage_store = MemoryDailyUsageStore()
+    tc = TestClient(create_api_app(runtime))
+    login(tc, runtime.accounts[0])
+
+    status, _ = _chat(tc, "解方程 x+1=2")
+    assert status == 200
+    assert fake.limit_calls[-1] == {"max_tokens": 12345, "max_wait_seconds": 77}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"max_output_tokens": True},
+        {"max_output_tokens": 48000.5},
+        {"max_output_tokens": 50},
+        {"max_output_tokens": 200001},
+        {"max_wait_seconds": False},
+        {"max_wait_seconds": 1.5},
+        {"max_wait_seconds": 5},
+        {"max_wait_seconds": 7201},
+    ],
+)
+def test_invalid_web_limits_rejected_before_model_call(env, payload):
+    """布尔/小数/越界值：请求开始前 400 拒绝，不调用模型。"""
+    tc, _, fake, _, _ = env
+    calls_before = len(fake.calls)
+    resp = tc.post("/api/chat", json={"message": "解方程 x+1=2", **payload})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert isinstance(detail, str)
+    assert ("整数" in detail) or ("之间" in detail)
+    assert len(fake.calls) == calls_before
+
+
+def test_continue_accepts_web_limits(env):
+    """继续生成同样携带覆盖值。"""
+    tc, _, fake, _, _ = env
+    status, _ = _chat(tc, "第一题")
+    assert status == 200
+    resp = tc.post(
+        "/api/continue", json={"max_output_tokens": 48000, "max_wait_seconds": 900}
+    )
+    assert resp.status_code == 200
+    assert fake.limit_calls[-1] == {"max_tokens": 48000, "max_wait_seconds": 900}

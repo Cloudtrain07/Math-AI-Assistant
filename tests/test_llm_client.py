@@ -41,8 +41,18 @@ _COMPLETION_JSON = {
 }
 
 
-def _install_capture_sdk(monkeypatch, captured: list[dict], *, stream: bool) -> None:
-    """把真实 SDK 的 HTTP 层换成捕获传输：记录序列化后的请求 JSON 再返回假响应。"""
+def _install_capture_sdk(
+    monkeypatch,
+    captured: list[dict],
+    *,
+    stream: bool,
+    create_kwargs_out: list[dict] | None = None,
+) -> None:
+    """把真实 SDK 的 HTTP 层换成捕获传输：记录序列化后的请求 JSON 再返回假响应。
+
+    create_kwargs_out 非空时额外记录每次 create() 收到的关键字参数
+    （类级替换：openai 的资源对象按属性访问新建，实例属性拦截不可靠）。
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(json.loads(request.content.decode("utf-8")))
@@ -59,6 +69,15 @@ def _install_capture_sdk(monkeypatch, captured: list[dict], *, stream: bool) -> 
         base_url="https://example.invalid/v1",
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
+    if create_kwargs_out is not None:
+        completions_cls = type(real_sdk.chat.completions)
+        original_create = completions_cls.create
+
+        def spy_create(sdk_self, **kwargs):
+            create_kwargs_out.append(kwargs)
+            return original_create(sdk_self, **kwargs)
+
+        monkeypatch.setattr(completions_cls, "create", spy_create)
     monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: real_sdk)
 
 
@@ -69,10 +88,16 @@ def _make_client(
     models: list[str],
     default_model: str,
     stream: bool = True,
+    create_kwargs_out: list[dict] | None = None,
 ) -> tuple[llm_module.LLMClient, list[dict]]:
     monkeypatch.setenv("TEST_LLM_API_KEY", "fake-key")
     captured: list[dict] = []
-    _install_capture_sdk(monkeypatch, captured, stream=stream)
+    _install_capture_sdk(
+        monkeypatch,
+        captured,
+        stream=stream,
+        create_kwargs_out=create_kwargs_out,
+    )
     client = llm_module.LLMClient(
         provider={
             "id": "p",
@@ -499,3 +524,102 @@ def test_empty_choices_usage_chunk_reaches_settlement(monkeypatch):
     assert states[-1]["answer"] == "第一段"
     assert states[-1]["usage"].total_tokens == 321
     assert states[-1]["truncated"] is False
+
+
+# ---- 网页覆盖的输出上限与等待时间（捕获请求参数证明生效，不做 token 反推） ----
+
+
+def _run_stream_override(client, *, max_tokens=None, max_wait_seconds=None, model=None):
+    return list(
+        client.chat_stream_with_usage(
+            [{"role": "user", "content": "问题"}],
+            thinking=True,
+            reasoning_effort="high",
+            model=model,
+            max_tokens=max_tokens,
+            max_wait_seconds=max_wait_seconds,
+        )
+    )
+
+
+def test_web_override_reaches_request_with_deepseek_param_name(monkeypatch):
+    create_kwargs: list[dict] = []
+    client, captured = _make_client(
+        monkeypatch,
+        thinking_param="deepseek",
+        models=["deepseek-v4-flash"],
+        default_model="deepseek-v4-flash",
+        create_kwargs_out=create_kwargs,
+    )
+    _run_stream_override(client, max_tokens=48000, max_wait_seconds=900)
+    body = captured[-1]
+    assert body["max_tokens"] == 48000
+    assert "max_completion_tokens" not in body
+    # 等待覆盖同时进入按请求超时：读超时跟随覆盖值，其余档位不变
+    timeout = create_kwargs[-1]["timeout"]
+    assert timeout.read == 900.0
+    assert timeout.connect == 30.0
+    assert timeout.write == 60.0
+    assert timeout.pool == 30.0
+
+
+def test_web_override_uses_max_completion_tokens_for_qwen(monkeypatch):
+    create_kwargs: list[dict] = []
+    client, captured = _make_client(
+        monkeypatch,
+        thinking_param="qwen",
+        models=["qwen3.8-flash"],
+        default_model="qwen3.8-flash",
+        create_kwargs_out=create_kwargs,
+    )
+    _run_stream_override(client, max_tokens=48000)
+    body = captured[-1]
+    assert body["max_completion_tokens"] == 48000
+    assert "max_tokens" not in body
+
+
+def test_web_override_keeps_max_tokens_for_local_ninfer(monkeypatch):
+    """本地 Bonsai（NInfer）覆盖值走 max_tokens，等待覆盖进入读超时。"""
+    create_kwargs: list[dict] = []
+    client, captured = _make_client(
+        monkeypatch,
+        thinking_param="ninfer",
+        models=["Bonsai-2-27B-Vision"],
+        default_model="Bonsai-2-27B-Vision",
+        create_kwargs_out=create_kwargs,
+    )
+    _run_stream_override(client, max_tokens=48000, max_wait_seconds=7200)
+    body = captured[-1]
+    assert body["max_tokens"] == 48000
+    assert create_kwargs[-1]["timeout"].read == 7200.0
+
+
+def test_wait_only_override_keeps_default_output_quota(monkeypatch):
+    create_kwargs: list[dict] = []
+    client, captured = _make_client(
+        monkeypatch,
+        thinking_param="deepseek",
+        models=["deepseek-v4-flash"],
+        default_model="deepseek-v4-flash",
+        create_kwargs_out=create_kwargs,
+    )
+    _run_stream_override(client, max_wait_seconds=120)
+    body = captured[-1]
+    assert body["max_tokens"] == 30000
+    assert create_kwargs[-1]["timeout"].read == 120.0
+
+
+def test_no_override_keeps_client_defaults(monkeypatch):
+    """不覆盖时与既有行为一致：30000 / read=600（未注入 settings 的回退值）。"""
+    create_kwargs: list[dict] = []
+    client, captured = _make_client(
+        monkeypatch,
+        thinking_param="deepseek",
+        models=["deepseek-v4-flash"],
+        default_model="deepseek-v4-flash",
+        create_kwargs_out=create_kwargs,
+    )
+    _run_stream_override(client)
+    body = captured[-1]
+    assert body["max_tokens"] == 30000
+    assert create_kwargs[-1]["timeout"].read == 600.0

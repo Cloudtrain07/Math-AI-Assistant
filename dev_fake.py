@@ -25,14 +25,39 @@ def _image_parts(content: object) -> int:
     )
 
 
+def _long_reasoning() -> str:
+    """加长的假推理文本：内容确定可重复，含公式便于检查吸附区的渲染。"""
+    parts = [
+        "先审题：把条件逐条抄下来，确认没有遗漏的约束，"
+        "特别注意 $r > 0$ 这个隐含前提。\n\n",
+    ]
+    for i in range(1, 25):
+        parts.append(
+            f"第 {i} 步：检查当前假设是否与已知条件相容。"
+            f"先代入特殊值 $r = {i}$ 验证：面积 $S = \\pi \\times {i}^2 = {3 * i * i}$"
+            "（取 $\\pi \\approx 3$ 便于口算），与直觉一致后再进入下一步。\n\n"
+            "中途如果发现某一步依赖了未证明的结论，就退回上一步重新拆解："
+            "把大步骤拆成更小的等价变形，逐个确认依据来自定义、公理还是已证结论。\n\n"
+        )
+    parts.append(
+        "收尾前的自查：单位是否统一、结论是否回答了题目所问、"
+        "有没有把「必要条件」误当成「充分条件」。\n\n"
+        "最后复核一次关键等式 $S = \\pi r^2$ 的量纲：长度²，"
+        "与面积单位一致，检查通过。"
+    )
+    return "".join(parts)
+
+
 class FakeStreamClient:
     """按现有 LLMClient 接口输出固定的流式公式回答。
 
-    - supports_vision 由服务商声明决定（见 build_fake_clients）；
-    - 记录每次收到的 messages 与累计收到的图片部分数量，供验收确认
-      「假客户端实际收到编辑后的图片消息」；
-    - 回答在早期即完成一个块级公式，随后继续追加多段文字与后续公式，
-      推理文本同样含公式，便于对回答与思考区分别做公式稳定性观测。
+- supports_vision 由服务商声明决定（见 build_fake_clients）；
+- 记录每次收到的 messages 与累计收到的图片部分数量，供验收确认
+  「假客户端实际收到编辑后的图片消息」；
+- 回答在早期即完成一个块级公式，随后继续追加多段文字与后续公式，
+  推理文本同样含公式，便于对回答与思考区分别做公式稳定性观测；
+- 思考开启时输出刻意加长的推理文本（数十段，含公式），供网页端做
+  「长思考区滚动、标题吸附与折叠校正」的可重复验收（--isolated --fake）。
     """
 
     model = "fake-math-model"
@@ -57,6 +82,8 @@ class FakeStreamClient:
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         model: str | None = None,
+        max_tokens: int | None = None,
+        max_wait_seconds: int | float | None = None,
     ):
         self.calls += 1
         self.last_messages = [dict(m) for m in messages]
@@ -92,13 +119,7 @@ class FakeStreamClient:
             "$$\nS(r) = \\pi r^2 \\quad (r > 0)\n$$\n\n"
             "结论：记住公式 $S = \\pi r^2$ 即可。"
         )
-        reasoning = (
-            "先判断题型的分类，再用公式 $S = \\pi r^2$ 估算。\n\n"
-            "先在草稿上验证 $\\frac{d}{dx}x^2 = 2x$，"
-            "再确认 $\\int_0^1 x^2\\,dx = \\frac{1}{3}$ 这一步。"
-            if thinking
-            else ""
-        )
+        reasoning = _long_reasoning() if thinking else ""
         usage = SimpleNamespace(
             total_tokens=100 + 20 * user_turns,
             prompt_tokens=60 + 10 * user_turns,

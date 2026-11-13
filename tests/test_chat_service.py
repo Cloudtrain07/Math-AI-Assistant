@@ -116,7 +116,13 @@ def test_stream_reply_accumulates_model_chunks():
 
     class FakeClient:
         def chat_stream_with_usage(
-            self, received_messages, thinking, reasoning_effort, model
+            self,
+            received_messages,
+            thinking,
+            reasoning_effort,
+            model,
+            max_tokens=None,
+            max_wait_seconds=None,
         ):
             self.received = (
                 received_messages, thinking, reasoning_effort, model
@@ -845,7 +851,13 @@ def test_generate_reply_composes_stream_and_finalization(
             self.calls = 0
 
         def chat_stream_with_usage(
-            self, messages, thinking, reasoning_effort, model
+            self,
+            messages,
+            thinking,
+            reasoning_effort,
+            model,
+            max_tokens=None,
+            max_wait_seconds=None,
         ):
             self.calls += 1
             self.received = (
@@ -1071,7 +1083,13 @@ def test_run_chat_turn_without_gradio(scenario):
             self.calls = 0
 
         def chat_stream_with_usage(
-            self, messages, thinking, reasoning_effort, model
+            self,
+            messages,
+            thinking,
+            reasoning_effort,
+            model,
+            max_tokens=None,
+            max_wait_seconds=None,
         ):
             self.calls += 1
             self.received = (

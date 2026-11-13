@@ -7,8 +7,10 @@
 - ninfer 系（本地 NInfer 引擎）：extra_body={"reasoning_effort": ...}（none 即关闭）
 - mimo 系：extra_body={"thinking": {"type": ...}} 开关，不带强度
 - 其余模型：保持原有统一格式（thinking 内联 reasoning_effort），不套用目标规则
-输出上限：qwen3.7/3.8 与 mimo 用 max_completion_tokens，其余仍用 max_tokens。
-自定义字段经 SDK 的 extra_body 合并到请求 JSON 顶层，不产生名为 extra_body 的对象。
+输出上限：qwen3.7/3.8 与 mimo 用 max_completion_tokens，其余仍用 max_tokens；
+聊天轮次可按请求覆盖（网页设置），覆盖只作用于本轮，不改动共享客户端的
+默认输出额度与超时。自定义字段经 SDK 的 extra_body 合并到请求 JSON 顶层，
+不产生名为 extra_body 的对象。
 """
 
 from __future__ import annotations
@@ -114,6 +116,8 @@ class LLMClient:
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         model: str | None = None,
+        max_tokens: int | None = None,
+        max_wait_seconds: int | float | None = None,
     ) -> Iterator[tuple[str | None, str | None, object | None, str | None]]:
         """流式生成；(内容, 思考链, usage, finish_reason) 四元组。"""
         model_name = model or self._model
@@ -121,10 +125,25 @@ class LLMClient:
         extra_body = self._build_extra_params(
             thinking, reasoning_effort, capability
         )
-        max_tokens = (
-            self._settings.max_output_tokens if self._settings is not None else 30000
+        # 覆盖值只决定本轮的数值；参数名仍按模型分流（providers 决定）
+        effective_max_tokens = (
+            max_tokens
+            if max_tokens is not None
+            else (
+                self._settings.max_output_tokens
+                if self._settings is not None
+                else 30000
+            )
         )
-        max_wait = float(self._settings.max_wait_seconds) if self._settings else 600.0
+        effective_max_wait = (
+            float(max_wait_seconds)
+            if max_wait_seconds is not None
+            else (
+                float(self._settings.max_wait_seconds)
+                if self._settings
+                else 600.0
+            )
+        )
         create_kwargs: dict = {
             "model": model_name,
             "messages": messages,
@@ -133,7 +152,15 @@ class LLMClient:
             "stream_options": {"include_usage": True},
         }
         # 输出额度数值不变，仅按官方要求调整参数名（qwen/mimo 用 max_completion_tokens）
-        create_kwargs[capability["output_limit_param"]] = max_tokens
+        create_kwargs[capability["output_limit_param"]] = effective_max_tokens
+        # 按请求覆盖超时：读超时与下面的流式计时使用同一个有效等待值；
+        # 未覆盖时数值与构造时注入的客户端超时一致，行为不变
+        create_kwargs["timeout"] = httpx.Timeout(
+            connect=30.0,
+            read=effective_max_wait,
+            write=60.0,
+            pool=30.0,
+        )
         stream = self._client.chat.completions.create(**create_kwargs)
         finish_reason: str | None = None
         start = time.monotonic()
@@ -141,9 +168,9 @@ class LLMClient:
         try:
             for chunk in stream:
                 now = time.monotonic()
-                if now - start > max_wait:
+                if now - start > effective_max_wait:
                     raise MaxWaitTimeout(
-                        f"等待超过 {int(max_wait)} 秒，已自动停止（可重新发送）"
+                        f"等待超过 {int(effective_max_wait)} 秒，已自动停止（可重新发送）"
                     )
                 # usage 读取必须在 choices 判断之外：DeepSeek 末尾的用量分片
                 # choices 为空但携带 usage，放进判断内会把用量静默丢弃
@@ -176,10 +203,21 @@ class LLMClient:
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         model: str | None = None,
+        max_tokens: int | None = None,
+        max_wait_seconds: int | float | None = None,
     ) -> Iterator[tuple[str | None, str | None, object | None, str | None]]:
-        """流式回答并携带用量与结束原因。"""
+        """流式回答并携带用量与结束原因。
+
+        max_tokens / max_wait_seconds 为网页覆盖值（None 表示沿用配置）：
+        等待值同时作用于本次请求的网络读取超时与流式全程计时。
+        """
         yield from self._chat_stream_with_usage(
-            messages, thinking, reasoning_effort, model
+            messages,
+            thinking,
+            reasoning_effort,
+            model,
+            max_tokens=max_tokens,
+            max_wait_seconds=max_wait_seconds,
         )
 
     def complete(

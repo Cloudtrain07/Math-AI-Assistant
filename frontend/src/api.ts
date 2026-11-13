@@ -56,7 +56,8 @@ export interface StartPayload {
 }
 
 /** 单轮界面设置：随聊天/继续生成请求提交，后端验证后选择对应客户端。
- * reasoning_effort 为 null 表示当前模型不提供思考强度（后端按缺省处理） */
+ * reasoning_effort 为 null 表示当前模型不提供思考强度（后端按缺省处理）；
+ * 两个覆盖值为 null 表示留空、沿用服务器 .env 配置，仅作用于本轮请求 */
 export interface TurnSettings {
   mode: string
   level: string
@@ -65,6 +66,8 @@ export interface TurnSettings {
   model: string
   answer_style: string
   reasoning_effort: string | null
+  max_output_tokens: number | null
+  max_wait_seconds: number | null
 }
 
 /** 单个模型的思考档位信息（来自后端共享能力规则，前端不自行维护） */
@@ -97,6 +100,9 @@ export interface SettingsInfo {
   default_answer_style: string
   default_thinking: boolean
   default_reasoning_effort: string
+  /** 网页覆盖值的展示默认：输入框留空时提示沿用这两个服务器配置值 */
+  default_max_output_tokens: number
+  default_max_wait_seconds: number
   startup_hint: string
 }
 
@@ -189,7 +195,11 @@ async function consumeTurnStream(
     throw new Error('登录已过期，请重新登录')
   }
   if (!resp.ok || !resp.body) {
-    throw new Error(`请求失败（HTTP ${resp.status}）`)
+    // 后端 400/503 返回的字符串 detail 直接展示（含设置校验的中文提示）；
+    // 没有可读 detail（如 422 的结构化明细）时保留通用错误
+    const body = await readJson(resp)
+    const detail = body && typeof body.detail === 'string' ? body.detail : ''
+    throw new Error(detail || `请求失败（HTTP ${resp.status}）`)
   }
 
   const parser = new SseParser()

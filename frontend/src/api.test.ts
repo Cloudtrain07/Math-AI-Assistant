@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { adminResetPassword, fetchAdminStats, uploadImage } from './api'
+import { adminResetPassword, continueChat, fetchAdminStats, streamChat, uploadImage } from './api'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -104,5 +104,59 @@ describe('管理员接口', () => {
       ),
     )
     await expect(adminResetPassword('bob', ' ')).rejects.toThrow('新密码不能为空')
+  })
+})
+
+describe('聊天/继续生成的 HTTP 400 提示', () => {
+  const settings = {
+    mode: '互动模式',
+    level: '高中',
+    thinking: false,
+    provider_id: null,
+    model: 'deepseek-v4-flash',
+    answer_style: '完整步骤+答案',
+    reasoning_effort: null,
+    max_output_tokens: null,
+    max_wait_seconds: null,
+  }
+
+  it('streamChat：400 的字符串 detail 直接展示（设置校验中文提示可见）', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ detail: '最大输出 token必须是整数，不接受 true/false' }), {
+        status: 400,
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(
+      streamChat('1+1=?', settings, {}),
+    ).rejects.toThrow('最大输出 token必须是整数，不接受 true/false')
+  })
+
+  it('continueChat：400 的字符串 detail 直接展示', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ detail: '最大等待时间需在 15–7200 之间，请修改后重试' }), {
+        status: 400,
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(continueChat(settings, {})).rejects.toThrow('最大等待时间需在 15–7200 之间')
+  })
+
+  it('没有可读 detail 时保留通用错误；401 仍提示重新登录', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ detail: [{ msg: 'pydantic' }] }), { status: 422 }),
+      ),
+    )
+    await expect(streamChat('1+1=?', settings, {})).rejects.toThrow('请求失败（HTTP 422）')
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('未登录', { status: 401 })),
+    )
+    await expect(streamChat('1+1=?', settings, {})).rejects.toThrow('登录已过期，请重新登录')
   })
 })

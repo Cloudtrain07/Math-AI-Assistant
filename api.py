@@ -106,7 +106,7 @@ import anyio
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 from starlette.concurrency import iterate_in_threadpool
 
 # 登录副作用与文案/格式化来自 core，本层不依赖任何界面层
@@ -165,6 +165,14 @@ MAX_IMAGE_PIXELS = 50_000_000
 # 非目标模型 / thinking_param=none 的显式思考强度沿用原有全局档位校验；
 # 已核实目标模型（DeepSeek/Qwen3.7/Qwen3.8/MiMo）按模型级 accepted_efforts 校验
 REASONING_EFFORTS = ("low", "high", "max")
+
+# 网页覆盖输出上限的合法范围：只拦截明显非法/离谱的提交；
+# 模型或引擎自身的额度与上下文上限以服务商返回为准（运行时给出可读提示）。
+# 与前端 webLimits.ts 中的范围常量保持一致
+WEB_MIN_OUTPUT_TOKENS = 100
+WEB_MAX_OUTPUT_TOKENS = 200_000
+WEB_MIN_WAIT_SECONDS = 15
+WEB_MAX_WAIT_SECONDS = 7200
 
 
 # ===================== 会话与账号聊天状态 =====================
@@ -647,7 +655,14 @@ class AdminResetPasswordBody(BaseModel):
 
 
 class TurnSettings(BaseModel):
-    """界面设置：全部可缺省，缺省时按当前注入 runtime 的默认值解析。"""
+    """界面设置：全部可缺省，缺省时按当前注入 runtime 的默认值解析。
+
+    max_output_tokens / max_wait_seconds 是网页覆盖值：None 表示沿用 .env。
+    类型用 StrictInt | float | bool 的联合（而非裸 int）是有意的：
+    pydantic 的 422 明细无法以中文展示，把布尔/小数放行到
+    _validate_web_limit 统一校验并返回带字段名的中文错误；
+    裸 int 会把 48000.0 静默收整、把布尔直接 422，不符合严格校验要求。
+    """
 
     mode: str = MODE_INTERACTIVE
     level: str | None = None
@@ -656,6 +671,8 @@ class TurnSettings(BaseModel):
     model: str | None = None
     answer_style: str | None = None
     reasoning_effort: str | None = None
+    max_output_tokens: StrictInt | float | bool | None = None
+    max_wait_seconds: StrictInt | float | bool | None = None
 
 
 class ChatBody(TurnSettings):
@@ -688,6 +705,28 @@ def _reject_message(status: str, turn: dict, runtime: AppRuntime) -> str:
     if status == "no_client":
         return f"⚠️ {runtime.startup_hint}" if runtime.startup_hint else "⚠️ 模型客户端不可用。"
     return turn.get("reject_message") or "⚠️ 请求被拒绝。"
+
+
+def _validate_web_limit(label: str, raw: object, lo: int, hi: int) -> int | None:
+    """网页覆盖值校验：None 放行（沿用配置），其余必须是范围内整数。
+
+    拒绝布尔与一切小数（含 48000.0 这类整值小数——前端发送的 JSON 数字
+    由 Number.isInteger 保证不带小数点，服务端不做静默收整）。
+    字符串等其余类型在 pydantic 层即被 StrictInt 联合拒绝（422）。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise HTTPException(status_code=400, detail=f"{label}必须是整数，不接受 true/false")
+    if isinstance(raw, float):
+        raise HTTPException(status_code=400, detail=f"{label}必须是整数，不接受小数（收到 {raw}）")
+    if not isinstance(raw, int):  # 防御：联合类型下理论上不会到达
+        raise HTTPException(status_code=400, detail=f"{label}必须是整数")
+    if raw < lo or raw > hi:
+        raise HTTPException(
+            status_code=400, detail=f"{label}需在 {lo}–{hi} 之间，请修改后重试"
+        )
+    return raw
 
 
 def _resolve_turn_settings(runtime: AppRuntime, username: str, body: TurnSettings) -> dict:
@@ -805,6 +844,26 @@ def _resolve_turn_settings(runtime: AppRuntime, username: str, body: TurnSetting
         if body.thinking is not None
         else (settings.thinking if settings is not None else False)
     )
+    max_output_tokens = _validate_web_limit(
+        "最大输出 token",
+        body.max_output_tokens,
+        WEB_MIN_OUTPUT_TOKENS,
+        WEB_MAX_OUTPUT_TOKENS,
+    )
+    if max_output_tokens is None:
+        max_output_tokens = (
+            settings.max_output_tokens if settings is not None else 30000
+        )
+    max_wait_seconds = _validate_web_limit(
+        "最大等待时间",
+        body.max_wait_seconds,
+        WEB_MIN_WAIT_SECONDS,
+        WEB_MAX_WAIT_SECONDS,
+    )
+    if max_wait_seconds is None:
+        max_wait_seconds = (
+            settings.max_wait_seconds if settings is not None else 600
+        )
     return {
         "client": active_client,
         "model": model,
@@ -812,6 +871,8 @@ def _resolve_turn_settings(runtime: AppRuntime, username: str, body: TurnSetting
         "thinking": thinking,
         "reasoning_effort": effort,
         "answer_style": answer_style,
+        "max_output_tokens": max_output_tokens,
+        "max_wait_seconds": max_wait_seconds,
     }
 
 
@@ -964,6 +1025,8 @@ def chat_event_stream(
             image_note=IMAGE_NOTE,
             turn_token=turn_token,
             force_continue=force_continue,
+            max_output_tokens=resolved["max_output_tokens"],
+            max_wait_seconds=resolved["max_wait_seconds"],
         ):
             event_type = event["type"]
             turn = event["turn"]
@@ -1197,6 +1260,13 @@ def create_api_app(
             ),
             "default_reasoning_effort": (
                 rt.settings.reasoning_effort if rt.settings is not None else "high"
+            ),
+            # 网页覆盖值的展示默认：留空时前端提示沿用这两个值
+            "default_max_output_tokens": (
+                rt.settings.max_output_tokens if rt.settings is not None else 30000
+            ),
+            "default_max_wait_seconds": (
+                rt.settings.max_wait_seconds if rt.settings is not None else 600
             ),
             "startup_hint": rt.startup_hint,
         }

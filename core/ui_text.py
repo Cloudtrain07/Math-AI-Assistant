@@ -57,8 +57,21 @@ def friendly_error(exc: Exception) -> str:
     """把 API 异常映射为简洁的中文提示，避免把堆栈抛给用户。"""
     name = exc.__class__.__name__
     text = str(exc)[:150]
+    lower = text.lower()
     if isinstance(exc, MaxWaitTimeout):
         hint = "已达到最长等待时间，已自动停止（可重新发送）"
+    elif (
+        "maximum context length" in lower
+        or "context_length_exceeded" in lower
+        or "上下文长度" in text
+    ):
+        hint = "上下文超限：可清空对话重试，或缩短消息/调小「最大输出 token」"
+    elif (
+        "max_tokens" in lower
+        or "max_completion_tokens" in lower
+        or "max_output_tokens" in lower
+    ):
+        hint = "输出上限被该模型或引擎拒绝，请调小「最大输出 token」后重试"
     elif "Authentication" in name or "401" in text:
         hint = "API Key 无效或未配置，请检查 .env 中的 DEEPSEEK_API_KEY"
     elif "RateLimit" in name or "429" in text:

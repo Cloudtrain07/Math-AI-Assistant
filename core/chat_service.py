@@ -63,8 +63,13 @@ def stream_reply(
     thinking: bool,
     reasoning_effort: str,
     model: str,
+    max_tokens: int | None = None,
+    max_wait_seconds: int | float | None = None,
 ):
-    """调用模型，并在每次收到片段后交出当前的累计结果。"""
+    """调用模型，并在每次收到片段后交出当前的累计结果。
+
+    max_tokens / max_wait_seconds 为网页覆盖值（None 表示沿用配置）。
+    """
     answer = ""
     reasoning_text = ""
     usage = None
@@ -76,6 +81,8 @@ def stream_reply(
             thinking=thinking,
             reasoning_effort=reasoning_effort,
             model=model,
+            max_tokens=max_tokens,
+            max_wait_seconds=max_wait_seconds,
         )
     ):
         if reasoning_piece:
@@ -415,6 +422,8 @@ def generate_reply(
     model: str,
     image_data_url: str | None,
     max_history_messages: int | None,
+    max_output_tokens: int | None = None,
+    max_wait_seconds: int | None = None,
     active_client,
     history_compressor,
     history_store,
@@ -451,6 +460,8 @@ def generate_reply(
             thinking=thinking,
             reasoning_effort=reasoning_effort,
             model=model,
+            max_tokens=max_output_tokens,
+            max_wait_seconds=max_wait_seconds,
         ):
             yield {"type": "stream", "reply": reply}
 
@@ -671,6 +682,8 @@ def run_chat_turn(
     force_continue: bool = False,
     attach_image: bool = True,
     turn_token: int | None = None,
+    max_output_tokens: int | None = None,
+    max_wait_seconds: int | None = None,
 ):
     """从原始提问开始，交出拒绝、准备完成、流式和最终事件。
 
@@ -726,6 +739,8 @@ def run_chat_turn(
         history_store=history_store,
         daily_usage_store=daily_usage_store,
         event_logger=event_logger,
+        max_output_tokens=max_output_tokens,
+        max_wait_seconds=max_wait_seconds,
     ):
         event["turn"] = prepared
         yield event
