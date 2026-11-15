@@ -1,6 +1,7 @@
 
 from core import message_builder
 from core import dialogue_state
+from core.llm_client import TurnAborted
 from core.math_format import normalize_math_text
 from core.vision_client import image_to_data_url
 from core.usage import (
@@ -39,11 +40,17 @@ def prepare_api_messages(
     stage: str | None,
     mode_changed: bool,
     max_history_messages: int | None,
+    turn_abort=None,
 ) -> list[dict]:
-    """准备发送给 API 的消息列表。"""
+    """准备发送给 API 的消息列表。
+
+    turn_abort 透传给摘要压缩：用户停止/断连时取消在途摘要请求。
+    """
     summary = ""
     if max_history_messages is not None and len(history) > max_history_messages:
-        summary = history_compressor.get_summary(username, history, max_history_messages, active_client)
+        summary = history_compressor.get_summary(
+            username, history, max_history_messages, active_client, turn_abort
+        )
     return message_builder.to_api_messages(
         history,
         level,
@@ -65,25 +72,33 @@ def stream_reply(
     model: str,
     max_tokens: int | None = None,
     max_wait_seconds: int | float | None = None,
+    turn_abort=None,
 ):
     """调用模型，并在每次收到片段后交出当前的累计结果。
 
     max_tokens / max_wait_seconds 为网页覆盖值（None 表示沿用配置）。
+    turn_abort 为消费端中止句柄：仅当客户端声明支持（supports_turn_abort）
+    时注入，假客户端等其余实现不受影响。
     """
     answer = ""
     reasoning_text = ""
     usage = None
     truncated = False
 
+    stream_kwargs: dict = {
+        "thinking": thinking,
+        "reasoning_effort": reasoning_effort,
+        "model": model,
+        "max_tokens": max_tokens,
+        "max_wait_seconds": max_wait_seconds,
+    }
+    if turn_abort is not None and getattr(
+        active_client, "supports_turn_abort", False
+    ):
+        stream_kwargs["abort"] = turn_abort
+
     for piece, reasoning_piece, chunk_usage, finish_reason in (
-        active_client.chat_stream_with_usage(
-            messages,
-            thinking=thinking,
-            reasoning_effort=reasoning_effort,
-            model=model,
-            max_tokens=max_tokens,
-            max_wait_seconds=max_wait_seconds,
-        )
+        active_client.chat_stream_with_usage(messages, **stream_kwargs)
     ):
         if reasoning_piece:
             reasoning_text += reasoning_piece
@@ -424,13 +439,18 @@ def generate_reply(
     max_history_messages: int | None,
     max_output_tokens: int | None = None,
     max_wait_seconds: int | None = None,
+    turn_abort=None,
     active_client,
     history_compressor,
     history_store,
     daily_usage_store,
     event_logger,
 ):
-    """准备上下文、流式生成并收尾，交出进度事件和最终事件。"""
+    """准备上下文、流式生成并收尾，交出进度事件和最终事件。
+
+    turn_abort 为消费端中止句柄：中止（停止/断连）不走错误收尾，
+    原样上抛交由外层 finally 释放 busy 与图片状态。
+    """
     reply = {
         "answer": "",
         "reasoning_text": "",
@@ -452,7 +472,13 @@ def generate_reply(
             stage=stage,
             mode_changed=mode_changed,
             max_history_messages=max_history_messages,
+            turn_abort=turn_abort,
         )
+
+        # 摘要期间消费端已中止（停止/断连）：不再发出主回答请求，
+        # 原样上抛交由外层 finally 释放 busy 与图片状态
+        if turn_abort is not None and turn_abort.event.is_set():
+            raise TurnAborted()
 
         for reply in stream_reply(
             active_client,
@@ -462,9 +488,12 @@ def generate_reply(
             model=model,
             max_tokens=max_output_tokens,
             max_wait_seconds=max_wait_seconds,
+            turn_abort=turn_abort,
         ):
             yield {"type": "stream", "reply": reply}
 
+    except TurnAborted:
+        raise
     except Exception as exc:
         error = exc
 
@@ -684,10 +713,12 @@ def run_chat_turn(
     turn_token: int | None = None,
     max_output_tokens: int | None = None,
     max_wait_seconds: int | None = None,
+    turn_abort=None,
 ):
     """从原始提问开始，交出拒绝、准备完成、流式和最终事件。
 
     turn_token 语义同 prepare_chat_turn：缺省由核心自取，传入则复用。
+    turn_abort 为消费端中止句柄，透传给 generate_reply（None 表示无通道）。
     """
     prepared = prepare_chat_turn(
         message=message,
@@ -741,6 +772,7 @@ def run_chat_turn(
         event_logger=event_logger,
         max_output_tokens=max_output_tokens,
         max_wait_seconds=max_wait_seconds,
+        turn_abort=turn_abort,
     ):
         event["turn"] = prepared
         yield event

@@ -169,3 +169,75 @@ def test_me_level_from_account_and_fallback(api_runtime):
     me = tc.get("/api/me").json()
     assert me["level"] == "高中"
     assert me["display_name"] == account["username"]
+
+
+# ===================== 远程 HTTPS 边界：Secure Cookie 与公网域名形状 =====================
+#
+# 对应 Cloudflare Tunnel 接入的本地验证（隧道侧实测见部署文档的待测项）：
+# - HTTPS 下发的会话 Cookie 带 Secure；HTTP（本机/局域网直连）不带，
+#   两种传输都能登录；
+# - 公网域名 Host + 同源 Origin：同源校验放行、local_admin=False、
+#   管理接口仍被应用层拒绝；
+# - openapi.json 不再挂载，路由清单不对外暴露。
+
+
+def test_login_https_sets_secure_cookie(api_runtime):
+    """HTTPS 下发的会话 Cookie 带 Secure（隧道/公网 HTTPS 场景）。"""
+    tc = TestClient(create_api_app(api_runtime), base_url="https://testserver")
+    account = _first_account(api_runtime)
+    resp = tc.post(
+        "/api/login",
+        json={"username": account["username"], "password": account["password"]},
+    )
+    assert resp.status_code == 200
+    cookie = resp.headers.get("set-cookie", "")
+    assert "maa_session=" in cookie
+    assert "Secure" in cookie
+
+
+def test_login_http_cookie_has_no_secure_and_session_works(api_runtime):
+    """HTTP（本机/局域网直连）登录不受 Secure 影响：Cookie 可下发、会话可用。"""
+    tc = TestClient(create_api_app(api_runtime))
+    account = _first_account(api_runtime)
+    resp = tc.post(
+        "/api/login",
+        json={"username": account["username"], "password": account["password"]},
+    )
+    assert resp.status_code == 200
+    cookie = resp.headers.get("set-cookie", "")
+    assert "Secure" not in cookie
+    assert tc.get("/api/me").status_code == 200
+
+
+def test_public_hostname_request_shape(api_runtime):
+    """隧道形状（公网域名 Host + 同源 Origin）：同源放行、local_admin=False。"""
+    tc = TestClient(create_api_app(api_runtime), base_url="https://maa.example.com")
+    account = _first_account(api_runtime)
+    resp = tc.post(
+        "/api/login",
+        json={"username": account["username"], "password": account["password"]},
+        headers={"Origin": "https://maa.example.com"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["local_admin"] is False
+
+    me = tc.get("/api/me")
+    assert me.status_code == 200
+    assert me.json()["local_admin"] is False
+
+    # 公网管理接口仍被应用层拒绝（远程永不提权）
+    admin = tc.get("/api/admin/stats")
+    assert admin.status_code == 403
+
+    # 写请求同源校验：公网域名 Origin 与 Host 一致 → 放行（保留公网 Host 口径）
+    logout_resp = tc.post(
+        "/api/logout", headers={"Origin": "https://maa.example.com"}
+    )
+    assert logout_resp.status_code == 200
+
+
+def test_openapi_json_not_served(api_runtime):
+    """openapi.json 不再挂载：一律 404，不暴露路由清单（docs 早已关闭）。"""
+    tc = TestClient(create_api_app(api_runtime))
+    assert tc.get("/openapi.json").status_code == 404
+    assert tc.get("/docs").status_code == 404

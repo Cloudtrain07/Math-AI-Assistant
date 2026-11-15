@@ -124,6 +124,7 @@ from core.access import (
 from core.accounts import load_accounts, reset_password
 from core.backup import BACKUP_FAILED, BackupResult, daily_backup_loop, prune_backups, run_backup
 from core.login import verify_login
+from core.llm_client import TurnAbort, TurnAborted
 from core.prompts import MODE_ANSWER, MODE_INTERACTIVE
 from core.providers import get_model_thinking_capability, get_provider_supports_thinking
 from core.runtime import AppRuntime, build_runtime
@@ -581,6 +582,17 @@ def _session_cookie(request: Request) -> str | None:
     return request.cookies.get(SESSION_COOKIE)
 
 
+def _request_is_https(request: Request) -> bool:
+    """请求传输层是否为 HTTPS（决定会话 Cookie 是否带 Secure）。
+
+    uvicorn 默认信任回环代理的 X-Forwarded-Proto（forwarded_allow_ips=127.0.0.1）：
+    cloudflared 从本机回源时 scheme 已被改写为 https，Cookie 带 Secure；
+    本机与局域网 HTTP 直连时 scheme 保持 http，不带 Secure——否则浏览器
+    会拒收 HTTP 下发的 Secure Cookie，破坏既有局域网登录。
+    """
+    return (request.url.scheme or "").lower() == "https"
+
+
 def _current_user(request: Request) -> str:
     sessions: SessionStore = request.app.state.sessions
     username = sessions.get(_session_cookie(request))
@@ -676,13 +688,18 @@ class TurnSettings(BaseModel):
 
 
 class ChatBody(TurnSettings):
-    message: str
+    message: str = ""
+    action: str = "create"
+    generation_id: str | None = None
+    background: bool = False
     # /api/images 返回的服务端临时图片 id；缺省表示纯文本发送
     image_id: str | None = None
 
 
 class ContinueBody(TurnSettings):
     """继续生成：不带消息文本，指令由服务端按服务端历史构造。"""
+    generation_id: str | None = None
+    background: bool = False
 
 
 # ===================== SSE 事件映射 =====================
@@ -931,6 +948,9 @@ def chat_event_stream(
     *,
     force_continue: bool = False,
     image_id: str | None = None,
+    turn_abort: TurnAbort | None = None,
+    start_lock=None,
+    preview_store=None,
 ):
     """核心 run_chat_turn 事件 → SSE 文本流（同步生成器，Starlette 线程池执行）。
 
@@ -948,7 +968,13 @@ def chat_event_stream(
     不支持视觉拒绝——不复制任何图片业务逻辑；轮次结束（含被拒、断连关闭
     生成器）后经 sync_image_state 写回并清理被替换或被丢弃的临时文件。
     """
-    turn = registry.begin_turn(runtime, username)
+    if start_lock is None:
+        turn = registry.begin_turn(runtime, username)
+    else:
+        with start_lock:
+            if turn_abort is not None and turn_abort.event.is_set():
+                return
+            turn = registry.begin_turn(runtime, username)
     if turn is None:
         yield _sse(
             "rejected",
@@ -960,8 +986,11 @@ def chat_event_stream(
         return
     state, start_epoch, turn_token = turn
     prepared: dict | None = None
+    preview_id = None
 
     try:
+        if turn_abort is not None and turn_abort.event.is_set():
+            return
         if image_id is not None and not registry.mount_pending_image(
             username, state, start_epoch, image_id
         ):
@@ -1027,6 +1056,7 @@ def chat_event_stream(
             force_continue=force_continue,
             max_output_tokens=resolved["max_output_tokens"],
             max_wait_seconds=resolved["max_wait_seconds"],
+            turn_abort=turn_abort,
         ):
             event_type = event["type"]
             turn = event["turn"]
@@ -1044,9 +1074,17 @@ def chat_event_stream(
 
             if event_type == "ready":
                 # start 携带本轮消息原文，供前端展示继续生成的指令
-                yield _sse("start", {"message": message})
+                start_payload = {"message": message}
+                if image_id and preview_store is not None and start_lock is not None:
+                    with start_lock:
+                        if state.epoch == start_epoch:
+                            preview_id = preview_store.capture(username, image_id, prepared["history"][-1])
+                            if preview_id:
+                                start_payload["preview_id"] = preview_id
+                            else:
+                                start_payload["preview_unavailable"] = True
+                yield _sse("start", start_payload)
                 continue
-
             reply = event["reply"]
             answer = reply["answer"]
             reasoning = reply["reasoning_text"]
@@ -1085,14 +1123,22 @@ def chat_event_stream(
                 )
             t_final = time.monotonic()
             result = event["result"]
-            persisted = registry.finish_turn(
-                username,
-                state,
-                start_epoch,
-                history=result["history"],
-                usage_state=result["usage_state"],
-                stage_state=turn["stage_state"],
-            )
+            def finish():
+                persisted = registry.finish_turn(
+                    username, state, start_epoch, history=result["history"],
+                    usage_state=result["usage_state"], stage_state=turn["stage_state"],
+                )
+                if preview_id and preview_store is not None:
+                    if persisted and result["error"] is None and reply["answer"]:
+                        preview_store.commit(username, preview_id, state.history)
+                    else:
+                        preview_store.discard_pending(username, preview_id)
+                return persisted
+            if start_lock is None:
+                persisted = finish()
+            else:
+                with start_lock:
+                    persisted = finish()
             payload = _done_payload(runtime, reply, result, turn)
             if not persisted:
                 # 期间被清空：会话累计改按清空后的状态显示，不回填旧上下文
@@ -1100,9 +1146,16 @@ def chat_event_stream(
             payload.update(turn_speed_fields(reply, t0, t_first, t_final))
             yield _sse("done", payload)
             return
+    except TurnAborted:
+        # 消费端已中止（停止/断连）：立即退出。核心生成器链的 finally 已
+        # 取消上游；此处 finally 释放 busy 与图片状态，不作为模型错误
+        return
     finally:
         # 写回核心给出的图片状态（被拒、断连、异常路径同样适用）；
         # 期间被清空则 epoch 已变，写回自动放弃，临时文件由清空删除
+        if preview_id and preview_store is not None and start_lock is not None:
+            with start_lock:
+                preview_store.discard_pending(username, preview_id)
         if prepared is not None:
             registry.sync_image_state(
                 username, state, start_epoch, prepared["image_state"]
@@ -1116,23 +1169,261 @@ class ClosingStreamingResponse(StreamingResponse):
     Starlette 在正常完成或客户端断连取消时都会退出内部任务组并返回 __call__；
     在此 close 同步生成器，触发核心生成器链的 finally（关上游流、释放 busy），
     不依赖垃圾回收。close 可能在工作线程执行，异常不外泄。
+
+    abort 为可选中止句柄，解决"断连感知要等下一次 send"的问题：
+    - 线程池拉取（anyio.to_thread.run_sync）默认 abandon_on_cancel=False，
+      任务组取消要等线程完成才送达——同步链阻塞在下一次拉取上时，取消会
+      拖到下一个心跳/分片（最长一个心跳间隔）；
+    - 因此包装 receive：http.disconnect 一出现就同步调用 abort()，哨兵
+      立即唤醒阻塞中的拉取侧，由其以 TurnAborted 退出并在 finally 内
+      取消上游、释放 busy；close 再兜底收尾（挂起中的生成器只有 close
+      能收尾，执行中的 close 抛 ValueError 由 except 吞掉）。
     """
 
-    def __init__(self, sync_generator, **kwargs):
+    def __init__(self, sync_generator, *, abort: Callable[[], None] | None = None, **kwargs):
         super().__init__(iterate_in_threadpool(sync_generator), **kwargs)
         self._sync_generator = sync_generator
+        self._abort = abort
 
     async def __call__(self, scope, receive, send):
+        if self._abort is not None:
+            base_receive = receive
+
+            async def receive_abort_on_disconnect():
+                message = await base_receive()
+                if message["type"] == "http.disconnect":
+                    self._abort()
+                return message
+
+            receive = receive_abort_on_disconnect
+
         try:
             await super().__call__(scope, receive, send)
+        except TurnAborted:
+            # 摘要等准备阶段的中止从拉取线程冒泡到响应任务：接收方已不存在
+            pass
         finally:
+            # 兜底：send 先于 receive 察觉断连（OSError）等路径同样中止；
+            # 屏蔽取消让 close 真正执行（断连后的已取消作用域内，
+            # 未屏蔽的 await 会直接抛 CancelledError 跳过 close）
+            if self._abort is not None:
+                try:
+                    self._abort()
+                except Exception:
+                    pass
             try:
-                await anyio.to_thread.run_sync(self._sync_generator.close)
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(self._sync_generator.close)
             except Exception:
                 pass
 
 
 # ===================== 应用工厂 =====================
+
+
+class ImagePreviews:
+    """Bounded per-chat preview copies; never reused as model input or persisted."""
+
+    MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp",
+            "BMP": "image/bmp", "GIF": "image/gif"}
+
+    def __init__(self, image_store):
+        self.image_store = image_store
+        self.items = {}
+        self.missing = set()
+        self.total = 0
+
+    def capture(self, username, image_id, entry):
+        path = self.image_store.resolve(username, image_id)
+        if path is None:
+            return None
+        try:
+            from PIL import Image
+            data = path.read_bytes()
+            with Image.open(io.BytesIO(data)) as image:
+                mime = self.MIME.get(image.format)
+            if mime is None:
+                return None
+        except (OSError, ValueError):
+            return None
+        entries = self.items.setdefault(username, {})
+        if len(entries) >= 10 or sum(len(v["data"]) for v in entries.values()) + len(data) > 20_000_000 or self.total + len(data) > 64_000_000:
+            self.missing.add(username)
+            return None
+        preview_id = secrets.token_urlsafe(16)
+        entries[preview_id] = {"data": data, "mime": mime,
+                               "entry": entry, "committed": False, "image_id": image_id}
+        self.total += len(data)
+        return preview_id
+
+    def clear(self, username):
+        self.missing.discard(username)
+        for item in self.items.pop(username, {}).values():
+            self.total -= len(item["data"])
+
+    def get(self, username, preview_id):
+        return self.items.get(username, {}).get(preview_id)
+
+    def commit(self, username, preview_id, history):
+        item = self.get(username, preview_id)
+        if item is not None and any(entry is item["entry"] for entry in history):
+            item["committed"] = True
+        else:
+            self.discard_pending(username, preview_id)
+
+    def discard_pending(self, username, preview_id):
+        entries = self.items.get(username, {})
+        item = entries.get(preview_id)
+        if item is not None and not item["committed"]:
+            self.total -= len(item["data"])
+            del entries[preview_id]
+
+    def history(self, username, history):
+        result = []
+        for preview_id, item in self.items.get(username, {}).items():
+            if item["committed"]:
+                for index, entry in enumerate(history):
+                    if entry is item["entry"]:
+                        result.append({"index": index, "id": preview_id})
+                        break
+        return result
+
+    def active(self, username, image_path):
+        if not image_path:
+            return None
+        for preview_id, item in reversed(list(self.items.get(username, {}).items())):
+            if str(self.image_store.resolve(username, item["image_id"])) == image_path:
+                return preview_id
+        return None
+
+
+class BackgroundGenerations:
+    """Account-scoped background workers with bounded, ephemeral SSE replay."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.items = {}
+        self.seen = {}
+        self.seen_at = {}
+
+    def _prune(self):
+        now = time.monotonic()
+        for key, timestamp in list(self.seen_at.items()):
+            if now - timestamp > 86400 and self.seen.get(key) is None:
+                self.seen.pop(key, None)
+                self.seen_at.pop(key, None)
+        for username, item in list(self.items.items()):
+            if item["finished"] and now - item.get("finished_at", now) > 300:
+                self.items.pop(username, None)
+                self.seen[(username, item["id"])] = None
+
+    def current(self, username):
+        self._prune()
+        item = self.items.get(username)
+        if item and not item["finished"]:
+            return {"id": item["id"], "history_length": item["history_length"]}
+        return None
+
+    def clear(self, username):
+        item = self.items.pop(username, None)
+        if item:
+            self.seen[(username, item["id"])] = None
+            item["abort"].abort()
+            with item["condition"]:
+                item["invalid"] = True
+                item["condition"].notify_all()
+
+    def start(self, username, generation_id, factory, abort, history_length):
+        if not generation_id or len(generation_id) > 100 or not all(c.isalnum() or c in "-_" for c in generation_id):
+            raise HTTPException(status_code=400, detail="无效的生成标识")
+        with self.lock:
+            self._prune()
+            key = (username, generation_id)
+            if key in self.seen:
+                previous = self.seen[key]
+                if previous is None:
+                    raise HTTPException(status_code=409, detail="生成记录已失效")
+                return self._response(previous)
+            if len(self.seen) >= 4096:
+                raise HTTPException(status_code=503, detail="生成记录已满，请稍后重试")
+            item = self.items.get(username)
+            if item is None and len(self.items) >= 8:
+                raise HTTPException(status_code=503, detail="生成服务繁忙，请稍后重试")
+            if item and not item["finished"]:
+                raise HTTPException(status_code=409, detail="上一条回答还在生成中")
+            item = {"id": generation_id, "abort": abort, "events": [], "size": 0,
+                    "finished": False, "invalid": False, "history_length": history_length, "condition": threading.Condition()}
+            if item:
+                self.seen[(username, item["id"])] = None
+            self.items[username] = item
+            self.seen[key] = item
+            self.seen_at[key] = time.monotonic()
+            threading.Thread(target=self._run, args=(item, factory), daemon=True).start()
+            return self._response(item)
+
+    def _run(self, item, factory):
+        terminal = False
+        try:
+            for event in factory():
+                with item["condition"]:
+                    if item["invalid"]:
+                        break
+                    if item["size"] + len(event) > 16_000_000:
+                        item["abort"].abort()
+                        item["events"].append(_sse("rejected", {"status": "limit", "message": "回答过长，已停止生成。"}))
+                        terminal = True
+                        break
+                    item["events"].append(event)
+                    item["size"] += len(event)
+                    terminal = event.startswith("event: done\n") or event.startswith("event: rejected\n")
+                    item["condition"].notify_all()
+        except Exception:
+            pass
+        finally:
+            with item["condition"]:
+                if not terminal and not item["invalid"]:
+                    item["events"].append(_sse("rejected", {"status": "stopped", "message": "生成已停止或未能完成。"}))
+                item["finished_at"] = time.monotonic()
+                item["finished"] = True
+                item["condition"].notify_all()
+
+    def operation(self, username, generation_id, action):
+        if not generation_id or len(generation_id) > 100 or not all(c.isalnum() or c in "-_" for c in generation_id):
+            raise HTTPException(status_code=400, detail="无效的生成标识")
+        with self.lock:
+            self._prune()
+            item = self.items.get(username)
+            if item is None or item["id"] != generation_id:
+                if action == "stop" and generation_id and (username, generation_id) not in self.seen:
+                    if len(self.seen) >= 4096:
+                        raise HTTPException(status_code=503, detail="生成记录已满")
+                    self.seen[(username, generation_id)] = None
+                    self.seen_at[(username, generation_id)] = time.monotonic()
+                    return {"ok": True}
+                raise HTTPException(status_code=404, detail="生成记录不存在")
+            if action == "stop":
+                item["abort"].abort()
+                return {"ok": True}
+            return self._response(item)
+
+    def _response(self, item):
+        def stream():
+            index = 0
+            while True:
+                with item["condition"]:
+                    if index >= len(item["events"]) and not item["finished"] and not item["invalid"]:
+                        item["condition"].wait(timeout=10)
+                    if item["invalid"]:
+                        return
+                    if index >= len(item["events"]):
+                        if item["finished"]:
+                            return
+                        event = ": ping\n\n"
+                    else:
+                        event = item["events"][index]
+                        index += 1
+                yield event
+        return ClosingStreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def create_api_app(
@@ -1144,13 +1435,22 @@ def create_api_app(
     frontend_dir: Path | None = "default",
 ) -> FastAPI:
     """组装 FastAPI 应用；会话与状态对象可注入，便于测试隔离。"""
-    app = FastAPI(title="数学学习 AI 助手 API", docs_url=None, redoc_url=None)
+    # 文档与接口清单均不提供：docs/redoc 已关闭，openapi.json 同样不挂载，
+    # 公网经隧道访问时不会暴露路由结构（应用层兜底，与 WAF 规则互补）
+    app = FastAPI(
+        title="数学学习 AI 助手 API",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.runtime = runtime
     app.state.sessions = sessions if sessions is not None else SessionStore()
     if image_store is None:
         image_store = TempImageStore(Path(runtime.data_dir) / "temp_images")
     app.state.image_store = image_store
     app.state.registry = registry if registry is not None else ChatRegistry(image_store)
+    app.state.generations = BackgroundGenerations()
+    app.state.previews = ImagePreviews(image_store)
     try:
         image_store.cleanup_expired()
     except Exception:
@@ -1170,6 +1470,7 @@ def create_api_app(
             samesite="lax",
             max_age=SESSION_TTL_SECONDS,
             path="/",
+            secure=_request_is_https(request),
         )
         account = next(
             (a for a in runtime.accounts if a["username"] == username), None
@@ -1184,7 +1485,10 @@ def create_api_app(
     @app.post("/api/logout", dependencies=[Depends(_same_origin)])
     def logout(request: Request, response: Response):
         app.state.sessions.drop(_session_cookie(request))
-        response.delete_cookie(SESSION_COOKIE, path="/")
+        # 与下发时的 Secure 保持同一口径，避免跨 HTTP/HTTPS 场景删不掉会话
+        response.delete_cookie(
+            SESSION_COOKIE, path="/", secure=_request_is_https(request)
+        )
         return {"ok": True}
 
     @app.get("/api/me")
@@ -1201,14 +1505,37 @@ def create_api_app(
         }
 
     @app.get("/api/history")
-    def history(username: str = Depends(_current_user)):
-        state = app.state.registry.get_state(runtime, username)
-        return {"history": state.history, "notice": state.load_error or ""}
+    def history(preview_id: str | None = None, username: str = Depends(_current_user)):
+        with app.state.generations.lock:
+            if preview_id is not None:
+                preview = app.state.previews.get(username, preview_id)
+                if preview is None:
+                    raise HTTPException(status_code=404, detail="图片预览不存在")
+                return Response(content=preview["data"], media_type=preview["mime"],
+                                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+            state = app.state.registry.get_state(runtime, username)
+            generation = app.state.generations.current(username)
+            result = {"history": list(state.history), "notice": state.load_error or ""}
+            previews = app.state.previews.history(username, result["history"])
+            if previews:
+                result["image_previews"] = previews
+            if username in app.state.previews.missing:
+                result["image_preview_missing"] = True
+            active_preview = app.state.previews.active(username, state.image_state.get("path"))
+            if active_preview:
+                result["active_preview_id"] = active_preview
+        if generation is not None:
+            result["generation"] = generation
+        return result
 
     @app.post("/api/clear", dependencies=[Depends(_same_origin)])
     def clear(username: str = Depends(_current_user)):
         # clear_account：同一锁内先磁盘后内存，旧轮次无法取混合状态
-        ok = app.state.registry.clear_account(runtime, username)
+        with app.state.generations.lock:
+            ok = app.state.registry.clear_account(runtime, username)
+            if ok:
+                app.state.generations.clear(username)
+                app.state.previews.clear(username)
         if not ok:
             return {"ok": False, "message": "⚠️ 清空未成功，请稍后重试。"}
         return {"ok": True, "message": "🗑️ 已开启新对话。"}
@@ -1310,6 +1637,10 @@ def create_api_app(
         request: Request,
         username: str = Depends(_current_user),
     ):
+        if body.action in ("attach", "stop"):
+            return app.state.generations.operation(username, body.generation_id, body.action)
+        if body.action != "create":
+            raise HTTPException(status_code=400, detail="不支持的操作")
         if body.mode not in MODES:
             raise HTTPException(status_code=400, detail="不支持的模式")
         image_id = None
@@ -1323,6 +1654,11 @@ def create_api_app(
             image_id = body.image_id
         resolved = _resolve_turn_settings(app.state.runtime, username, body)
         ip = (request.client.host if request.client else None) or "unknown"
+        turn_abort = TurnAbort()
+        if body.background:
+            return app.state.generations.start(username, body.generation_id, lambda: chat_event_stream(
+                app.state.runtime, app.state.registry, username, body, ip, resolved,
+                image_id=image_id, turn_abort=turn_abort, start_lock=app.state.generations.lock, preview_store=app.state.previews), turn_abort, len(app.state.registry.get_state(runtime, username).history))
         return ClosingStreamingResponse(
             chat_event_stream(
                 app.state.runtime,
@@ -1332,12 +1668,14 @@ def create_api_app(
                 ip,
                 resolved,
                 image_id=image_id,
+                turn_abort=turn_abort,
             ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
+            abort=turn_abort.abort,
         )
 
     @app.post("/api/continue", dependencies=[Depends(_same_origin)])
@@ -1351,6 +1689,11 @@ def create_api_app(
             raise HTTPException(status_code=400, detail="不支持的模式")
         resolved = _resolve_turn_settings(app.state.runtime, username, body)
         ip = (request.client.host if request.client else None) or "unknown"
+        turn_abort = TurnAbort()
+        if body.background:
+            return app.state.generations.start(username, body.generation_id, lambda: chat_event_stream(
+                app.state.runtime, app.state.registry, username, body, ip, resolved,
+                force_continue=True, turn_abort=turn_abort, start_lock=app.state.generations.lock), turn_abort, len(app.state.registry.get_state(runtime, username).history))
         return ClosingStreamingResponse(
             chat_event_stream(
                 app.state.runtime,
@@ -1360,12 +1703,14 @@ def create_api_app(
                 ip,
                 resolved,
                 force_continue=True,
+                turn_abort=turn_abort,
             ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
+            abort=turn_abort.abort,
         )
 
     # ===================== 管理员接口（仅本机直连的已登录用户） =====================
@@ -1434,6 +1779,16 @@ def create_api_app(
         rt.accounts = load_accounts(rt.accounts_path)
         rt.event_logger.log_access_event("重置密码", f"账号={account_name}")
         return {"ok": True, "username": account_name}
+
+    @app.middleware("http")
+    async def no_cache_for_spa_shell(request: Request, call_next):
+        response = await call_next(request)
+        # SPA 外壳（HTML 文档）禁浏览器启发式缓存：StaticFiles 不带 Cache-Control，
+        # 重建后浏览器可能仍用旧外壳引用已删除的旧 bundle → 远程刷新白屏。
+        # 只标记 HTML 文档；哈希命名的 /assets/* 保持可缓存，SSE/JSON 响应不受影响。
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["cache-control"] = "no-cache"
+        return response
 
     if frontend_dir == "default":
         frontend_dir = FRONTEND_DIST

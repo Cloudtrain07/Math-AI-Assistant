@@ -8,6 +8,7 @@
 
 import copy
 import json
+import os
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -61,6 +62,21 @@ def pytest_configure(config):
     # 兜底：防止系统环境变量里的真实 Key 进入测试进程
     patch.setenv("DEEPSEEK_API_KEY", "")
     patch.setenv("OPENAI_API_KEY", "")
+
+    # 隔离测试进程内显式直连：清掉代理环境变量并令回环地址不走代理，
+    # 避免系统代理劫持 浏览器/API 客户端→uvicorn、MAA→假上游 两段的
+    # 127.0.0.1 / localhost / ::1 请求。只改本测试进程，不动系统代理设置。
+    for _proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        os.environ.pop(_proxy_var, None)
+    patch.setenv("NO_PROXY", "127.0.0.1,localhost,::1")
+    patch.setenv("no_proxy", "127.0.0.1,localhost,::1")
 
 
 # API 测试专用：固定双账号，不依赖共享 accounts.json 里实际生成了几个账号

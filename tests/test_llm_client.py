@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from core import llm_client as llm_module
 from core.chat_service import stream_reply
@@ -69,6 +69,13 @@ def _install_capture_sdk(
         base_url="https://example.invalid/v1",
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
+    # 非流式补全（complete）已改走 AsyncOpenAI：同一捕获 handler 配异步客户端，
+    # 请求序列化路径与断言口径保持一致
+    real_async_sdk = AsyncOpenAI(
+        api_key="fake-key",
+        base_url="https://example.invalid/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
     if create_kwargs_out is not None:
         completions_cls = type(real_sdk.chat.completions)
         original_create = completions_cls.create
@@ -79,6 +86,7 @@ def _install_capture_sdk(
 
         monkeypatch.setattr(completions_cls, "create", spy_create)
     monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: real_sdk)
+    monkeypatch.setattr(llm_module, "AsyncOpenAI", lambda **kwargs: real_async_sdk)
 
 
 def _make_client(

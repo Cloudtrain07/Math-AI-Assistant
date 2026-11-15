@@ -39,10 +39,13 @@ class HistoryCompressor:
         history: list[dict],
         window_size: int,
         client,
+        turn_abort=None,
     ) -> str:
         """返回该账号当前应注入的压缩摘要；没有可压缩内容时返回空串。
 
         history 应为已经包含本轮用户消息的完整消息列表。
+        turn_abort 为消费端中止句柄：用户停止/断连时取消在途摘要请求，
+        摘要失败照常回退本地摘要。
         """
         if not history or window_size <= 0:
             return ""
@@ -54,7 +57,7 @@ class HistoryCompressor:
 
         # 在锁外调用模型，避免长压缩阻塞其他账号的摘要读取
         new_messages = history[state["count"]:old_count]
-        summary = self._summarize(client, state["summary"], new_messages)
+        summary = self._summarize(client, state["summary"], new_messages, turn_abort)
         if not summary:
             summary = self._fallback_summary(new_messages)
 
@@ -65,9 +68,14 @@ class HistoryCompressor:
                 self._states[username] = {"summary": summary, "count": old_count}
         return summary
 
-    def _summarize(self, client, existing_summary: str, messages: list[dict]) -> str:
+    def _summarize(
+        self, client, existing_summary: str, messages: list[dict], turn_abort=None
+    ) -> str:
         complete_fn = getattr(client, "complete", None)
         if complete_fn is None:
+            return ""
+        # 消费端已中止（停止/断连）：不再发出摘要请求
+        if turn_abort is not None and turn_abort.event.is_set():
             return ""
         parts = []
         if existing_summary:
@@ -78,14 +86,17 @@ class HistoryCompressor:
                 role = "用户" if msg.get("role") == "user" else "助手"
                 content = str(msg.get("content") or "")[:800]
                 parts.append(f"{role}：{content}")
+        complete_kwargs: dict = {"thinking": False, "max_tokens": 600}
+        # 中止句柄仅注入声明支持的客户端（假实现等其余实现不受影响）
+        if turn_abort is not None and getattr(client, "supports_turn_abort", False):
+            complete_kwargs["abort"] = turn_abort
         try:
             text = complete_fn(
                 [
                     {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
                     {"role": "user", "content": "\n\n".join(parts)},
                 ],
-                thinking=False,
-                max_tokens=600,
+                **complete_kwargs,
             )
         except Exception:
             return ""

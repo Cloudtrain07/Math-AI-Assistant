@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { adminResetPassword, continueChat, fetchAdminStats, streamChat, uploadImage } from './api'
+import {
+  adminResetPassword,
+  continueChat,
+  fetchAdminStats,
+  fetchHistory,
+  streamChat,
+  uploadImage,
+} from './api'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -158,5 +165,42 @@ describe('聊天/继续生成的 HTTP 400 提示', () => {
       vi.fn(async () => new Response('未登录', { status: 401 })),
     )
     await expect(streamChat('1+1=?', settings, {})).rejects.toThrow('登录已过期，请重新登录')
+  })
+})
+
+describe('fetchHistory（刷新恢复的契约）', () => {
+  it('200 时原样返回服务端历史与通知', async () => {
+    const payload = {
+      history: [
+        { role: 'user', content: '第一轮问题' },
+        { role: 'assistant', content: '（假模型 · 第 1 轮）' },
+      ],
+      notice: '',
+    }
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify(payload), { status: 200 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(fetchHistory()).resolves.toEqual(payload)
+    expect(fetchMock).toHaveBeenCalledWith('/api/history')
+  })
+
+  it('非 2xx 时必须抛错而不是静默降级为空历史（防「界面空对话、模型旧上下文」）', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('读取失败', { status: 500 })),
+    )
+    await expect(fetchHistory()).rejects.toThrow('读取聊天记录失败（HTTP 500）')
+  })
+
+  it('网络层失败（fetch 直接 reject）同样向上抛出', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('Failed to fetch')
+      }),
+    )
+    await expect(fetchHistory()).rejects.toThrow('Failed to fetch')
   })
 })

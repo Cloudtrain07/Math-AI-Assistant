@@ -4,6 +4,9 @@ import StreamMessage from './components/StreamMessage.vue'
 import ImageEditorDialog from './components/ImageEditorDialog.vue'
 import AdminPanel from './components/AdminPanel.vue'
 import {
+  TurnHttpError,
+  attachGeneration,
+  stopGeneration,
   clearConversation,
   continueChat,
   fetchHistory,
@@ -18,6 +21,7 @@ import {
   type TurnSettings,
   type UserInfo,
 } from './api'
+import { blockSendWhileHistoryBusy, HISTORY_LOAD_ERROR_TEXT } from './historyGate'
 import {
   isOverSize,
   isSupportedImageFile,
@@ -33,6 +37,7 @@ import { OUTPUT_TOKENS_BOUNDS, WAIT_SECONDS_BOUNDS, parseWebLimit } from './webL
 import { modelThinking, providerView, syncEffort } from './settings'
 import { copyText } from './clipboard'
 import { formatAvgSpeed } from './speed'
+import { browserStorage, selectedProvider, saveProvider } from './providerPreference'
 
 interface ChatEntry {
   role: 'user' | 'assistant'
@@ -78,6 +83,14 @@ const liveTokens = ref<number | null>(null)
 const activeAssistant = ref<ChatEntry | null>(null)
 let firstDeltaAt: number | null = null
 const restoreNotice = ref('')
+/** 历史恢复状态门禁：加载中/读取失败时锁定发送，防止界面与模型上下文分叉 */
+const historyLoading = ref(false)
+const historyError = ref('')
+/** 恢复结果的代次：清空/登出后递增，过期恢复结果直接丢弃（不覆盖最新状态） */
+let restoreEpoch = 0
+const historyBusy = computed(() =>
+  blockSendWhileHistoryBusy(historyLoading.value, historyError.value),
+)
 const mode = ref('互动模式')
 const clearArmed = ref(false)
 let clearTimer: ReturnType<typeof setTimeout> | null = null
@@ -90,6 +103,7 @@ function setStatus(text: string, kind: StatusKind = 'info') {
 
 // ---- 待发送图片：选择/粘贴 → 编辑确认 → 缩略图 → 点击发送才上传 ----
 const pendingImage = ref<PendingImage | null>(null)
+let imageRestoreSerial = 0
 const editorOpen = ref(false)
 const editorSource = ref<EditorSource | null>(null)
 const editorParams = ref<EditParams | null>(null)
@@ -108,6 +122,7 @@ function autosizeComposer() {
 watch(input, () => void nextTick(autosizeComposer))
 
 function discardPendingImage() {
+  imageRestoreSerial++
   if (pendingImage.value) {
     URL.revokeObjectURL(pendingImage.value.editedUrl)
     pendingImage.value = null
@@ -127,8 +142,30 @@ function createSentImageUrl(): string | undefined {
 /** 释放所有已发送消息持有的图片地址（messages 即将被整体替换或组件销毁时） */
 function releaseMessageImages() {
   for (const m of messages.value) {
-    if (m.imageUrl) URL.revokeObjectURL(m.imageUrl)
+    if (m.imageUrl?.startsWith('blob:')) URL.revokeObjectURL(m.imageUrl)
   }
+}
+
+function previewUrl(id: string): string {
+  return `/api/history?preview_id=${encodeURIComponent(id)}`
+}
+
+async function restoreActiveImage(id: string, epoch: number) {
+  const serial = imageRestoreSerial
+  try {
+    const response = await fetch(previewUrl(id), { cache: 'no-store' })
+    if (!response.ok) return
+    const blob = await response.blob()
+    const bitmap = await decodeImage(blob)
+    const width = bitmap.width, height = bitmap.height
+    bitmap.close()
+    if (epoch !== restoreEpoch || serial !== imageRestoreSerial || pendingImage.value) return
+    pendingImage.value = {
+      source: { blob, name: 'restored-image' }, editedBlob: blob,
+      editedUrl: URL.createObjectURL(blob), editedWidth: width, editedHeight: height,
+      params: { rotate: 0, crop: null }, sent: true,
+    }
+  } catch { /* A missing preview must not prevent history restoration. */ }
 }
 
 function openFilePicker() {
@@ -243,7 +280,11 @@ const modes = computed(() => settings.value?.modes ?? ['互动模式', '解答�
 
 // 切换服务商：模型列表与选中值同步为新服务商配置，避免残留无效模型
 watch(providerId, () => {
-  model.value = providerView(settings.value?.providers ?? [], providerId.value).model
+  const providers = settings.value?.providers ?? []
+  model.value = providerView(providers, providerId.value).model
+  if (me.value && providerId.value && providers.some(p => p.id === providerId.value)) {
+    saveProvider(browserStorage(), me.value.username, providerId.value)
+  }
 })
 
 // 切换服务商或模型后同步思考强度：合法值保留，非法值换成新模型的默认档位，
@@ -285,10 +326,22 @@ let stickToBottom = true
 const showJump = ref(false)
 
 let controller: AbortController | null = null
+let generationId: string | null = null
+let stopRequested = false
+let reconnectRequested = false
+function resumeVisible() {
+  if (!document.hidden && generationId && controller) {
+    reconnectRequested = true
+    controller.abort()
+  }
+}
 let elapsedTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
   window.addEventListener('paste', onPaste)
+  document.addEventListener('visibilitychange', resumeVisible)
+  window.addEventListener('pageshow', resumeVisible)
+  window.addEventListener('online', resumeVisible)
   await nextTick(autosizeComposer)
   me.value = await fetchMe()
   authChecked.value = true
@@ -300,37 +353,80 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (elapsedTimer !== null) clearInterval(elapsedTimer)
   window.removeEventListener('paste', onPaste)
+  document.removeEventListener('visibilitychange', resumeVisible)
+  window.removeEventListener('pageshow', resumeVisible)
+  window.removeEventListener('online', resumeVisible)
+  reconnectRequested = false
+  controller?.abort()
   headerResize?.disconnect()
   headerResize = null
   releaseMessageImages()
 })
 
 async function loadSettings() {
-  settings.value = await fetchSettings()
+  const username = me.value?.username
+  const epoch = restoreEpoch
+  const loaded = await fetchSettings()
+  if (!username || username !== me.value?.username || epoch !== restoreEpoch) return
+  settings.value = loaded
   const s = settings.value
   if (!s) return
   level.value = s.default_level
   mode.value = s.default_mode
-  providerId.value = s.default_provider
-  model.value = providerView(s.providers, s.default_provider).model
+  const selected = selectedProvider(browserStorage(), me.value?.username ?? '', s.providers, s.default_provider)
+  providerId.value = selected
+  model.value = providerView(s.providers, selected).model
   thinking.value = s.default_thinking
   effort.value = s.default_reasoning_effort
   answerStyle.value = s.default_answer_style
 }
 
-async function restoreHistory() {
-  releaseMessageImages()
-  const data = await fetchHistory()
-  messages.value = data.history.map((m) => ({
-    role: m.role,
-    content: m.content,
-    reasoning: '',
-    done: true,
-  }))
-  restoreNotice.value = data.notice
-  followLatest()
-  await nextTick()
-  scrollToBottom()
+async function restoreHistory(resumeCurrent = true) {
+  const epoch = restoreEpoch
+  historyLoading.value = true
+  historyError.value = ''
+  try {
+    releaseMessageImages()
+    const data = await fetchHistory()
+    // 恢复期间发生清空/登出（restoreEpoch 递增）时，过期结果不得覆盖最新状态
+    if (epoch !== restoreEpoch) return
+    messages.value = (resumeCurrent && data.generation ? data.history.slice(0, data.generation.history_length) : data.history).map((m) => ({
+      role: m.role,
+      content: m.content,
+      reasoning: '',
+      done: true,
+    }))
+    for (const preview of data.image_previews ?? []) {
+      const entry = messages.value[preview.index]
+      if (entry?.role === 'user') entry.imageUrl = previewUrl(preview.id)
+    }
+    if (data.active_preview_id && !pendingImage.value) {
+      void restoreActiveImage(data.active_preview_id, epoch)
+    }
+    restoreNotice.value = data.notice
+    if (data.notice) setStatus(data.notice, 'error')
+    else if (data.image_preview_missing) setStatus('部分图片预览超过本次对话容量限制，刷新后无法显示。', 'warn')
+    followLatest()
+    await nextTick()
+    scrollToBottom()
+    if (data.generation && epoch === restoreEpoch) {
+      if (resumeCurrent) {
+        historyLoading.value = false
+        void runTurn('resume', '', data.generation.id)
+      } else {
+        setStatus('已有另一条回答正在生成，请刷新页面查看进度。', 'warn')
+      }
+    }
+  } catch {
+    // 读取失败绝不能伪装成空的新对话：服务端历史仍在，此时发送会造成
+    // 「界面像新对话、模型带着旧上下文」的分歧——锁定发送直到恢复或显式清空
+    if (epoch !== restoreEpoch) return
+    messages.value = []
+    historyError.value = HISTORY_LOAD_ERROR_TEXT
+    followLatest()
+  } finally {
+    if (epoch === restoreEpoch) historyLoading.value = false
+  }
 }
 
 async function submitLogin() {
@@ -349,14 +445,18 @@ async function submitLogin() {
 }
 
 async function doLogout() {
-  stopStreaming()
+  reconnectRequested = false
+  controller?.abort()
   await apiLogout()
+  restoreEpoch++
   me.value = null
   releaseMessageImages()
   messages.value = []
   setStatus('')
   usageText.value = ''
   input.value = ''
+  historyError.value = ''
+  historyLoading.value = false
   discardPendingImage()
   // 会话整体没了：重置跟随与「回到底部」状态，重新登录后不带残留
   followLatest()
@@ -476,7 +576,12 @@ function stopElapsedTimer() {
 }
 
 function stopStreaming() {
-  if (controller !== null) controller.abort()
+  stopRequested = true
+  if (generationId) {
+    void stopGeneration(generationId).catch(() => setStatus('停止请求失败，请重试。', 'error'))
+  } else {
+    controller?.abort()
+  }
 }
 
 async function onCopy(msg: ChatEntry, text: string) {
@@ -529,12 +634,13 @@ function currentTurnSettings(limits: ResolvedWebLimits): TurnSettings {
   }
 }
 
-async function runTurn(kind: 'chat' | 'continue', text = '') {
-  if (sending.value) return
+async function runTurn(kind: 'chat' | 'continue' | 'resume', text = '', resumeId = '') {
+  // 历史恢复完成前（或读取失败未处理时）禁止发送：此时界面与服务端历史不一致
+  if (sending.value || historyBusy.value) return
   const pendingUnsent = kind === 'chat' && pendingImage.value && !pendingImage.value.sent
   if (kind === 'chat' && !text && !pendingUnsent) return
   // 请求开始前验证覆盖值：无效时不进入发送流程、不清空输入草稿
-  const limits = resolveWebLimits()
+  const limits = kind === 'resume' ? { maxOutputTokens: null, maxWaitSeconds: null } : resolveWebLimits()
   if ('error' in limits) {
     setStatus(limits.error, 'error')
     return
@@ -568,6 +674,9 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   followLatest()
   startElapsedTimer()
   controller = new AbortController()
+  generationId = null
+  stopRequested = false
+  reconnectRequested = false
 
   // 图片在点击发送后才上传：选择、编辑、预览阶段不发生任何网络传输；
   // 上传阶段可停止（中止后不发聊天请求），失败保留待发送图片供重试
@@ -596,6 +705,7 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
   }
 
   const requestSettings = currentTurnSettings(limits)
+  generationId = resumeId || Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('')
   const onDelta = (d: { answer: string; reasoning: string }) => {
     if (firstDeltaAt === null && (d.answer || d.reasoning)) {
       firstDeltaAt = performance.now()
@@ -605,30 +715,67 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
     void nextTick(scrollToBottom)
   }
 
+  let reconcileHistory = false
+  let previewUnavailable = false
   try {
-    const result =
-      kind === 'chat'
-        ? await streamChat(text, requestSettings, {
-            signal: controller.signal,
-            imageId,
-            // 纯图片发送时文本为服务端默认题目提示，气泡同时展示所发图片
-            onStart: (payload) => showBubbles(text || payload.message, imageId ? createSentImageUrl() : undefined),
-            onDelta,
-            onUsage: (tokens) => { liveTokens.value = tokens },
-          })
-        : await continueChat(requestSettings, {
-            signal: controller.signal,
-            // 继续指令由服务端构造，start 事件带回原文仅供展示
-            onStart: (payload) => showBubbles(payload.message),
-            onDelta,
-            onUsage: (tokens) => { liveTokens.value = tokens },
-          })
+    const handlers = {
+      signal: controller.signal,
+      generationId,
+      imageId,
+      onStart: (payload: { message: string; preview_id?: string; preview_unavailable?: boolean }) => {
+        if (!assistantShown) showBubbles(kind === 'chat' ? (text || payload.message) : payload.message, imageId ? createSentImageUrl() : (payload.preview_id ? previewUrl(payload.preview_id) : undefined))
+        else { assistant.content = ''; assistant.reasoning = '' }
+        if (kind === 'resume' && payload.preview_id && !pendingImage.value) void restoreActiveImage(payload.preview_id, restoreEpoch)
+        if (payload.preview_unavailable) {
+          previewUnavailable = true
+          setStatus('图片预览未能保留，刷新后无法恢复这张图片。', 'warn')
+        }
+      },
+      onDelta,
+      onUsage: (tokens: number) => { liveTokens.value = tokens },
+    }
+    let result
+    try {
+      result = kind === 'chat' ? await streamChat(text, requestSettings, handlers)
+        : kind === 'continue' ? await continueChat(requestSettings, handlers)
+        : await attachGeneration(generationId, handlers)
+    } catch (err) {
+      if (err instanceof TurnHttpError) throw err
+      if (controller.signal.aborted) {
+        if (!reconnectRequested) throw err
+        reconnectRequested = false
+        controller = new AbortController()
+        handlers.signal = controller.signal
+      }
+      // A lost response can follow an accepted start. Keep trying the same id.
+      for (;;) {
+        if (controller.signal.aborted) throw err
+        try {
+          if (stopRequested) await stopGeneration(generationId)
+          result = await attachGeneration(generationId, handlers)
+          break
+        } catch (retryError) {
+          if (controller.signal.aborted) {
+            if (!reconnectRequested) throw retryError
+            reconnectRequested = false
+            controller = new AbortController()
+            handlers.signal = controller.signal
+          }
+          if (retryError instanceof TurnHttpError) throw retryError
+          setStatus('连接中断，正在尝试恢复回答…', 'warn')
+          await new Promise(resolve => setTimeout(resolve, 2000))
+        }
+      }
+    }
     if (result.kind === 'rejected') {
       // 被拒：移除占位的助手气泡（如有），保留提示文字；待发送图片保留供重试
-      if (assistantShown) {
+      if (assistantShown && !stopRequested) {
         messages.value.splice(messages.value.indexOf(assistant), 1)
+      } else if (assistantShown) {
+        assistant.done = true
+        if (assistant.content || assistant.reasoning) assistant.speedSummary = `未完成 · ${liveSummary(assistant)}`
       }
-      setStatus(result.payload.message, 'info')
+      setStatus(result.payload.message, stopRequested ? 'stopped' : 'info')
     } else {
       const d = result.payload
       assistant.content = d.answer
@@ -636,18 +783,21 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
       assistant.done = true
       assistant.speedSummary = (d.error ? '未完成 · ' : '') + (formatAvgSpeed(d) || (d.completion_tokens != null ? `输出${d.tok_s_estimated ? '约 ' : ' '}${d.completion_tokens} tokens` : ''))
       // done ≠ 全部成功：状态种类由结构化字段判定（模型错误/空回答/截断/保存失败/stale/用量失败）
-      setStatus(composeNotice(d), classifyDone(d))
+      setStatus([composeNotice(d), previewUnavailable ? '图片预览未能保留，刷新后无法恢复这张图片。' : ''].filter(Boolean).join('\n'), previewUnavailable && classifyDone(d) === 'success' ? 'warn' : classifyDone(d))
       usageText.value = [d.cumulative_usage, composeDaily(d)]
         .filter(Boolean)
         .join('\n')
       // 普通发送后按核心的图片状态同步缩略图：保留（标记已发送）或被消费/丢弃
-      if (kind === 'chat' && pendingImage.value) {
-        if (d.image_kept) pendingImage.value.sent = true
-        else discardPendingImage()
+      if (kind === 'chat' || kind === 'resume') {
+        if (!d.image_kept) discardPendingImage()
+        else if (pendingImage.value) pendingImage.value.sent = true
       }
       await nextTick(scrollToBottom)
     }
   } catch (err) {
+    if (err instanceof TurnHttpError && err.status === 404) {
+      reconcileHistory = true
+    }
     if (assistant.content || assistant.reasoning) assistant.speedSummary = `未完成 · ${liveSummary(assistant)}`
     assistant.done = true
     if (controller?.signal.aborted) {
@@ -662,8 +812,12 @@ async function runTurn(kind: 'chat' | 'continue', text = '') {
     sending.value = false
     activeAssistant.value = null
     controller = null
+    generationId = null
     // 收尾时状态行/用量行会改变内容高度：布局完成后再核对一次按钮显隐
     void nextTick(refreshJumpState)
+  }
+  if (reconcileHistory && me.value) {
+    await restoreHistory(false)
   }
 }
 
@@ -698,6 +852,9 @@ async function onClearClick() {
   }
   if (clearTimer !== null) clearTimeout(clearTimer)
   clearArmed.value = false
+  // 显式清空是唯一允许覆盖恢复结果的操作：递增代次丢弃在途恢复，
+  // 并解除读取失败门禁（服务端历史已清空，界面与上下文重新一致）
+  restoreEpoch++
   const result = await clearConversation()
   if (result.ok) {
     releaseMessageImages()
@@ -705,6 +862,8 @@ async function onClearClick() {
     setStatus(result.message, 'success')
     usageText.value = ''
     restoreNotice.value = ''
+    historyError.value = ''
+    historyLoading.value = false
     discardPendingImage()
     // 内容清空后没有「上方」可读：按钮状态与跟随一起归零
     followLatest()
@@ -761,7 +920,7 @@ async function onClearClick() {
             <option v-for="m in modes" :key="m" :value="m">{{ m }}</option>
           </select>
           <div class="user-actions">
-            <button class="btn ghost" :class="{ armed: clearArmed }" :disabled="sending" @click="onClearClick">
+            <button class="btn ghost" :class="{ armed: clearArmed }" :disabled="sending || historyLoading" @click="onClearClick">
               <svg viewBox="0 0 20 20" aria-hidden="true">
                 <circle cx="10" cy="10" r="7.2" />
                 <path d="M10 6.6v6.8M6.6 10h6.8" />
@@ -769,7 +928,7 @@ async function onClearClick() {
               {{ clearArmed ? '再点一次确认清空' : '新对话' }}
             </button>
             <!-- 手机端：继续生成移到页头与「新对话」并排（桌面端此按钮隐藏，用输入区的同名按钮） -->
-            <button class="btn ghost continue-top" :disabled="sending" @click="continueTurn">
+            <button class="btn ghost continue-top" :disabled="sending || historyBusy" @click="continueTurn">
               <svg viewBox="0 0 20 20" aria-hidden="true">
                 <path d="M7.5 5.5l7 4.5-7 4.5z" />
               </svg>
@@ -888,7 +1047,18 @@ async function onClearClick() {
       <AdminPanel v-if="me.local_admin" />
 
       <main class="chat">
-        <div v-if="messages.length === 0" class="placeholder">
+        <div v-if="historyLoading" class="placeholder">
+          <span class="mark" aria-hidden="true">∑</span>
+          <p>正在加载对话…</p>
+        </div>
+        <div v-else-if="historyError" class="placeholder">
+          <span class="mark" aria-hidden="true">∑</span>
+          <p role="alert">{{ historyError }}</p>
+          <button class="btn" type="button" :disabled="historyLoading" @click="restoreHistory()">
+            重试加载对话
+          </button>
+        </div>
+        <div v-else-if="messages.length === 0" class="placeholder">
           <span class="mark" aria-hidden="true">∑</span>
           <p>输入数学问题开始提问。</p>
         </div>
@@ -1022,7 +1192,7 @@ async function onClearClick() {
         <button
           v-if="!sending"
           class="btn ghost continue"
-          :disabled="sending"
+          :disabled="sending || historyBusy"
           @click="continueTurn"
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -1039,7 +1209,7 @@ async function onClearClick() {
         <button
           v-else
           class="btn primary send"
-          :disabled="!input.trim() && !(pendingImage && !pendingImage.sent)"
+          :disabled="historyBusy || (!input.trim() && !(pendingImage && !pendingImage.sent))"
           @click="send"
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">

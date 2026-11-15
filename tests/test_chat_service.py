@@ -100,7 +100,7 @@ def test_prepare_api_messages_with_compression():
     )
 
     compressor.get_summary.assert_called_once_with(
-        "tester", history, 2, active_client
+        "tester", history, 2, active_client, None
     )
     assert any(
         message["role"] == "system"

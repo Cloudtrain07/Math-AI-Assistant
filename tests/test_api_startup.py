@@ -1178,3 +1178,39 @@ def test_ipv4_wildcard_still_publishes_ipv4_lan_address(tmp_path, env):
     assert entries["局域网地址"] == f"http://{FAKE_LAN_IP}:{PORT}"
     assert FAKE_LAN_IP in support.address_file.read_text(encoding="utf-8")
     assert env.lan_ipv6_probes == 0
+
+
+def test_spa_shell_no_cache_but_hashed_assets_stay_cacheable(api_runtime, tmp_path):
+    """远程白屏修复：HTML 外壳带 Cache-Control: no-cache。
+
+    StaticFiles 不发 Cache-Control，浏览器按启发式缓存旧外壳；前端重建后
+    旧外壳引用已删除的旧 bundle，远程刷新即白屏。外壳改为每次回源验证；
+    哈希命名的静态资源保持默认可缓存；API/JSON 响应不受影响。
+    """
+    frontend = tmp_path / "dist"
+    (frontend / "assets").mkdir(parents=True)
+    (frontend / "index.html").write_text(
+        "<!doctype html><title>t</title>"
+        '<script src="/assets/index-abc.js"></script>',
+        encoding="utf-8",
+    )
+    (frontend / "assets" / "index-abc.js").write_text(
+        "console.log(1)", encoding="utf-8"
+    )
+
+    app = api.create_api_app(api_runtime, frontend_dir=frontend)
+    client = TestClient(app, base_url="http://127.0.0.1:8000")
+
+    shell = client.get("/")
+    assert shell.status_code == 200
+    assert shell.headers["content-type"].startswith("text/html")
+    assert shell.headers["cache-control"] == "no-cache"
+
+    asset = client.get("/assets/index-abc.js")
+    assert asset.status_code == 200
+    assert "cache-control" not in asset.headers
+
+    api_resp = client.get("/api/me")
+    assert api_resp.status_code == 401
+    assert api_resp.headers["content-type"].startswith("application/json")
+    assert "cache-control" not in api_resp.headers

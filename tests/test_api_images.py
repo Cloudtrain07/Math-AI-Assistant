@@ -512,3 +512,68 @@ def test_upload_rejects_corrupt_pixel_data(env):
     resp = upload_image(tc, data, "corrupt.png")
     assert resp.status_code == 400
     assert "损坏或无法解码" in resp.json()["detail"]
+
+
+def test_background_previews_remain_separate_and_account_scoped(env):
+    tc, runtime, vision, store = env
+    images = [make_png(color=(255, 0, 0)), make_png(color=(0, 0, 255))]
+    ids = []
+    for number, image in enumerate(images):
+        image_id = upload_image(tc, image, "edited.png").json()["image_id"]
+        response = tc.post("/api/chat", json={"message": f"第{number}题", "image_id": image_id,
+                                                "background": True, "generation_id": f"preview-{number}"})
+        events = parse_sse(response.text)
+        start = next(data for name, data in events if name == "start")
+        ids.append(start["preview_id"])
+    history = tc.get("/api/history").json()
+    assert [x["id"] for x in history["image_previews"]] == ids
+    assert history["active_preview_id"] == ids[-1]
+    assert len(vision.calls) == 2
+    for preview_id, image in zip(ids, images):
+        response = tc.get("/api/history", params={"preview_id": preview_id})
+        assert response.content == image
+        assert response.headers["content-type"] == "image/png"
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+    other = TestClient(tc.app)
+    login(other, runtime.accounts[1])
+    assert other.get("/api/history", params={"preview_id": ids[0]}).status_code == 404
+    assert TestClient(tc.app).get("/api/history", params={"preview_id": ids[0]}).status_code == 401
+    assert tc.post("/api/clear").json()["ok"]
+    assert tc.get("/api/history", params={"preview_id": ids[0]}).status_code == 404
+
+
+def test_plain_background_turn_has_no_preview_metadata(env):
+    tc, _, _, _ = env
+    response = tc.post("/api/chat", json={"message": "文字", "background": True, "generation_id": "plain"})
+    start = next(data for name, data in parse_sse(response.text) if name == "start")
+    assert "preview_id" not in start
+    assert "image_previews" not in tc.get("/api/history").json()
+
+
+def test_preview_tracks_committed_message_not_raw_text_or_failed_duplicate(env):
+    tc, runtime, _, _ = env
+    class FailedVision(VisionFakeClient):
+        def chat_stream_with_usage(self, *args, **kwargs):
+            raise RuntimeError("upstream failure")
+            yield
+    runtime.client = FailedVision()
+    question = r"求 \(x+1\)"
+    first = upload_image(tc, make_png(color=(255, 0, 0)), "red.png").json()["image_id"]
+    failed = tc.post("/api/chat", json={"message": question, "image_id": first, "background": True, "generation_id": "bad"})
+    failed_events = parse_sse(failed.text)
+    failed_id = next(data["preview_id"] for name, data in failed_events if name == "start")
+    assert tc.get("/api/history", params={"preview_id": failed_id}).status_code == 404
+    assert "image_previews" not in tc.get("/api/history").json()
+    runtime.client = VisionFakeClient()
+    blue = make_png(color=(0, 0, 255))
+    second = upload_image(tc, blue, "blue.png").json()["image_id"]
+    response = tc.post("/api/chat", json={"message": question, "image_id": second, "background": True, "generation_id": "good"})
+    good_id = next(data["preview_id"] for name, data in parse_sse(response.text) if name == "start")
+    history = tc.get("/api/history").json()
+    assert len(history["image_previews"]) == 1
+    index = history["image_previews"][0]["index"]
+    assert history["image_previews"][0]["id"] == good_id
+    assert history["history"][index]["role"] == "user"
+    assert question not in history["history"][index]["content"]
+    assert tc.get("/api/history", params={"preview_id": good_id}).content == blue

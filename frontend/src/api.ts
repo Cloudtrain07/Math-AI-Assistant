@@ -53,6 +53,8 @@ export interface RejectedPayload {
 export interface StartPayload {
   /** 本轮消息原文；继续生成时为服务端构造的继续指令，仅用于展示 */
   message: string
+  preview_id?: string
+  preview_unavailable?: boolean
 }
 
 /** 单轮界面设置：随聊天/继续生成请求提交，后端验证后选择对应客户端。
@@ -153,9 +155,15 @@ export async function fetchMe(): Promise<UserInfo | null> {
 export async function fetchHistory(): Promise<{
   history: ChatMessage[]
   notice: string
+  generation?: { id: string; history_length: number } | null
+  image_previews?: { index: number; id: string }[]
+  image_preview_missing?: boolean
+  active_preview_id?: string
 }> {
   const resp = await fetch('/api/history')
-  if (!resp.ok) return { history: [], notice: '⚠️ 聊天记录读取失败。' }
+  // 非成功状态一律抛错：调用方必须能区分「读到了空对话」与「没读到」。
+  // 失败若被吞成空历史，界面像新对话而服务端旧历史仍在（模型记得旧对话）。
+  if (!resp.ok) throw new Error(`读取聊天记录失败（HTTP ${resp.status}）`)
   return await resp.json()
 }
 
@@ -178,6 +186,10 @@ export async function fetchSettings(): Promise<SettingsInfo | null> {
   }
 }
 
+export class TurnHttpError extends Error {
+  constructor(message: string, public status: number) { super(message) }
+}
+
 /**
  * 消费一轮聊天的 SSE 流（/api/chat 与 /api/continue 共用）。
  * - 网络错误 / HTTP 非 2xx：抛出异常（含可展示信息）；
@@ -192,14 +204,14 @@ async function consumeTurnStream(
   { kind: 'done'; payload: DonePayload } | { kind: 'rejected'; payload: RejectedPayload }
 > {
   if (resp.status === 401) {
-    throw new Error('登录已过期，请重新登录')
+    throw new TurnHttpError('登录已过期，请重新登录', 401)
   }
   if (!resp.ok || !resp.body) {
     // 后端 400/503 返回的字符串 detail 直接展示（含设置校验的中文提示）；
     // 没有可读 detail（如 422 的结构化明细）时保留通用错误
     const body = await readJson(resp)
     const detail = body && typeof body.detail === 'string' ? body.detail : ''
-    throw new Error(detail || `请求失败（HTTP ${resp.status}）`)
+    throw new TurnHttpError(detail || `请求失败（HTTP ${resp.status}）`, resp.status)
   }
 
   const parser = new SseParser()
@@ -311,12 +323,13 @@ export async function adminResetPassword(
 export async function streamChat(
   message: string,
   settings: TurnSettings,
-  handlers: StreamHandlers & { signal?: AbortSignal; imageId?: string | null },
+  handlers: StreamHandlers & { signal?: AbortSignal; imageId?: string | null; generationId?: string },
 ): Promise<
   { kind: 'done'; payload: DonePayload } | { kind: 'rejected'; payload: RejectedPayload }
 > {
   const body: Record<string, unknown> = { message, ...settings }
   if (handlers.imageId) body.image_id = handlers.imageId
+  if (handlers.generationId) Object.assign(body, { background: true, generation_id: handlers.generationId })
   const resp = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -332,15 +345,27 @@ export async function streamChat(
  */
 export async function continueChat(
   settings: TurnSettings,
-  handlers: StreamHandlers & { signal?: AbortSignal },
+  handlers: StreamHandlers & { signal?: AbortSignal; generationId?: string },
 ): Promise<
   { kind: 'done'; payload: DonePayload } | { kind: 'rejected'; payload: RejectedPayload }
 > {
   const resp = await fetch('/api/continue', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...settings }),
+    body: JSON.stringify({ ...settings, ...(handlers.generationId ? { background: true, generation_id: handlers.generationId } : {}) }),
     signal: handlers.signal,
   })
   return consumeTurnStream(resp, handlers)
+}
+
+export async function attachGeneration(id: string, handlers: StreamHandlers & { signal?: AbortSignal }) {
+  const resp = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'attach', generation_id: id }), signal: handlers.signal })
+  return consumeTurnStream(resp, handlers)
+}
+
+export async function stopGeneration(id: string) {
+  const resp = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'stop', generation_id: id }) })
+  if (!resp.ok) throw new Error('停止请求失败，请重试。')
 }
