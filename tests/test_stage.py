@@ -3,6 +3,9 @@
 
 import sys
 from pathlib import Path
+
+import pytest
+
 from core import dialogue_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -25,6 +28,48 @@ def test_escape_keyword_full_solution():
     assert result["stage"] == "full_solution"
 
 
+def test_explicit_single_hint_overrides_previous_hint_count():
+    result = advance_stage(
+        "互动模式", "先不要给答案，只提示我下一步。",
+        _st("targeted_hint", hints=3), has_history=True,
+    )
+    assert result["stage"] == "single_hint"
+
+
+@pytest.mark.parametrize(("message", "stage"), [
+    ("不要直接讲答案，我想自己试试。", "single_hint"),
+    ("不用提示了，直接给我答案。", "full_solution"),
+    ("不用先直接给我答案。", "single_hint"),
+    ("不需要最终答案。", "single_hint"),
+    ("直接给我答案，不需要提示。", "full_solution"),
+    ("我只需要一点提示。", "single_hint"),
+    ("我只要提示。", "single_hint"),
+    ("只需要一点提示。还是直接给我答案吧。", "full_solution"),
+    ("直接给我答案，算了，先不要答案。", "single_hint"),
+    ("先不要答案，还是给出最终答案吧。", "full_solution"),
+    ("先提示我一步，还是直接给答案吧。", "full_solution"),
+    ("直接讲答案吧，等等，只提示一步。", "single_hint"),
+    ("谢谢刚才的提示，我的做法是 x=3，对吗？", "grading"),
+    ("之前的提示里，为什么这一步可以写成 x=3？", "targeted_hint"),
+    ("之前只提示了一步，为什么这一步可以写成 x=3？", "targeted_hint"),
+])
+def test_reply_directives_and_ordinary_followups(message, stage):
+    assert advance_stage(
+        "互动模式", message, _st("full_solution"), has_history=True
+    )["stage"] == stage
+
+
+def test_switch_from_hint_to_full_solution_and_keep_stage_when_continuing():
+    hint = advance_stage("互动模式", "只提示一步", _st(), has_history=True)
+    assert hint["stage"] == "single_hint"
+    assert advance_stage(
+        "互动模式", "只提示一步", hint, has_history=True, force_continue=True
+    ) == hint
+    assert advance_stage(
+        "互动模式", "现在可以讲完整解法了", hint, has_history=True
+    )["stage"] == "full_solution"
+
+
 def test_practice_keyword_practice_wait():
     result = advance_stage("互动模式", "出道题练练", _st())
     assert result["stage"] == "practice_wait"
@@ -43,6 +88,23 @@ def test_new_problem_resets_to_initial():
     )
     assert result["stage"] == "initial_hint"
     assert result["hints"] == 0
+
+
+@pytest.mark.parametrize("separator", ["：", ":", "，", ",", "、", "；", " ", "\n"])
+def test_next_problem_recognizes_common_separators(separator):
+    assert dialogue_state.explicitly_switches_problem(f"下一题{separator}计算 2+2")
+
+
+@pytest.mark.parametrize(("message", "is_new"), [
+    ("计算图上标出的线段长度。", False),
+    ("证明图上标出的两角相等。", False),
+    ("计算 2+2 的结果。", True),
+    ("证明三角形的内角和等于 180 度。", True),
+    ("换一道题：求图上标出的角。", True),
+    ("别换题，继续讲这里。", False),
+])
+def test_problem_statements_and_image_references(message, is_new):
+    assert dialogue_state.looks_like_new_problem(message) is is_new
 
 
 def test_first_message_initial_hint():

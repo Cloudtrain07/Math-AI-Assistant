@@ -138,13 +138,13 @@ def route_image_for_turn(
     fresh_image = bool(image_state.get("fresh"))
 
     if image_path and not force_continue and attach_image:
-        looks_like_new = dialogue_state.looks_like_new_problem(message)
-        stale_image = (
-            previous_stage in ("summary", "full_solution", "grading")
-            or previous_stage is None
-        ) and looks_like_new
-
-        if stale_image and not fresh_image:
+        if not fresh_image and (
+            dialogue_state.explicitly_switches_problem(message)
+            or (
+                previous_stage in (None, "summary", "full_solution", "grading")
+                and dialogue_state.looks_like_new_problem(message)
+            )
+        ):
             # 上一题留下的旧图，不带到新题中
             new_image_state = {"path": None, "fresh": False}
 

@@ -103,6 +103,11 @@ function setStatus(text: string, kind: StatusKind = 'info') {
 
 // ---- 待发送图片：选择/粘贴 → 编辑确认 → 缩略图 → 点击发送才上传 ----
 const pendingImage = ref<PendingImage | null>(null)
+const removingImage = ref(false)
+const canRequestGuidance = computed(() =>
+  mode.value === '互动模式' &&
+  (pendingImage.value !== null || messages.value.some((message) => message.role === 'user')),
+)
 let imageRestoreSerial = 0
 const editorOpen = ref(false)
 const editorSource = ref<EditorSource | null>(null)
@@ -245,11 +250,21 @@ function reEdit() {
 }
 
 async function removePending() {
-  if (sending.value) return
-  discardPendingImage()
-  // 同时清掉服务端可能保留的上一条附图，避免后续轮次重新附带
-  const result = await apiRemoveImage()
-  if (result && !result.ok && result.message) setStatus(result.message, 'error')
+  if (!pendingImage.value || sending.value || removingImage.value) return
+  const image = pendingImage.value
+  const epoch = restoreEpoch
+  removingImage.value = true
+  try {
+    const result = await apiRemoveImage()
+    if (!result.ok) throw new Error(result.message || '移除图片失败，请重试。')
+    if (pendingImage.value === image && epoch === restoreEpoch) discardPendingImage()
+  } catch (error) {
+    if (epoch === restoreEpoch) {
+      setStatus(error instanceof Error ? error.message : '移除图片失败，请重试。', 'error')
+    }
+  } finally {
+    removingImage.value = false
+  }
 }
 
 // ---- 界面设置（来自 /api/settings，均可在折叠区修改） ----
@@ -634,9 +649,14 @@ function currentTurnSettings(limits: ResolvedWebLimits): TurnSettings {
   }
 }
 
-async function runTurn(kind: 'chat' | 'continue' | 'resume', text = '', resumeId = '') {
+async function runTurn(
+  kind: 'chat' | 'continue' | 'resume',
+  text = '',
+  resumeId = '',
+  { preserveDraft = false } = {},
+) {
   // 历史恢复完成前（或读取失败未处理时）禁止发送：此时界面与服务端历史不一致
-  if (sending.value || historyBusy.value) return
+  if (sending.value || removingImage.value || historyBusy.value) return
   const pendingUnsent = kind === 'chat' && pendingImage.value && !pendingImage.value.sent
   if (kind === 'chat' && !text && !pendingUnsent) return
   // 请求开始前验证覆盖值：无效时不进入发送流程、不清空输入草稿
@@ -645,8 +665,7 @@ async function runTurn(kind: 'chat' | 'continue' | 'resume', text = '', resumeId
     setStatus(limits.error, 'error')
     return
   }
-  const originalText = text
-  if (kind === 'chat') input.value = ''
+  if (kind === 'chat' && !preserveDraft) input.value = ''
   setStatus('')
   const assistant = reactive<ChatEntry>({
     role: 'assistant',
@@ -691,7 +710,7 @@ async function runTurn(kind: 'chat' | 'continue' | 'resume', text = '', resumeId
       )
       imageId = uploaded.image_id
     } catch (err) {
-      input.value = originalText
+      if (!preserveDraft) input.value = text
       sending.value = false
       stopElapsedTimer()
       controller = null
@@ -825,6 +844,10 @@ function send() {
   const hasPending = pendingImage.value && !pendingImage.value.sent
   if (!input.value.trim() && !hasPending) return
   runTurn('chat', input.value.trim())
+}
+
+function requestGuidance(message: '只提示一步' | '看完整解答') {
+  if (canRequestGuidance.value) void runTurn('chat', message, '', { preserveDraft: true })
 }
 
 /** Enter 发送；Shift+Enter 换行；中文输入法组合输入（选词/确认候选）不触发发送 */
@@ -1131,28 +1154,32 @@ async function onClearClick() {
       </section>
       <section v-if="usageText" class="usage">{{ usageText }}</section>
 
-      <!-- 待发送图片：确认后才出现在这里；点击发送时才上传 -->
+      <div class="composer-dock">
+      <!-- 待发送或继续沿用的题图 -->
       <div v-if="pendingImage" class="pending-image">
-        <img class="thumb" :src="pendingImage.editedUrl" alt="待发送图片" />
+        <img class="thumb" :src="pendingImage.editedUrl" alt="当前题图" />
         <div class="pending-meta">
-          <span class="pending-size">
+          <span v-if="pendingImage.sent" class="pending-badge">本轮沿用上一张题图</span>
+          <span v-else class="pending-size">
             {{ pendingImage.editedWidth }}×{{ pendingImage.editedHeight }}
           </span>
-          <span v-if="pendingImage.sent" class="pending-badge">已发送</span>
         </div>
         <div class="pending-actions">
-          <button class="chip" type="button" :disabled="sending" @click="reEdit">
+          <button class="chip" type="button" :disabled="sending || removingImage" @click="reEdit">
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.8 3.6l3.6 3.6L7 16.6l-4 1 1-4z" /></svg>
             编辑
           </button>
-          <button class="chip danger" type="button" :disabled="sending" @click="removePending">
+          <button class="chip danger" type="button" :disabled="sending || removingImage" @click="removePending">
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" /></svg>
             移除
           </button>
         </div>
       </div>
 
-      <div class="composer-dock">
+      <div v-if="canRequestGuidance" class="guidance-actions">
+        <button class="chip" type="button" :disabled="sending || removingImage || historyBusy" @click="requestGuidance('只提示一步')">只提示一步</button>
+        <button class="chip" type="button" :disabled="sending || removingImage || historyBusy" @click="requestGuidance('看完整解答')">看完整解答</button>
+      </div>
       <div v-if="sending && activeAssistant" class="live-stats" role="status">
         <template v-if="firstDeltaAt === null">等待模型响应 · 已用时 {{ elapsedSeconds }} 秒</template>
         <template v-else>{{ activeAssistant.content ? '正在回答' : '正在思考' }} · {{ liveSummary(activeAssistant) }}</template>
@@ -1169,7 +1196,7 @@ async function onClearClick() {
           class="icon-btn"
           type="button"
           title="添加图片（支持裁剪、旋转）"
-          :disabled="sending"
+          :disabled="sending || removingImage"
           @click="openFilePicker"
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -1192,7 +1219,7 @@ async function onClearClick() {
         <button
           v-if="!sending"
           class="btn ghost continue"
-          :disabled="sending || historyBusy"
+          :disabled="sending || removingImage || historyBusy"
           @click="continueTurn"
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -1209,7 +1236,7 @@ async function onClearClick() {
         <button
           v-else
           class="btn primary send"
-          :disabled="historyBusy || (!input.trim() && !(pendingImage && !pendingImage.sent))"
+          :disabled="removingImage || historyBusy || (!input.trim() && !(pendingImage && !pendingImage.sent))"
           @click="send"
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -1892,7 +1919,10 @@ select {
 }
 
 /* ===== 输入区：实心表面 + 细边框，专注但不厚重 ===== */
-.composer-dock { position: sticky; bottom: 0; z-index: 20; }
+.composer-dock { position: sticky; bottom: 0; z-index: 20; background: var(--surface); }
+.guidance-actions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 6px; }
+.guidance-actions .chip { min-height: 32px; }
+.guidance-actions + .composer { margin-top: 6px; }
 .live-stats { padding: 7px 12px; background: var(--surface, #fff); color: var(--ink-2); font-size: 0.82rem; border-radius: 8px; }
 .composer {
   position: relative;

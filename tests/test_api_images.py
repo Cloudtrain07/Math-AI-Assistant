@@ -46,14 +46,16 @@ def decode_data_url(data_url: str) -> Image.Image:
     return Image.open(io.BytesIO(raw))
 
 
+def last_user_content(messages: list[dict]) -> str | list[dict]:
+    return next(m["content"] for m in reversed(messages) if m["role"] == "user")
+
+
 def last_image_part(messages: list[dict]) -> dict | None:
-    """取模型消息里最后一个 user 多模态 content 的图片部分。"""
-    for m in reversed(messages):
-        if m.get("role") == "user" and isinstance(m.get("content"), list):
-            for part in m["content"]:
-                if part.get("type") == "image_url":
-                    return part
-    return None
+    """检查当前轮的 user 消息。"""
+    content = last_user_content(messages)
+    if not isinstance(content, list):
+        return None
+    return next((part for part in content if part.get("type") == "image_url"), None)
 
 
 def upload_image(tc: TestClient, data: bytes, name: str = "edited.jpg"):
@@ -248,6 +250,116 @@ def test_replace_image_deletes_old_file(env):
     assert img.size == (40, 30)
     r, g, b = img.convert("RGB").getpixel((2, 2))
     assert b > 200 and r < 30
+
+
+@pytest.mark.parametrize("question", [
+    "刚才那张图里，为什么角A等于角B？",
+    "图中这一步为什么能写成 x=3？",
+    r"这一步为什么能写成 \(x=3\)？",
+])
+def test_followup_after_full_solution_sends_same_image_to_model(env, question):
+    tc, _, vision, _ = env
+    image_id = upload_image(tc, make_png()).json()["image_id"]
+    _, events = chat(tc, "直接给我答案", image_id=image_id)
+    assert events[-1][0] == "done"
+    assert "当前阶段：完整解答" in vision.calls[-1][0]["content"]
+    original = last_image_part(vision.calls[-1])
+    assert original is not None
+
+    _, events = chat(tc, question)
+    assert events[-1][0] == "done"
+    assert last_image_part(vision.calls[-1]) == original
+    assert events[-1][1]["image_kept"]
+
+
+@pytest.mark.parametrize(("question", "keep_image"), [
+    pytest.param("求图上标出的角是多少度？", True, id="same-image"),
+    pytest.param("下一题，求方程 2x+3=11 的解。", False, id="next-problem"),
+])
+def test_image_routing_for_question_and_followup(env, question, keep_image):
+    tc, _, vision, _ = env
+    image = make_png(73, 51, (0, 0, 255))
+    image_id = upload_image(tc, image, "angle.png").json()["image_id"]
+    status, events = chat(
+        tc, "直接给我答案", image_id=image_id, background=True,
+        generation_id="original-diagram",
+    )
+    assert status == 200 and events[-1][0] == "done"
+    assert "当前阶段：完整解答" in vision.calls[-1][0]["content"]
+    preview_id = next(data["preview_id"] for name, data in events if name == "start")
+    original = last_image_part(vision.calls[-1])
+    assert original is not None
+    with decode_data_url(original["image_url"]["url"]) as decoded:
+        assert decoded.size == (73, 51)
+        r, g, b = decoded.convert("RGB").getpixel((2, 2))
+        assert r < 20 and g < 20 and b > 235
+    assert tc.get("/api/history").json()["active_preview_id"] == preview_id
+
+    parts = []
+    pure_text = []
+    kept = []
+    active_previews = []
+    for turn in (question, "为什么？"):
+        status, events = chat(tc, turn)
+        assert status == 200 and events[-1][0] == "done"
+        parts.append(last_image_part(vision.calls[-1]))
+        pure_text.append(isinstance(last_user_content(vision.calls[-1]), str))
+        kept.append(events[-1][1]["image_kept"])
+        active_previews.append(tc.get("/api/history").json().get("active_preview_id"))
+
+    preview = tc.get("/api/history", params={"preview_id": preview_id})
+    assert preview.status_code == 200 and preview.content == image
+    assert [part is not None for part in parts] == [keep_image, keep_image]
+    assert parts == ([original, original] if keep_image else [None, None])
+    assert pure_text == [not keep_image, not keep_image]
+    assert kept == [keep_image, keep_image]
+    assert active_previews == ([preview_id, preview_id] if keep_image else [None, None])
+
+
+def test_explicit_problem_switch_drops_active_image_during_hints(env):
+    tc, _, vision, _ = env
+    image_id = upload_image(tc, make_png()).json()["image_id"]
+    _, events = chat(tc, "只提示一步", image_id=image_id)
+    assert events[-1][0] == "done" and last_image_part(vision.calls[-1])
+    _, events = chat(tc, "换一道题，求方程 2x+3=11 的解")
+    assert events[-1][0] == "done" and not events[-1][1]["image_kept"]
+    assert last_image_part(vision.calls[-1]) is None
+
+
+def test_replace_and_remove_active_image_keep_old_message_previews(env):
+    tc, _, vision, _ = env
+    images = [make_png(color=(255, 0, 0)), make_png(40, 30, (0, 0, 255))]
+    previews = []
+    for index, image in enumerate(images):
+        image_id = upload_image(tc, image, "edited.png").json()["image_id"]
+        _, events = chat(
+            tc, "直接给我答案" if index == 0 else "换一道题，请解答图中的问题",
+            image_id=image_id, background=True, generation_id=f"replace-{index}",
+        )
+        assert events[-1][0] == "done"
+        previews.append(next(data["preview_id"] for name, data in events if name == "start"))
+        part = last_image_part(vision.calls[-1])
+        assert part is not None
+        received = decode_data_url(part["image_url"]["url"])
+        with Image.open(io.BytesIO(image)) as expected:
+            assert received.size == expected.size
+            assert all(
+                abs(actual - expected_channel) < 20
+                for actual, expected_channel in zip(
+                    received.convert("RGB").getpixel((2, 2)), expected.getpixel((2, 2))
+                )
+            )
+
+    assert tc.get("/api/history").json()["active_preview_id"] == previews[-1]
+    assert tc.delete("/api/images").json()["ok"]
+    _, events = chat(tc, "图中这一步为什么能写成 x=3？")
+    assert events[-1][0] == "done" and not events[-1][1]["image_kept"]
+    assert last_image_part(vision.calls[-1]) is None
+    history = tc.get("/api/history").json()
+    assert "active_preview_id" not in history
+    assert [item["id"] for item in history["image_previews"]] == previews
+    for preview_id, image in zip(previews, images):
+        assert tc.get("/api/history", params={"preview_id": preview_id}).content == image
 
 
 def test_clear_removes_temp_files(env):

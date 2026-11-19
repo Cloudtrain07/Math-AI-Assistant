@@ -194,6 +194,56 @@ def test_done_speed_empty_reply_has_no_timing(env):
     assert done["tok_s"] is None
 
 
+def test_explicit_guidance_is_injected_into_model_messages(env):
+    tc, _, fake, _, _ = env
+    status, events = _chat(tc, "先不要给答案，只提示我下一步。")
+    assert status == 200 and events[-1][0] == "done"
+    system = fake.calls[-1][0]["content"]
+    assert "当前阶段：单步提示" in system
+    assert "只给一个可执行的下一步，给完即停" in system
+    assert "不要给出后续步骤、完整解法或最终答案" in system
+
+    status, events = _chat(tc, "现在可以讲完整解法了")
+    assert status == 200 and events[-1][0] == "done"
+    assert "当前阶段：完整解答" in fake.calls[-1][0]["content"]
+
+
+@pytest.mark.parametrize(("message", "expected_stage"), [
+    pytest.param("我只要提示，不要答案。", "单步提示", id="hint-only"),
+    pytest.param("直接给我答案。算了，还是只要提示。", "单步提示", id="changes-mind"),
+    pytest.param("不用提示了，直接给我答案。", "完整解答", id="answer-only"),
+    pytest.param(
+        "直接给我答案。算了，别把答案告诉我，我想自己做。",
+        "单步提示", id="declines-disclosing-answer",
+    ),
+    pytest.param(
+        "先只要提示。算了，把答案告诉我吧。",
+        "完整解答", id="requests-disclosing-answer",
+    ),
+    pytest.param(
+        "先告诉我答案。还是不要把最终答案直接告诉我。",
+        "单步提示", id="declines-direct-disclosure",
+    ),
+])
+def test_final_guidance_request_controls_model_prompt(env, message, expected_stage):
+    tc, _, fake, _, _ = env
+    for turn in ("解方程 2x+3=11", "我还没想出来", "这个方法我还是不会"):
+        status, events = _chat(tc, turn)
+        assert status == 200 and events[-1][0] == "done"
+    assert "当前阶段：针对卡点提示" in fake.calls[-1][0]["content"]
+
+    status, events = _chat(tc, message)
+    assert status == 200 and events[-1][0] == "done"
+    system = fake.calls[-1][0]
+    assert system["role"] == "system"
+    stage_instruction = next(
+        line for line in system["content"].splitlines() if line.startswith("当前阶段：")
+    )
+    assert stage_instruction.partition("——")[0] == f"当前阶段：{expected_stage}"
+    if expected_stage == "单步提示":
+        assert "只给一个可执行的下一步，给完即停" in stage_instruction
+
+
 def test_two_turns_use_previous_context(env):
     tc, _, fake, _, _ = env
     _chat(tc, "第一问")
