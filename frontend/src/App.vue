@@ -32,7 +32,7 @@ import {
 import { shouldSendOnEnter } from './ime'
 import { classifyDone, composeDaily, composeNotice } from './notice'
 import { collapsedScrollAdjustment } from './collapseAnchor'
-import { isFollowingBottom, shouldShowJumpToBottom } from './scrollFollow'
+import { distanceFromBottom, isFollowingBottom, shouldShowJumpToBottom } from './scrollFollow'
 import { OUTPUT_TOKENS_BOUNDS, WAIT_SECONDS_BOUNDS, parseWebLimit } from './webLimits'
 import { modelThinking, providerView, syncEffort } from './settings'
 import { copyText } from './clipboard'
@@ -185,7 +185,7 @@ async function onFileChange(event: Event) {
 }
 
 function onPaste(event: ClipboardEvent) {
-  if (!me.value || sending.value || editorOpen.value) return
+  if (!me.value || !composerVisible.value || sending.value || editorOpen.value) return
   const item = Array.from(event.clipboardData?.items ?? []).find((i) =>
     i.type.startsWith('image/'),
   )
@@ -200,18 +200,20 @@ function onPaste(event: ClipboardEvent) {
 async function acceptNewImage(file: File) {
   if (sending.value) return
   if (!isSupportedImageFile(file)) {
-    setStatus('不支持的图片格式，仅支持 jpg / png / webp / bmp / gif。', 'error')
+    showComposerError('不支持的图片格式，仅支持 jpg / png / webp / bmp / gif。')
     return
   }
   if (isOverSize(file)) {
-    setStatus('图片超过 10MB，请压缩后再试。', 'error')
+    showComposerError('图片超过 10MB，请压缩后再试。')
     return
   }
   setStatus('')
+  composerError.value = ''
   try {
-    await decodeImage(file)
+    const bitmap = await decodeImage(file)
+    bitmap.close()
   } catch {
-    setStatus('浏览器无法解码该图片（如 HEIC 格式），请先转换为 jpg 或 png。', 'error')
+    showComposerError('浏览器无法解码该图片（如 HEIC 格式），请先转换为 jpg 或 png。')
     return
   }
   // 新图从零开始编辑；重新编辑则由 reEdit 带入原参数
@@ -260,7 +262,7 @@ async function removePending() {
     if (pendingImage.value === image && epoch === restoreEpoch) discardPendingImage()
   } catch (error) {
     if (epoch === restoreEpoch) {
-      setStatus(error instanceof Error ? error.message : '移除图片失败，请重试。', 'error')
+      showComposerError(error instanceof Error ? error.message : '移除图片失败，请重试。')
     }
   } finally {
     removingImage.value = false
@@ -339,6 +341,52 @@ watch([authChecked, me], () => void nextTick(attachHeaderObserver), { immediate:
 let stickToBottom = true
 /** 用户明显离开底部时的「回到底部」入口（流式输出不会把阅读位置拉回去） */
 const showJump = ref(false)
+const mobile = ref(false)
+const composerOpen = ref(false)
+const accepted = ref(false)
+const hasConversation = computed(() => messages.value.length > 0)
+const composerVisible = computed(() => !mobile.value || !hasConversation.value || composerOpen.value)
+const composerError = ref('')
+const stopError = ref('')
+const followUpButton = ref<HTMLButtonElement | null>(null)
+const closeComposerButton = ref<HTMLButtonElement | null>(null)
+const composerDock = ref<HTMLElement | null>(null)
+const visualBottom = ref(0)
+const visualHeight = ref(0)
+let mobileQuery: MediaQueryList
+let lastMobileTop = 0
+let readerRevision = 0
+
+function syncMobileLayout() {
+  mobile.value = mobileQuery.matches
+  const viewport = window.visualViewport
+  visualHeight.value = viewport?.height ?? window.innerHeight
+  visualBottom.value = viewport
+    ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop)
+    : 0
+}
+
+async function toggleComposer(open: boolean) {
+  if (!open) composerInput.value?.blur()
+  composerOpen.value = open
+  await nextTick()
+  const button = open ? closeComposerButton.value : followUpButton.value
+  button?.focus({ preventScroll: true })
+}
+
+function showComposerError(message: string) {
+  composerError.value = message
+  if (mobile.value) {
+    composerOpen.value = true
+    void nextTick(() => {
+      if (composerDock.value) composerDock.value.scrollTop = 0
+    })
+  } else {
+    setStatus(message, 'error')
+  }
+}
+
+watch(composerVisible, () => void nextTick(autosizeComposer))
 
 let controller: AbortController | null = null
 let generationId: string | null = null
@@ -353,6 +401,12 @@ function resumeVisible() {
 let elapsedTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
+  mobileQuery = window.matchMedia('(max-width: 560px)')
+  mobileQuery.addEventListener('change', syncMobileLayout)
+  window.addEventListener('resize', syncMobileLayout)
+  window.visualViewport?.addEventListener('resize', syncMobileLayout)
+  window.visualViewport?.addEventListener('scroll', syncMobileLayout)
+  syncMobileLayout()
   window.addEventListener('paste', onPaste)
   document.addEventListener('visibilitychange', resumeVisible)
   window.addEventListener('pageshow', resumeVisible)
@@ -366,6 +420,10 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  mobileQuery?.removeEventListener('change', syncMobileLayout)
+  window.removeEventListener('resize', syncMobileLayout)
+  window.visualViewport?.removeEventListener('resize', syncMobileLayout)
+  window.visualViewport?.removeEventListener('scroll', syncMobileLayout)
   if (elapsedTimer !== null) clearInterval(elapsedTimer)
   window.removeEventListener('paste', onPaste)
   document.removeEventListener('visibilitychange', resumeVisible)
@@ -405,6 +463,7 @@ async function restoreHistory(resumeCurrent = true) {
     const data = await fetchHistory()
     // 恢复期间发生清空/登出（restoreEpoch 递增）时，过期结果不得覆盖最新状态
     if (epoch !== restoreEpoch) return
+    if (resumeCurrent) composerOpen.value = false
     messages.value = (resumeCurrent && data.generation ? data.history.slice(0, data.generation.history_length) : data.history).map((m) => ({
       role: m.role,
       content: m.content,
@@ -473,6 +532,8 @@ async function doLogout() {
   historyError.value = ''
   historyLoading.value = false
   discardPendingImage()
+  composerOpen.value = false
+  composerError.value = ''
   // 会话整体没了：重置跟随与「回到底部」状态，重新登录后不带残留
   followLatest()
 }
@@ -501,17 +562,31 @@ function refreshJumpState() {
 
 function onScroll() {
   const el = chatScroll.value
-  if (el) followReader(el)
+  if (!el) return
+  if (!mobile.value) {
+    followReader(el)
+    return
+  }
+  if (el.scrollTop < lastMobileTop - 1) {
+    stickToBottom = false
+    readerRevision++
+  } else if (el.scrollTop > lastMobileTop + 1 && distanceFromBottom(el) <= 2) {
+    stickToBottom = true
+  }
+  lastMobileTop = el.scrollTop
+  refreshJumpState()
 }
 
 async function scrollToBottom() {
   const el = chatScroll.value
   if (!el) return
   // 滚动事件要到下一帧才派发：位置已被用户改动时，先按实时几何量核对要不要继续跟随
-  if (stickToBottom && pinnedTop >= 0 && el.scrollTop < pinnedTop - 4) followReader(el)
+  if (mobile.value && el.scrollTop < lastMobileTop - 1) onScroll()
+  if (!mobile.value && stickToBottom && pinnedTop >= 0 && el.scrollTop < pinnedTop - 4) followReader(el)
   if (stickToBottom) {
     el.scrollTop = el.scrollHeight
     pinnedTop = el.scrollTop
+    lastMobileTop = el.scrollTop
   }
   // 内容增高本身不派发滚动事件：布局完成后按实时几何量重算显隐（不把向上阅读的人拉回来）
   refreshJumpState()
@@ -542,7 +617,7 @@ function onThinkingSummaryClick(event: MouseEvent) {
   const summary = event.currentTarget as HTMLElement | null
   const details = summary?.closest('details')
   const pageEl = chatScroll.value
-  if (!summary || !details || !pageEl || !details.open) return
+  if (mobile.value || !summary || !details || !pageEl || !details.open) return
   const containerTop = pageEl.getBoundingClientRect().top
   const topBefore = details.getBoundingClientRect().top - containerTop
   // 浏览器在 click 默认动作里切换 open：定时器回调时布局已折叠，读取几何量
@@ -593,7 +668,14 @@ function stopElapsedTimer() {
 function stopStreaming() {
   stopRequested = true
   if (generationId) {
-    void stopGeneration(generationId).catch(() => setStatus('停止请求失败，请重试。', 'error'))
+    const id = generationId
+    stopError.value = ''
+    void stopGeneration(id).catch(() => {
+      if (generationId !== id) return
+      stopRequested = false
+      stopError.value = '停止请求失败，请重试。'
+      if (!mobile.value) setStatus(stopError.value, 'error')
+    })
   } else {
     controller?.abort()
   }
@@ -662,10 +744,15 @@ async function runTurn(
   // 请求开始前验证覆盖值：无效时不进入发送流程、不清空输入草稿
   const limits = kind === 'resume' ? { maxOutputTokens: null, maxWaitSeconds: null } : resolveWebLimits()
   if ('error' in limits) {
-    setStatus(limits.error, 'error')
+    if (kind === 'chat') showComposerError(limits.error)
+    else setStatus(limits.error, 'error')
     return
   }
-  if (kind === 'chat' && !preserveDraft) input.value = ''
+  composerError.value = ''
+  stopError.value = ''
+  accepted.value = false
+  const submittedAtRevision = readerRevision
+  const submittedAtTop = chatScroll.value?.scrollTop ?? 0
   setStatus('')
   const assistant = reactive<ChatEntry>({
     role: 'assistant',
@@ -690,7 +777,7 @@ async function runTurn(
     void nextTick(scrollToBottom)
   }
   sending.value = true
-  followLatest()
+  if (!mobile.value) followLatest()
   startElapsedTimer()
   controller = new AbortController()
   generationId = null
@@ -710,14 +797,14 @@ async function runTurn(
       )
       imageId = uploaded.image_id
     } catch (err) {
-      if (!preserveDraft) input.value = text
       sending.value = false
+      activeAssistant.value = null
       stopElapsedTimer()
       controller = null
       if (uploadSignal.aborted) {
         setStatus('已停止发送，未发起模型请求。图片已保留，可重试。', 'stopped')
       } else {
-        setStatus(err instanceof Error ? err.message : '图片上传失败，请重试。', 'error')
+        showComposerError(err instanceof Error ? err.message : '图片上传失败，请重试。')
       }
       return
     }
@@ -742,8 +829,27 @@ async function runTurn(
       generationId,
       imageId,
       onStart: (payload: { message: string; preview_id?: string; preview_unavailable?: boolean }) => {
-        if (!assistantShown) showBubbles(kind === 'chat' ? (text || payload.message) : payload.message, imageId ? createSentImageUrl() : (payload.preview_id ? previewUrl(payload.preview_id) : undefined))
-        else { assistant.content = ''; assistant.reasoning = '' }
+        if (!assistantShown) {
+          accepted.value = true
+          if (kind === 'chat') {
+            if (!preserveDraft) input.value = ''
+            if (mobile.value) composerInput.value?.blur()
+            composerOpen.value = false
+          }
+          if (mobile.value && kind !== 'resume'
+            && readerRevision === submittedAtRevision
+            && (chatScroll.value?.scrollTop ?? 0) >= submittedAtTop - 1) {
+            lastMobileTop = chatScroll.value?.scrollTop ?? 0
+            followLatest()
+          }
+          showBubbles(
+            kind === 'chat' ? (text || payload.message) : payload.message,
+            imageId ? createSentImageUrl() : (payload.preview_id ? previewUrl(payload.preview_id) : undefined),
+          )
+        } else {
+          assistant.content = ''
+          assistant.reasoning = ''
+        }
         if (kind === 'resume' && payload.preview_id && !pendingImage.value) void restoreActiveImage(payload.preview_id, restoreEpoch)
         if (payload.preview_unavailable) {
           previewUnavailable = true
@@ -794,7 +900,8 @@ async function runTurn(
         assistant.done = true
         if (assistant.content || assistant.reasoning) assistant.speedSummary = `未完成 · ${liveSummary(assistant)}`
       }
-      setStatus(result.payload.message, stopRequested ? 'stopped' : 'info')
+      if (!accepted.value && kind === 'chat' && !stopRequested) showComposerError(result.payload.message)
+      else setStatus(result.payload.message, stopRequested ? 'stopped' : 'info')
     } else {
       const d = result.payload
       assistant.content = d.answer
@@ -821,15 +928,16 @@ async function runTurn(
     assistant.done = true
     if (controller?.signal.aborted) {
       setStatus('已停止接收。未完成的回答不会写入历史。', 'stopped')
-    } else if (err instanceof Error) {
-      setStatus(err.message, 'error')
     } else {
-      setStatus('连接中断，请稍后重试。', 'error')
+      const message = err instanceof Error ? err.message : '连接中断，请稍后重试。'
+      if (!accepted.value && kind === 'chat') showComposerError(message)
+      else setStatus(message, 'error')
     }
   } finally {
     stopElapsedTimer()
     sending.value = false
     activeAssistant.value = null
+    accepted.value = false
     controller = null
     generationId = null
     // 收尾时状态行/用量行会改变内容高度：布局完成后再核对一次按钮显隐
@@ -888,6 +996,8 @@ async function onClearClick() {
     historyError.value = ''
     historyLoading.value = false
     discardPendingImage()
+    composerOpen.value = false
+    composerError.value = ''
     // 内容清空后没有「上方」可读：按钮状态与跟随一起归零
     followLatest()
   } else {
@@ -897,7 +1007,13 @@ async function onClearClick() {
 </script>
 
 <template>
-  <div ref="chatScroll" class="page" @scroll="onScroll">
+  <div
+    ref="chatScroll"
+    class="page"
+    :class="{ 'mobile-conversation': mobile && hasConversation }"
+    :style="{ '--visible-bottom': visualBottom + 'px', '--visible-height': visualHeight + 'px' }"
+    @scroll="onScroll"
+  >
     <template v-if="authChecked && !me">
       <form class="login" @submit.prevent="submitLogin">
         <span class="mark large" aria-hidden="true">∑</span>
@@ -949,13 +1065,6 @@ async function onClearClick() {
                 <path d="M10 6.6v6.8M6.6 10h6.8" />
               </svg>
               {{ clearArmed ? '再点一次确认清空' : '新对话' }}
-            </button>
-            <!-- 手机端：继续生成移到页头与「新对话」并排（桌面端此按钮隐藏，用输入区的同名按钮） -->
-            <button class="btn ghost continue-top" :disabled="sending || historyBusy" @click="continueTurn">
-              <svg viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M7.5 5.5l7 4.5-7 4.5z" />
-              </svg>
-              继续生成
             </button>
             <button class="btn ghost" :disabled="sending" @click="doLogout">
               <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -1114,20 +1223,41 @@ async function onClearClick() {
                 :text="msg.content"
                 :done="msg.done"
               />
-              <span v-else class="waiting">
+              <span v-else class="waiting desktop-control">
                 <span class="spinner" aria-hidden="true"></span>
                 正在思考… 已用时 {{ elapsedSeconds }} 秒
               </span>
             </div>
+            <div v-if="mobile && sending && msg === activeAssistant" class="turn-controls">
+              <div class="live-stats" role="status">
+                {{ !msg.content && !msg.reasoning
+                  ? '等待模型响应 · 已用时 ' + elapsedSeconds + ' 秒'
+                  : (msg.content ? '正在回答' : '正在思考') + ' · ' + liveSummary(msg) }}
+              </div>
+              <button class="btn danger-btn" type="button" @click="stopStreaming">停止</button>
+              <p v-if="stopError" class="turn-error" role="alert">{{ stopError }}</p>
+            </div>
             <div v-if="msg.speedSummary" class="gen-speed">{{ msg.speedSummary }}</div>
-            <div v-if="msg.content" class="msg-actions">
-              <button class="chip copy-chip" type="button" @click="onCopy(msg, msg.content)">
+            <div v-if="msg.content || (mobile && !sending && i === messages.length - 1)" class="msg-actions">
+              <button v-if="msg.content" class="chip copy-chip" type="button" @click="onCopy(msg, msg.content)">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 7V4h9v9h-3M4 7h9v9H4z" /></svg>
                 {{ msg.copied ? '已复制' : '复制' }}
               </button>
+              <button
+                v-if="mobile && !sending && i === messages.length - 1"
+                class="chip"
+                type="button"
+                :disabled="historyBusy || removingImage"
+                @click="continueTurn"
+              >继续生成</button>
             </div>
           </div>
         </template>
+        <div v-if="mobile && sending && !accepted && !composerVisible" class="turn-controls">
+          <span role="status">正在准备回答 · 已用时 {{ elapsedSeconds }} 秒</span>
+          <button class="btn danger-btn" type="button" @click="stopStreaming">停止</button>
+          <p v-if="stopError" class="turn-error" role="alert">{{ stopError }}</p>
+        </div>
       </main>
 
       <section v-if="statusText" class="status" :class="statusKind">
@@ -1154,7 +1284,33 @@ async function onClearClick() {
       </section>
       <section v-if="usageText" class="usage">{{ usageText }}</section>
 
-      <div class="composer-dock">
+      <button
+        v-if="mobile && hasConversation && !composerVisible"
+        ref="followUpButton"
+        class="btn follow-up"
+        type="button"
+        aria-controls="chat-composer"
+        aria-expanded="false"
+        @click="toggleComposer(true)"
+      >追问</button>
+      <div
+        v-show="composerVisible"
+        ref="composerDock"
+        id="chat-composer"
+        class="composer-dock"
+        @keydown.esc="mobile && hasConversation && toggleComposer(false)"
+      >
+      <div v-if="mobile && hasConversation" class="composer-panel-header">
+        <button
+          ref="closeComposerButton"
+          class="btn ghost"
+          type="button"
+          aria-controls="chat-composer"
+          aria-expanded="true"
+          @click="toggleComposer(false)"
+        >收起</button>
+      </div>
+      <p v-if="mobile && composerError" class="turn-error composer-error" role="alert">{{ composerError }}</p>
       <!-- 待发送或继续沿用的题图 -->
       <div v-if="pendingImage" class="pending-image">
         <img class="thumb" :src="pendingImage.editedUrl" alt="当前题图" />
@@ -1180,7 +1336,7 @@ async function onClearClick() {
         <button class="chip" type="button" :disabled="sending || removingImage || historyBusy" @click="requestGuidance('只提示一步')">只提示一步</button>
         <button class="chip" type="button" :disabled="sending || removingImage || historyBusy" @click="requestGuidance('看完整解答')">看完整解答</button>
       </div>
-      <div v-if="sending && activeAssistant" class="live-stats" role="status">
+      <div v-if="sending && activeAssistant && (!mobile || !accepted)" class="live-stats" role="status">
         <template v-if="firstDeltaAt === null">等待模型响应 · 已用时 {{ elapsedSeconds }} 秒</template>
         <template v-else>{{ activeAssistant.content ? '正在回答' : '正在思考' }} · {{ liveSummary(activeAssistant) }}</template>
       </div>
@@ -1210,14 +1366,14 @@ async function onClearClick() {
           v-model="input"
           class="composer-input"
           rows="1"
-          :disabled="sending"
+          :disabled="sending && (!mobile || !accepted)"
           placeholder="输入数学问题，可附图片"
           aria-label="输入数学问题，可附图片"
           @keydown="onComposerKey"
           @input="autosizeComposer"
         ></textarea>
         <button
-          v-if="!sending"
+          v-if="!mobile && !sending"
           class="btn ghost continue"
           :disabled="sending || removingImage || historyBusy"
           @click="continueTurn"
@@ -1227,7 +1383,7 @@ async function onClearClick() {
           </svg>
           继续生成
         </button>
-        <button v-if="sending" class="btn danger-btn" @click="stopStreaming">
+        <button v-if="sending && (!mobile || !accepted)" class="btn danger-btn" @click="stopStreaming">
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <rect x="5.5" y="5.5" width="9" height="9" rx="1.5" />
           </svg>
@@ -1236,7 +1392,7 @@ async function onClearClick() {
         <button
           v-else
           class="btn primary send"
-          :disabled="removingImage || historyBusy || (!input.trim() && !(pendingImage && !pendingImage.sent))"
+          :disabled="sending || removingImage || historyBusy || (!input.trim() && !(pendingImage && !pendingImage.sent))"
           @click="send"
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -1246,7 +1402,7 @@ async function onClearClick() {
           发送
         </button>
         <!-- 回到底部：只在明显离开底部时出现，浮在输入卡上方，不改用新的滚动容器 -->
-        <button v-if="showJump" class="jump-bottom" type="button" @click="jumpToBottom">
+        <button v-if="!mobile && showJump" class="jump-bottom" type="button" @click="jumpToBottom">
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M10 4.2v9.6M6.2 10.6 10 14.4l3.8-3.8" />
           </svg>
@@ -1978,10 +2134,6 @@ select {
   white-space: nowrap;
   background: var(--surface);
 }
-/* 页头「继续生成」仅在手机端替代输入区里的同名按钮，桌面端不显示，避免重复可见 */
-.continue-top {
-  display: none;
-}
 
 /* 回到底部：跟随输入卡这一悬浮层，贴在它上方右侧，不覆盖输入区 */
 .jump-bottom {
@@ -2089,10 +2241,12 @@ select {
 /* ===== 手机视口 ===== */
 @media (max-width: 560px) {
   .page {
-    /* 顶部避开刘海、底部避开手势条：页头与输入卡都是 sticky，按容器内边距留位 */
+    --dock-bottom: calc(var(--visible-bottom, 0px) + max(8px, env(safe-area-inset-bottom, 0px)));
     padding: calc(8px + env(safe-area-inset-top, 0px)) 8px
       calc(8px + env(safe-area-inset-bottom, 0px));
   }
+  .header,
+  .thinking[open] > summary { position: static; }
   .header {
     padding: 8px 2px;
   }
@@ -2110,7 +2264,7 @@ select {
     min-width: 0;
     max-width: 100%;
   }
-  /* 操作按钮整组另起一行：「新对话」与「继续生成」必定并排，组内再按宽度换行 */
+  /* 页头操作整组另起一行 */
   .user-actions {
     width: 100%;
     gap: 10px;
@@ -2133,11 +2287,61 @@ select {
     gap: 16px;
     padding: 14px 2px;
   }
-  /* 手机端显示页头「继续生成」，隐藏输入区里的同名按钮（避免重复） */
-  .continue-top {
-    display: inline-flex;
+  .desktop-control { display: none; }
+  .msg-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .turn-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    color: var(--ink-2);
+    font-size: 0.82rem;
   }
-  /* 输入区改为上下两行：第一行 textarea 独占宽度，第二行放图片上传、回到底部与发送/停止 */
+  .turn-controls .live-stats { padding: 0; background: transparent; }
+  .turn-controls button,
+  .msg-actions button { min-height: 40px; }
+  .turn-error {
+    flex-basis: 100%;
+    margin: 0;
+    color: var(--danger);
+    overflow-wrap: anywhere;
+  }
+  .composer-error { padding: 6px 4px; }
+  .follow-up {
+    position: fixed;
+    z-index: 20;
+    right: max(8px, env(safe-area-inset-right, 0px));
+    bottom: var(--dock-bottom);
+    min-height: 40px;
+    padding: 0 10px;
+    border-radius: 999px;
+    background: var(--surface);
+    box-shadow: var(--shadow-card);
+  }
+  .composer-dock { bottom: var(--dock-bottom); }
+  .mobile-conversation .composer-dock {
+    position: fixed;
+    left: max(8px, env(safe-area-inset-left, 0px));
+    right: max(8px, env(safe-area-inset-right, 0px));
+    bottom: var(--dock-bottom);
+    max-height: min(calc(var(--visible-height, 100dvh) - 16px), max(220px, var(--visible-height, 100dvh) / 2));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 6px 8px 2px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-pop);
+  }
+  .composer-panel-header {
+    display: flex;
+    justify-content: flex-end;
+    position: sticky;
+    top: 0;
+    z-index: 21;
+    background: var(--surface);
+  }
+  .composer-panel-header button { min-height: 40px; }
+  /* 第一行输入文字，第二行放附件与发送操作 */
   .composer {
     display: grid;
     grid-template-columns: auto 1fr auto;
@@ -2148,6 +2352,7 @@ select {
   .composer .composer-input {
     grid-column: 1 / -1;
     grid-row: 1;
+    font-size: 16px;
     max-height: 120px;
   }
   .composer .icon-btn {
@@ -2163,17 +2368,6 @@ select {
     /* 普通长度即取自然宽度，靠右对齐，不铺满整行 */
     justify-self: end;
     height: 44px;
-  }
-  .composer .continue {
-    display: none;
-  }
-  /* 手机端把「回到底部」放进第二行的空档：不压住正文，也不用另起一个悬浮层 */
-  .composer .jump-bottom {
-    position: static;
-    grid-column: 2;
-    grid-row: 2;
-    justify-self: start;
-    min-height: 34px;
   }
 }
 
@@ -2195,6 +2389,11 @@ select {
   }
   .composer .composer-input {
     max-height: 88px;
+  }
+}
+@media (max-width: 560px) {
+  .mobile-conversation {
+    padding-bottom: calc(48px + env(safe-area-inset-bottom, 0px));
   }
 }
 </style>
