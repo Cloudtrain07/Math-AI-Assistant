@@ -2,7 +2,7 @@
 
 面向个人学习和可信小范围使用的数学聊天助手：用互动模式逐步引导，用解答模式展示完整步骤，并支持题目图片输入。
 
-当前版本为 **v2.1.0**。更新记录见 [CHANGELOG.md](CHANGELOG.md)，当前状态与下一步见 [PLAN.md](PLAN.md)。
+当前版本为 **v2.1.1**。更新记录见 [CHANGELOG.md](CHANGELOG.md)，当前状态与下一步见 [PLAN.md](PLAN.md)。
 
 ## 项目介绍
 
